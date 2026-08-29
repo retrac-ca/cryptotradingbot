@@ -32,12 +32,12 @@ describe('CLI dispatcher', () => {
     expect(consoleErrorSpy).toHaveBeenCalled();
   });
 
-  it('returns error when config is invalid', async () => {
-    // TRADING_MODE invalid triggers a config error path.
-    const code = await run(['paper']);
-    // paperCommand calls loadConfig which reads process.env (no .env here);
-    // it may succeed with defaults or fail depending on environment. We just
-    // assert it returns a number without throwing.
+  it('returns a number for paper (validate-only path, no engine start)', async () => {
+    // --validate loads/validates config and exits without blocking on the engine.
+    const code = await run(['paper', '--validate']);
+    // May succeed with defaults or fail depending on environment; just assert it
+    // returns a number without throwing and without starting a long-running bot.
     expect(typeof code).toBe('number');
+    expect(code).toBeLessThan(2);
   });
 });

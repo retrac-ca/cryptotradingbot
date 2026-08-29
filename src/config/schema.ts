@@ -83,7 +83,23 @@ export const botConfigSchema = z.object({
   maxDailyLossFraction: fractionZeroToOne.default(0.05),
   maxOpenPositions: z.coerce.number().int().min(0).default(1),
   cooldownAfterLossSeconds: z.coerce.number().int().min(0).default(3600),
+  // Phase 7 additions:
+  maxPortfolioExposureFraction: fractionZeroToOne.default(0.5),
+  maxDrawdownFraction: fractionZeroToOne.default(0.1),
+  marketDataMaxAgeMs: z.coerce.number().int().positive().default(60000),
   paperStartingBalance: z.coerce.number().positive().default(10000),
+
+  // --- Paper execution / engine (Phase 8) ---
+  // Paper fill/fee/slippage realism knobs. 0 disables the respective effect.
+  paperFeeFraction: fractionZeroToOne.default(0.0005),
+  paperSlippageFraction: z.coerce.number().min(0).default(0.0005),
+  paperFillFraction: fractionZeroToOne.default(1),
+  // Where the persisted paper state (portfolio, executed orders) is kept so a
+  // restart does not reset the account.
+  paperStateFile: z.string().default('.paper-state.json'),
+  // How often the engine re-evaluates candles/signals (ms); also the market-data
+  // candle poll cadence. Kept small in tests via override.
+  evaluateIntervalSeconds: z.coerce.number().int().positive().default(60),
 
   // --- System ---
   logLevel: z

@@ -17,9 +17,9 @@ behind the design. The guiding principles are:
 | 3 | Exchange abstraction | **DONE** |
 | 4 | NDAX adapter | **DONE** (verified live 2026-08-28) |
 | 5 | Market data | **DONE** |
-| 6 | Strategy engine | Planned |
-| 7 | Risk management | Planned |
-| 8 | Paper trading | Planned |
+| 6 | Strategy engine | **DONE** |
+| 7 | Risk management | **DONE** |
+| 8 | Paper trading | **DONE** |
 | 9 | Persistence | Planned |
 | 10 | Backtesting | Planned |
 | 11 | Live trading safeguards | Planned (disabled until approved) |
@@ -87,12 +87,34 @@ running without editing source.
 - `MarketDataProvider` is the read-only interface strategies consume;
   historical/simulated providers (backtesting) implement it later.
 - **`src/strategy/`** — `Strategy` interface emitting `Signal`s only.
-- **`src/risk/`** — `RiskManager` deciding approve/reject.
-- **`src/portfolio/`** — positions, P&L, exposure.
-- **`src/execution/`** — `ExecutionEngine` with `Paper` and `Live` variants,
-  duplicate-order prevention, and reconcile-before-retry.
-- **`src/persistence/`** — SQLite repository layer.
-- **`src/engine/`** — orchestration that wires the above together.
+- **`src/risk/`** — `RiskManager` deciding approve/reject **and sizing**.
+  It sits between signals and execution: strategies never choose order size or
+  enforce account-level limits. Given a signal + a read-only `RiskContext`
+  snapshot it produces a typed `RiskDecision` (approved/rejected + reason code +
+  quantity + notional + applied limits). Enforces max trade size, per-asset
+  position, portfolio exposure, daily loss, max drawdown, cooldown, kill switch,
+  and exchange market-constraint validation. **Fail-closed** on unavailable or
+  stale state. Risk-reducing SELLs are allowed even when new exposure is
+  prohibited (long-only V1: a SELL never exceeds the held position).
+- **`src/portfolio/`** — cash, positions, average entry price, cost basis,
+  realized/unrealized P&L, and exposure using exact `Money`. `applyFill` handles
+  opening/scaling a long (BUY) and reducing/closing it (SELL), and `markToMarket`
+  prices the book from current market prices. `serialization.ts` persists a
+  `PortfolioModel` as decimal strings so it round-trips a restart exactly.
+- **`src/execution/`** — `PaperExecutionEngine` simulates fills locally: market
+  and limit orders, configurable fees, slippage, partial fills (`fillFraction`),
+  order cancellation, and a long-only safety net. It has **no** reference to a
+  real exchange adapter and **no** live order-placement path. LIVE execution is
+  deliberately absent at this phase.
+- **`src/persistence/`** — `PaperStateStore`, a minimal JSON state file
+  (atomic write via temp+rename) storing the portfolio plus executed paper order
+  ids, so a restart does not reset the account. A fuller SQLite layer is Phase 9.
+- **`src/engine/`** — `PaperEngine` (Phase 8) wires everything into one
+  continuously-running loop: `Market Data → Strategy → Signal → Risk → Paper
+  Execution → Portfolio → Logging/Persistence`. It ticks on a fixed cadence
+  (no busy loop), fails closed on stale/unknown market data, and shuts down
+  gracefully, persisting on stop. `buildEngine.ts` is the composition root that
+  assembles the dependency graph from config.
 - **`src/backtest/`** — reuses strategy + risk over historical data.
 
 ## Safety Model

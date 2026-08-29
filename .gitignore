@@ -30,3 +30,7 @@ logs/
 *.sqlite
 *.sqlite3
 data/
+
+# Persisted bot runtime state (never commit; may contain account/config data)
+.paper-state.json
+.backtest-results*.json

@@ -123,6 +123,34 @@ export class Money {
     return new Money(this.scaled * n);
   }
 
+  /**
+   * Multiply by another same-scale value, producing a same-scale result.
+   * The raw product of two scale-8 values is scale-16; we divide back by the
+   * scale power and round half-up to the nearest unit. Exact to the supported
+   * scale (no floating point). Used e.g. for quantity * price = notional.
+   */
+  mul(other: Money): Money {
+    const negative = this.scaled < 0n !== other.scaled < 0n;
+    const absA = this.scaled < 0n ? -this.scaled : this.scaled;
+    const absB = other.scaled < 0n ? -other.scaled : other.scaled;
+    let quotient = (absA * absB) / SCALE_POW;
+    const remainder = (absA * absB) % SCALE_POW;
+    if (remainder * 2n >= SCALE_POW) quotient += 1n;
+    return new Money(negative ? -quotient : quotient);
+  }
+
+  /**
+   * Divide by another same-scale value, producing a same-scale result
+   * (rescaling the numerator up first). Truncates toward zero. Used e.g. for
+   * notional / price = quantity.
+   */
+  div(other: Money): Money {
+    if (other.scaled === 0n) {
+      throw new Error('Money.div: cannot divide by zero');
+    }
+    return new Money((this.scaled * SCALE_POW) / other.scaled);
+  }
+
   isZero(): boolean {
     return this.scaled === 0n;
   }
@@ -196,6 +224,22 @@ export class Money {
     const remainder = abs % inc;
     const rounded = remainder * 2n >= inc ? quotient + 1n : quotient;
     return new Money((negative ? -rounded : rounded) * inc);
+  }
+
+  /**
+   * Round this value DOWN to the nearest multiple of `increment` (a tick size).
+   * Never rounds toward a larger magnitude, so a sized quantity can never exceed
+   * the cap that produced it. Exact, BigInt-based. For positive values this is a
+   * plain floor; sign is preserved (rounds toward zero on the magnitude).
+   */
+  floorToIncrement(increment: Money): Money {
+    if (increment.scaled <= 0n) {
+      throw new Error('Money.floorToIncrement: increment must be positive');
+    }
+    const negative = this.scaled < 0n;
+    const abs = negative ? -this.scaled : this.scaled;
+    const quotient = abs / increment.scaled;
+    return new Money((negative ? -quotient : quotient) * increment.scaled);
   }
 
   /**

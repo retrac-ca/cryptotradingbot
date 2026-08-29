@@ -150,3 +150,90 @@ open-ended and that sparse markets return gap-y data.
 **Why:** In Node, an `EventEmitter` 'error' event with no listener throws. A
 transient network blip in a background poller must never crash the bot. Naming it
 `failure` avoids the special-cased throw while keeping the semantic clear.
+
+## 14. The RiskManager sizes orders and enforces all account limits
+
+**Decision:** Risk lives in `src/risk/RiskManager`. It sits between `Signal` and
+execution. It does not just approve/reject — it computes the permitted order
+size from a read-only `RiskContext` snapshot. Strategies never choose a size.
+Every decision carries a typed reason code (not just a free-form string) plus
+the quantity, estimated notional, and the limits that applied.
+
+**Why:** The spec required that a strategy cannot bypass risk controls by
+arbitrarily choosing a position size, and that decisions be auditable. Types
+like `DAILY_LOSS_LIMIT_EXCEEDED` are stable keys for logs/persistence/debugging.
+
+**Fail-closed:** whenever a required input is missing or stale (unknown balance,
+position, portfolio value, exposure, P&L, market info, price; or stale market
+data), the BUY path rejects rather than guessing. No "critical-risk-calculation
+unavailable" case silently trades.
+
+**How risk-reducing SELL is handled:** A SELL that closes/reduces a long is
+exempt from the exposure-affecting gates (daily loss, drawdown, cooldown,
+position/exposure/trade caps) — those are about *new exposure*. But it still
+validates the order itself (market info, price, position, quantity) and is
+long-only: a SELL is sized to at most the held position and is rejected if there
+is nothing to sell or it would go short. Stale-data/unknown-state still fail
+closed for SELL because we must not size from an unreliable price.
+
+## 15. No separate `Quantity` type; Money covers asset quantities
+
+**Decision:** Asset quantities are represented with the same `Money` type as
+prices/notional, rather than introducing a distinct `Quantity` class. Three
+exact BigInt methods were added to `Money` to support risk math: `mul`
+(quantity × price → notional), `div` (notional ÷ price → quantity), and
+`floorToIncrement` (round down to a tick so a sized quantity never exceeds the
+cap that produced it).
+
+**Why:** `Money` is already fixed-point scale 8 (covers BTC's 8-decimal
+precision), immutable, and supports tick-multiple validation
+(`isMultipleOf`) and rounding (`roundToIncrement`). A separate `Quantity` class
+would duplicate ~200 lines of identical BigInt arithmetic for no V1 benefit;
+exchange precision is enforced instead by validating against
+`MarketInfo.quantityTick`/`priceTick` before returning an order. This keeps the
+"no floating-point for money/quantities" invariant while avoiding needless
+duplication.
+
+## 16. Paper execution is a local simulator with no live-execution path
+
+**Decision (Phase 8):** Paper trading is implemented by `PaperExecutionEngine` —
+a self-contained simulator that fills orders against a provided reference price
+with configurable fees, slippage, and fill fraction, and updates the `Portfolio`.
+It holds **no reference** to any exchange adapter and exposes **no** path that
+submits a real order. Paper fills record reason codes (e.g. `"test"`) instead
+of exchange order ids, and a test asserts `placeOrder`/`cancelOrder` are never
+invoked while the engine trades — proving paper cannot route to NDAX (or any
+live) order placement.
+
+**Simulator assumptions (kept intentionally simple):**
+- Market orders fill fully (or by `fillFraction`) at the reference price
+  adjusted by a slippage fraction (`paperSlippageFraction`).
+- Limit orders fill immediately when marketable (BUY limit ≥ ask, SELL limit ≤
+  bid); otherwise they rest `OPEN` and can be cancelled. They can partial-fill by
+  `fillFraction`.
+- Fees are charged as a fraction of notional (`paperFeeFraction`) in the quote
+  currency. 0 disables the respective effect.
+- Long-only V1: a SELL cannot exceed the held position (the risk layer sizes
+  it; this engine re-validates as a safety net).
+- No order book depth, queue position, or partial-limit-then-rest simulation
+  beyond the above — that level of realism belongs to Phase 10 backtesting.
+
+**Why:** The goal of Phase 8 is a continuously-running, restart-safe, end-to-end
+paper bot that exercises the real strategy/risk pipeline against real market
+data. Full order-book microstructure is unnecessary and would over-engineer the
+phase. Because execution is purely local and portfolio math is exact `Money`,
+paper results are deterministic and auditable, and the same order/portfolio
+types carry forward to live execution.
+
+## 17. Restart-safe minimal JSON state (full persistence deferred to Phase 9)
+
+**Decision (Phase 8):** `PaperStateStore` persists the `PortfolioModel` plus the
+list of executed paper order ids to a single JSON file using an atomic
+temp-file+rename write. On start, `buildEngine()` loads it and rebuilds the
+`Portfolio`, so a restart does not reset cash, positions, P&L, realize duplicate
+flats, or forget executed orders.
+
+**Why:** Only this small set is needed to stop the paper bot from "forgetting"
+its book across restarts. A full SQLite repository with order/trade history and
+reconciliation is Phase 9; JSON is sufficient and honest for Phase 8's scope.
+`Money` is stored as its canonical decimal string so values survive exactly.

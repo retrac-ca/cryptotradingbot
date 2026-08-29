@@ -15,15 +15,20 @@ the future without rewriting trading logic.
 This project is under active development, built incrementally in phases. See
 `docs/ARCHITECTURE.md` for the full plan and current progress.
 
-**Currently implemented (Phase 1 — Foundation):**
+**Currently implemented (Phases 1–8):**
 - Project scaffolding (TypeScript, Vitest, ESLint)
 - Safe fixed-point money type (`src/money/Money.ts`) — no floating-point money
 - Configuration loading + validation from `.env` (zod), with clear errors
 - Structured logging (pino) with secret redaction
 - A minimal CLI: `setup`, `config`, `paper`, `start`, `status`
+- The NDAX exchange adapter (public market data, live-verified)
+- A polling market-data provider, a moving-average-crossover strategy, and a
+  full risk manager (sizing, exposure, loss/drawdown limits, kill switch)
+- A portfolio tracker with exact P&L, and a **continuous, restart-safe paper
+  trading engine** that runs the whole real-time pipeline without touching a
+  live order endpoint
 
-The NDAX adapter, strategy engine, risk manager, and execution engine are
-planned but not yet implemented.
+Live order execution (Phase 11) is planned but not yet implemented.
 
 ## Requirements
 
@@ -56,6 +61,12 @@ npm install
    npm start -- paper
    ```
 
+   The paper bot evaluates the configured strategy on a fixed cadence against
+   live market data, runs every signal through the risk manager, fills orders
+   through a local simulator (fees/slippage/partial fills), and updates a paper
+   portfolio. Press `Ctrl-C` to stop it gracefully. `npm start -- status` shows
+   the current paper portfolio.
+
 ## CLI Commands
 
 | Command | Description |
@@ -81,6 +92,12 @@ Key settings:
 - `TRADING_PAIRS=BTC/CAD` — comma-separated symbols.
 - `STRATEGY` / `TIMEFRAME` — strategy selection and candle timeframe.
 - `MAX_*` risk controls — conservative defaults safe to leave as-is.
+- Paper-mode knobs (safe to leave as-is): `PAPER_STARTING_BALANCE` (starting
+  cash for the paper account, default 10000 in the quote currency),
+  `PAPER_FEE_FRACTION`, `PAPER_SLIPPAGE_FRACTION`, `PAPER_FILL_FRACTION`,
+  `EVALUATE_INTERVAL_SECONDS` (how often the engine re-evaluates), and
+  `PAPER_STATE_FILE` (where the paper portfolio is persisted between restarts,
+  default `.paper-state.json`).
 
 ## Safety
 

@@ -74,6 +74,29 @@ describe('loadConfig', () => {
     expect(cfg.maxPositionSizeFraction).toBe(0.25);
   });
 
+  it('loads Phase 7 risk fields with conservative defaults', () => {
+    const cfg = loadConfig(baseEnv() as NodeJS.ProcessEnv);
+    expect(cfg.maxPortfolioExposureFraction).toBe(0.5);
+    expect(cfg.maxDrawdownFraction).toBe(0.1);
+    expect(cfg.marketDataMaxAgeMs).toBe(60000);
+    expect(cfg.killSwitch).toBe(false);
+  });
+
+  it('parses Phase 7 risk overrides', () => {
+    const env = {
+      ...baseEnv(),
+      MAX_PORTFOLIO_EXPOSURE_FRACTION: '0.8',
+      MAX_DRAWDOWN_FRACTION: '0.2',
+      MARKET_DATA_MAX_AGE_MS: '30000',
+      KILL_SWITCH: 'true',
+    };
+    const cfg = loadConfig(env as NodeJS.ProcessEnv);
+    expect(cfg.maxPortfolioExposureFraction).toBe(0.8);
+    expect(cfg.maxDrawdownFraction).toBe(0.2);
+    expect(cfg.marketDataMaxAgeMs).toBe(30000);
+    expect(cfg.killSwitch).toBe(true);
+  });
+
   it('collects multiple field errors in details', () => {
     const env: Record<string, string> = { TRADING_PAIRS: 'bad', EXPLODE_UNKNOWN_KEY: 'x' };
     const actual = baseEnv();

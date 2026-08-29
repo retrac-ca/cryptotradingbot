@@ -1,15 +1,23 @@
 /**
  * `bot paper` — start the bot in PAPER trading mode.
  *
- * This ignores TRADING_MODE in config and forces paper mode, so it is always
- * safe (never touches real order endpoints). This is the recommended way to
- * experiment.
+ * Forces paper mode (never touches real order endpoints) and runs the full
+ * end-to-end paper engine: market data → strategy → risk → paper execution →
+ * portfolio → logging/persistence, until signaled to stop.
+ *
+ * Options:
+ *   --validate   Load and validate configuration, then exit without starting
+ *                the engine (used for CI / config checking).
  */
 
 import { loadConfig } from '../config/load.js';
+import { createLogger } from '../logging/logger.js';
 import type { CommandHandler } from './context.js';
+import { runPaperEngine } from './run-engine.js';
 
-export const paperCommand: CommandHandler = (): number => {
+export const paperCommand: CommandHandler = async (args): Promise<number> => {
+  const validateOnly = args.includes('--validate');
+
   let cfg;
   try {
     cfg = loadConfig();
@@ -26,15 +34,19 @@ export const paperCommand: CommandHandler = (): number => {
     return 1;
   }
 
+  if (validateOnly) {
+    // eslint-disable-next-line no-console
+    console.log('Paper configuration OK: ' + cfg.tradingPairs.join(', '));
+    return 0;
+  }
+
   // eslint-disable-next-line no-console
   console.log('Starting cryptotradingbot in PAPER (simulated) mode.');
   // eslint-disable-next-line no-console
   console.log('Trading pairs: ' + cfg.tradingPairs.join(', '));
   // eslint-disable-next-line no-console
   console.log('Paper starting balance: ' + cfg.paperStartingBalance + ' (quote)');
-  // eslint-disable-next-line no-console
-  console.log('\n[INFO] The simulated trading engine is not yet implemented in this phase.');
-  // eslint-disable-next-line no-console
-  console.log('Run "bot status" for current state.');
-  return 0;
+
+  const logger = createLogger({ level: cfg.logLevel });
+  return runPaperEngine(cfg, logger);
 };

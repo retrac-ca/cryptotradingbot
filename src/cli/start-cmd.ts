@@ -1,16 +1,17 @@
 /**
- * `bot start` — start the bot.
+ * `bot start` — start the bot honoring the configured TRADING_MODE.
  *
- * Honors the configured TRADING_MODE. The full trading engine (strategy, risk,
- * execution, market data) is implemented in later phases; for now this
- * validates configuration and prints a clear status so users get immediate,
- * readable feedback.
+ * Only PAPER mode is implemented. LIVE mode is not yet available and fails
+ * closed rather than risking real orders. PAPER mode runs the full end-to-end
+ * paper engine.
  */
 
 import { loadConfig } from '../config/load.js';
+import { createLogger } from '../logging/logger.js';
 import type { CommandHandler } from './context.js';
+import { runPaperEngine } from './run-engine.js';
 
-export const startCommand: CommandHandler = (): number => {
+export const startCommand: CommandHandler = async (): Promise<number> => {
   let cfg;
   try {
     cfg = loadConfig();
@@ -27,13 +28,17 @@ export const startCommand: CommandHandler = (): number => {
     return 1;
   }
 
+  if (cfg.tradingMode !== 'paper') {
+    // eslint-disable-next-line no-console
+    console.error('LIVE trading is not implemented yet. Use "bot paper" to run in PAPER mode.');
+    return 1;
+  }
+
   // eslint-disable-next-line no-console
-  console.log('Starting cryptotradingbot in ' + cfg.tradingMode.toUpperCase() + ' mode...');
+  console.log('Starting cryptotradingbot in PAPER mode...');
   // eslint-disable-next-line no-console
   console.log('Trading pairs: ' + cfg.tradingPairs.join(', '));
-  // eslint-disable-next-line no-console
-  console.log('\n[INFO] The trading engine is not yet implemented in this phase.');
-  // eslint-disable-next-line no-console
-  console.log('Run "bot status" for current state.');
-  return 0;
+
+  const logger = createLogger({ level: cfg.logLevel });
+  return runPaperEngine(cfg, logger);
 };
