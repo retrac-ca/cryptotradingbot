@@ -1,0 +1,72 @@
+/**
+ * CLI entrypoint.
+ *
+ * Command dispatcher for the `bot` binary. Each subcommand is a small module.
+ * This is intentionally minimal at this phase; more commands (backtest,
+ * trades, logs) are added in later phases.
+ */
+
+import { createLogger } from '../logging/logger.js';
+import { configureCommand } from './config-cmd.js';
+import { paperCommand } from './paper-cmd.js';
+import { setupCommand } from './setup-cmd.js';
+import { startCommand } from './start-cmd.js';
+import { statusCommand } from './status-cmd.js';
+
+export const COMMANDS = {
+  setup: setupCommand,
+  config: configureCommand,
+  paper: paperCommand,
+  start: startCommand,
+  status: statusCommand,
+} as const;
+
+export type CommandName = keyof typeof COMMANDS;
+
+const USAGE = `cryptotradingbot v${'0.0.1'}
+
+Usage: bot <command> [options]
+
+Commands:
+  setup    Create/configure the .env file interactively
+  config   Show the effective resolved (non-secret) configuration
+  paper    Start the bot in PAPER (simulated) trading mode
+  start    Start the bot (paper by default)
+  status   Show current bot / trading status
+  help     Show this help
+
+Run "bot <command> --help" for command-specific options.
+`;
+
+export function printUsage(): void {
+  // eslint-disable-next-line no-console
+  console.log(USAGE);
+}
+
+export async function run(argv: string[]): Promise<number> {
+  const logger = createLogger();
+  const [command, ...rest] = argv;
+
+  if (!command || command === 'help' || command === '--help' || command === '-h') {
+    printUsage();
+    return 0;
+  }
+
+  const handler = COMMANDS[command as CommandName];
+  if (!handler) {
+    // eslint-disable-next-line no-console
+    console.error(`Unknown command: "${command}"\n`);
+    printUsage();
+    return 1;
+  }
+
+  try {
+    return await handler(rest, { logger });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // eslint-disable-next-line no-console
+    console.error(`error: ${message}`);
+    logger.error({ err }, 'command failed');
+    return 1;
+  }
+}
