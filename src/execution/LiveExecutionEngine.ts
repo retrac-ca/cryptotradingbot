@@ -3,26 +3,41 @@
  *
  * This engine is deliberately conservative. Its job is to move a fully
  * risk-approved order to the real exchange without ever creating a duplicate or
- * a destructive mistake, and to treat the exchange as authoritative. It does NOT
- * re-do portfolio-level risk analysis; the caller/risk layer must approve an
- * order before it is submitted here.
+ * a destructive mistake, and to treat the exchange as authoritative. It owns
+ * the RiskManager and REQUIRES RiskManager portfolio-level approval before any
+ * order can be submitted — a strategy can never reach LiveOrderEngine directly
+ * and a caller cannot bypass risk by omitting approval: `place()` internally
+ * runs `riskManager.evaluate(ctx)` and refuses to submit unless approved.
+ *
+ * The live execution path is: Strategy -> RiskManager -> LiveOrderEngine ->
+ * OrderStore -> ExchangeAdapter/NDAX. The engine builds the order from the
+ * RiskManager's approved sizing in `place()`, so no external pre-sized order can
+ * be injected past risk.
  *
  * Hard safety properties (all enforced here):
  *  1. GATED START — the engine refuses to operate unless the caller passes the
  *     explicit LiveSafetyGate (TRADING_MODE=live + realFundsAtRisk=true) and the
  *     adapter declares `supportsOrderPlacement`. Absent these it throws.
- *  2. PERSIST-BEFORE-SUBMIT — every order is recorded in the OrderStore keyed by
- *     its clientOrderId as CREATED before any network call, so a crash/duplicate
- *     retry can never submit the same order twice. A pre-existing CREATED/OPEN
- *     order with the same key causes a defensive rejection (reconcile instead).
- *  3. NO AUTO-RETRY ON AMBIGUOUS OUTCOME — if placeOrder returns `unknownOutcome`
+ *  2. RISK GATE — every placement runs RiskManager.evaluate on the provided
+ *     RiskContext. If it is not approved the order is refused (REJECTED) and the
+ *     exchange is never contacted. The order quantity/side/notional come from
+ *     the risk decision, not from any caller-supplied NewOrder.
+ *  3. PERSIST-BEFORE-SUBMIT — every order is recorded in the OrderStore keyed by
+ *     its internally-generated clientOrderId as CREATED before any network call,
+ *     so a crash/duplicate retry can never submit the same order twice. A
+ *     pre-existing CREATED/OPEN order with the same key causes a defensive
+ *     rejection (reconcile instead). Duplicate protection does NOT rely on any
+ *     exchange-side idempotency key (NDAX ClientOrderId is documented as
+ *     potentially non-unique).
+ *  4. NO AUTO-RETRY ON AMBIGUOUS OUTCOME — if placeOrder returns `unknownOutcome`
  *     or throws a timeout/network/ambiguous error, the order is NOT retried. It
  *     is transitioned to UNKNOWN and the caller must reconcile with the exchange
  *     (GetOrderStatus/GetOpenOrders) before deciding anything.
- *  4. PRECISION & BALANCE VALIDATION — quantity is validated against the
+ *  5. PRECISION & BALANCE VALIDATION — quantity is validated against the
  *     market's quantityTick and the real available balance; prices against the
- *     priceTick; minimum order size is enforced.
- *  5. FAIL CLOSED — any uncertainty about an order's disposition surfaces as
+ *     priceTick; minimum order size is enforced (defense-in-depth on top of the
+ *     RiskManager's own sizing checks, re-checked against live market state).
+ *  6. FAIL CLOSED — any uncertainty about an order's disposition surfaces as
  *     UNKNOWN/Api-vs-local mismatch rather than a guess.
  */
 
@@ -38,6 +53,9 @@ import {
 } from '../exchanges/errors.js';
 import { OrderStore } from '../persistence/OrderStore.js';
 import { ReconcileService } from '../reconcile/ReconcileService.js';
+import { RiskManager } from '../risk/RiskManager.js';
+import type { RiskApproval, RiskRejection } from '../risk/Reason.js';
+import type { RiskContext } from '../risk/RiskContext.js';
 
 export interface LiveGate {
   tradingMode: 'live';
@@ -52,6 +70,11 @@ export interface LiveExecutionConfig {
   /** Max ms to wait for exchange to acknowledge an order. Default 15s. */
   ackTimeoutMs?: number;
   /** When a read/ack fails and we cannot determine the outcome. */
+}
+
+export interface LiveOrderIntent {
+  /** Human reason this order is being placed, for auditability. */
+  reason: string;
 }
 
 export interface LiveOrderResult {
@@ -74,18 +97,25 @@ export class LiveOrderEngine {
   private readonly adapter: ExchangeAdapter;
   private readonly store: OrderStore;
   private readonly reconcileService: ReconcileService;
+  private readonly riskManager: RiskManager;
   private readonly cfg: Required<LiveExecutionConfig>;
+  private readonly seq = { n: 0 };
 
   constructor(
     adapter: ExchangeAdapter,
     store: OrderStore,
     reconcile: ReconcileService,
+    riskManager: RiskManager,
     cfg: LiveExecutionConfig,
   ) {
     this.adapter = adapter;
     this.store = store;
     this.reconcileService = reconcile;
-    this.cfg = { ackTimeoutMs: cfg.ackTimeoutMs ?? 15_000, ...cfg };
+    this.riskManager = riskManager;
+    this.cfg = {
+      ackTimeoutMs: cfg.ackTimeoutMs ?? 15_000,
+      ...cfg,
+    };
     this.assertGate();
   }
 
@@ -114,15 +144,84 @@ export class LiveOrderEngine {
   }
 
   /**
-   * Validate and place a single live order. Returns the recorded order. On an
-   * ambiguous outcome the returned order has status `UNKNOWN` and
+   * Risk-gate and place a single live order.
+   *
+   * The ONLY public entry point into live execution. It runs the owned
+   * RiskManager against the provided RiskContext; if risk rejects the intent the
+   * order is refused (REJECTED) and the exchange is never contacted. The order
+   * quantity/side/notional are taken from the risk decision (never from external
+   * callers), and the clientOrderId is generated internally. This makes it
+   * structurally impossible for a strategy to invoke live execution directly or
+   * for a caller to bypass RiskManager portfolio-level approval.
+   *
+   * On an ambiguous outcome the returned order has status `UNKNOWN` and
    * `unknownOutcome === true`; do NOT retry — reconcile instead.
    */
-  async place(order: NewOrder): Promise<LiveOrderResult> {
+  async place(ctx: RiskContext, intent: LiveOrderIntent): Promise<LiveOrderResult> {
     this.assertGate();
+
+    const decision = this.riskManager.evaluate(ctx);
+    if (!decision.approved) {
+      return this.riskRejected(ctx.symbol, decision, intent.reason);
+    }
+    const order = this.orderFromApproval(ctx.symbol, decision, intent.reason);
+    return this.submit(order);
+  }
+
+  // ---- internal risk-gating + submission ----
+
+  /** Refuse an order that RiskManager did not approve. Never contacts the exchange. */
+  private riskRejected(symbol: string, decision: RiskRejection, reason: string): LiveOrderResult {
+    const now = Date.now();
+    const rejected: Order = {
+      clientOrderId: `${this.nextClientOrderId(symbol)}`,
+      exchangeOrderId: null,
+      symbol,
+      side: decision.side ?? 'BUY',
+      type: 'market',
+      status: 'REJECTED',
+      quantity: Money.zero(),
+      filledQuantity: Money.zero(),
+      averagePrice: null,
+      price: null,
+      fills: [],
+      fee: Money.zero(),
+      feeCurrency: 'quote',
+      reason: `${reason} [risk rejected: ${decision.reason}${decision.detail ? `: ${decision.detail}` : ''}]`,
+      createdAtMs: now,
+      updatedAtMs: now,
+    };
+    return {
+      order: rejected,
+      unknownOutcome: false,
+      message: `risk rejected: ${decision.reason}${decision.detail ? `: ${decision.detail}` : ''}`,
+    };
+  }
+
+  /** Build the NewOrder strictly from the risk-approved decision (not from callers). */
+  private orderFromApproval(
+    symbol: string,
+    approval: RiskApproval,
+    reason: string,
+  ): NewOrder {
+    return {
+      clientOrderId: this.nextClientOrderId(symbol),
+      symbol,
+      side: approval.side,
+      type: 'market',
+      quantity: approval.quantity,
+      reason,
+    };
+  }
+
+  /**
+   * Persist-before-submit + submit + classify. Mutates only the OrderStore and
+   * the adapter (via placeOrder). Never retries ambiguous outcomes.
+   */
+  private async submit(order: NewOrder): Promise<LiveOrderResult> {
     await this.validateOrder(order);
 
-    // Persist-before-submit: claim the clientOrderId.
+    // Persist-before-submit: claim the internally-generated clientOrderId.
     if (this.store.get(order.clientOrderId)) {
       return {
         order: this.buildRejected(order, 'DUPLICATE_CLIENT_ORDER_ID: an order with this id already exists; reconcile instead of re-submitting'),
@@ -156,6 +255,12 @@ export class LiveOrderEngine {
     }
   }
 
+  /** Monotonic, per-process unique local idempotency key for a live order. */
+  private nextClientOrderId(symbol: string): string {
+    this.seq.n += 1;
+    return `live-${symbol.replace('/', '')}-${Date.now()}-${this.seq.n}`;
+  }
+
   /** Poll the exchange for the authoritative state of an order (reconciliation). */
   async refreshOrder(order: Order): Promise<Order> {
     if (!order.exchangeOrderId) {
@@ -174,7 +279,11 @@ export class LiveOrderEngine {
 
   // ---- internals ----
 
-  private async validateOrder(order: NewOrder): Promise<void> {
+  /**
+   * Validate an order against market constraints before submission. Public only
+   * as a test seam; the engine always validates internally before placing.
+   */
+  async validateOrder(order: NewOrder): Promise<void> {
     if (!order.quantity.isPositive()) {
       throw new LiveGateError('order quantity must be positive');
     }

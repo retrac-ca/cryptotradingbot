@@ -113,4 +113,67 @@ describe('Reconciler — local intent vs exchange authoritative state', () => {
       expect.objectContaining({ kind: 'BALANCE_NEGATIVE', currency: 'BTC' }),
     );
   });
+
+  // ---- Item 2: local-vs-exchange balance reconciliation (expectedBalances) ----
+
+  it('is consistent and safe when expected local balances match exchange balances', () => {
+    const snapshot = emptySnapshot(); // CAD available = 10000
+    const report = new Reconciler().reconcile(local([]), snapshot, {
+      expectedBalances: new Map([['CAD', Money.fromString('10000')]]),
+    });
+    expect(report.consistent).toBe(true);
+    expect(report.safeToTrade).toBe(true);
+    expect(report.discrepancies).toHaveLength(0);
+  });
+
+  it('treats a difference within balanceTolerance as a match (not a discrepancy)', () => {
+    const snapshot = emptySnapshot(); // CAD available = 10000
+    const report = new Reconciler().reconcile(local([]), snapshot, {
+      expectedBalances: new Map([['CAD', Money.fromString('10000.00000001')]]),
+      // tolerance of 0.00000002 absorbs the one-unit difference
+      balanceTolerance: Money.fromString('0.00000002'),
+    });
+    expect(report.safeToTrade).toBe(true);
+    expect(report.discrepancies).toHaveLength(0);
+  });
+
+  it('flags an unexplained balance mismatch and fails safe (safeToTrade=false)', () => {
+    const snapshot = emptySnapshot(); // CAD available = 10000
+    const report = new Reconciler().reconcile(local([]), snapshot, {
+      expectedBalances: new Map([['CAD', Money.fromString('9000')]]),
+    });
+    expect(report.safeToTrade).toBe(false);
+    expect(report.discrepancies).toContainEqual(
+      expect.objectContaining({ kind: 'BALANCE_MISMATCH', currency: 'CAD' }),
+    );
+    // The local balance must NOT be silently overwritten: it is surfaced, not fixed.
+    expect(report.discrepancies[0]!.detail).toContain('CAD');
+  });
+
+  it('fails safe when the exchange reports no balance for an expected currency', () => {
+    const snapshot = emptySnapshot(); // only CAD present
+    const report = new Reconciler().reconcile(local([]), snapshot, {
+      expectedBalances: new Map([['BTC', Money.fromString('0.5')]]),
+    });
+    expect(report.safeToTrade).toBe(false);
+    expect(report.discrepancies).toContainEqual(
+      expect.objectContaining({ kind: 'BALANCE_MISMATCH', currency: 'BTC' }),
+    );
+  });
+
+  it('ignores exchange currencies the bot does not expect (not a discrepancy)', () => {
+    const snapshot: ExchangeAccountSnapshot = {
+      ...emptySnapshot(),
+      balances: [
+        { currency: 'CAD', total: Money.fromString('10000'), available: Money.fromString('10000'), held: Money.zero() },
+        { currency: 'ETH', total: Money.fromString('2'), available: Money.fromString('2'), held: Money.zero() },
+      ],
+    };
+    // Bot only expects CAD; ETH on the exchange is simply untracked by the bot.
+    const report = new Reconciler().reconcile(local([]), snapshot, {
+      expectedBalances: new Map([['CAD', Money.fromString('10000')]]),
+    });
+    expect(report.consistent).toBe(true);
+    expect(report.safeToTrade).toBe(true);
+  });
 });

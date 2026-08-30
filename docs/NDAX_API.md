@@ -537,3 +537,32 @@ behind the adapter; no endpoint, request field, auth header, or order semantic i
 guessed into the codebase. The pure order mappers in
 `src/exchanges/ndax/orderMappings.ts` are ready to be wired once items 1–6 are
 verified, and are covered by unit tests using deterministic fixtures.
+
+### V1 software readiness vs NDAX private-API verification vs live-trading authorization
+
+These three are deliberately distinct and each is a separate gate. Satisfying
+one does NOT satisfy the others.
+
+1. **V1 software readiness (this repo).** The code that would drive live
+   placement is complete and unit-tested: the `LiveOrderEngine` risk-gates every
+   placement through `RiskManager`, persists before submit, never auto-retries an
+   ambiguous outcome, and fail-closes on reconcile balance mismatches and stale
+   data. This proves the *software* is safe to reason about, but it never touches
+   a real account. Fulfilled at the V1 milestone.
+2. **NDAX private API verification.** The read and (future) order-path code is
+   exercised against a *real* NDAX account whose credentials the owner provisions
+   and authorizes. This is the slowest, environment-dependent phase (IP
+   allow-listing, key Trading permission, validating header signing for reads,
+   then empirically validating `SendOrder`/`CancelOrder` semantics on a
+   non-production key as described above). It requires the owner to act; the repo
+   cannot do it on its own. NOT fulfilled.
+3. **Live-trading authorization.** The human owner gives explicit, deliberate
+   approval to place orders that move real funds (in addition to
+   `supportsOrderPlacement=true` and the config `realFundsAtRisk=true`
+   acknowledgement). This is a people/process gate, not a code gate, and is the
+   final authority. NEVER fulfilled.
+
+Point 2 is a prerequisite for the `supportsOrderPlacement` flag to be armed;
+point 3 is what actually authorizes moving funds. Until point 2 passes, point 3
+is moot for NDAX. Code changes may advance point 1; points 2 and 3 await the
+owner.

@@ -343,3 +343,35 @@ the `NDAX_API.md` "what is required before supportsOrderPlacement can become
 true" checklist enumerates the six items (live read auth, a safe placement
 mechanism, wire-shape verification, lifecycle confirmation, key/IP permissions,
 fees) that must pass first.
+
+## 23. V1 live-enablement hardening — risk-gated execution + balance reconciliation (2026-08-29)
+
+**Decision (V1 hardening, no live trading enabled):** three gaps in the
+live-ready software path were closed, with **no** change to
+`supportsOrderPlacement` (still `false`), **no** wiring of NDAX into real order
+submission, and **no** live order/cancel calls.
+
+1. **`LiveOrderEngine.place` now takes a `RiskContext` + intent instead of a raw
+   `NewOrder`.** It runs the owned `RiskManager`; the order (side, quantity,
+   internally-generated `clientOrderId`) is built **only** from the risk approval,
+   so a strategy cannot bypass portfolio-level risk or dictate size. A risk
+   rejection returns `REJECTED` without ever contacting the exchange. The
+   strategy→risk→live-engine→store→adapter path is the single entry point.
+2. **Local-vs-exchange balance reconciliation.** `Reconciler.reconcile` and
+   `ReconcileService.reconcile` accept `ReconcileOptions.expectedBalances`
+   (currency → expected local available) plus a `balanceTolerance` (default one
+   unit of `Money` scale, i.e. effectively exact). An unexplained difference
+   beyond tolerance, or an expected currency missing from the exchange, yields a
+   `BALANCE_MISMATCH` discrepancy and forces `safeToTrade=false`. The local
+   balance is never silently overwritten with the exchange's — the mismatch is
+   surfaced for a human/engine to resolve.
+
+**Why:** these close the V1 safety-critical test/design gaps: (a) the previous
+entry point let a caller hand the engine an arbitrary order, so RiskManager was
+not structurally in the live path; (b) reconciliation previously compared only
+orders, not balances, so unexplained balance drift wouldn't stop trading; (c) the
+below-min-size, limit-notional, limit-tick, SELL-over-balance, catch-all-UNKNOWN
+and ack-timeout gates were untested. All are now unit-tested. See the three-phase
+framing (software readiness vs NDAX private-API verification vs live-trading
+authorization) in `NDAX_API.md`.
+

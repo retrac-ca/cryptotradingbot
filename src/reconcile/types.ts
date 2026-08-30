@@ -59,6 +59,37 @@ export interface ReconcileReport {
 
 /** How the reconciler is told to proceed when reads fail (fail safe by default). */
 export interface ReconcileOptions {
-  /** Expected local quote balances keyed by currency (for drift detection). */
+  /**
+   * Expected local available balances keyed by currency (for drift detection).
+   *
+   * When provided, the reconciler compares each locally-expected currency's
+   * expected amount against the exchange's authoritative balance for that
+   * currency. An unexplained difference beyond `balanceTolerance` is a
+   * `BALANCE_MISMATCH` discrepancy and forces `safeToTrade = false`.
+   *
+   * Design rules (documented):
+   *  - Which balances are compared: only currencies present in this map. The
+   *    bot asserts its own bookkeeping for currencies it expects to hold.
+   *  - How the expected amount is interpreted: it is compared against the
+   *    exchange balance's `available` amount (the portion available to trade).
+   *  - What counts as a discrepancy: abs(expected - exchange.available) >
+   *    balanceTolerance.
+   *  - Unknown exchange balance: if the exchange reports no balance for an
+   *    expected currency, we cannot confirm it and treat it as a mismatch
+   *    (fail closed).
+   *  - Unknown local balance: currencies the exchange reports but the bot has
+   *    no expectation for are ignored (not a discrepancy) — the bot may simply
+   *    not track that currency.
+   *  - The exchange remains authoritative for actual balances; a mismatch is
+   *    NEVER resolved by silently overwriting local state with exchange state.
+   *    It is surfaced as a discrepancy for a human/engine to resolve.
+   */
   expectedBalances?: Map<string, Money>;
+  /**
+   * Absolute tolerance for balance comparison, in the compared currency's own
+   * units. A difference equal to or below this is treated as matching.
+   * Defaults to one smallest representable unit of the Money scale
+   * (0.00000001), i.e. effectively exact comparison unless overridden.
+   */
+  balanceTolerance?: Money;
 }

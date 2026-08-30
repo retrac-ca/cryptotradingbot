@@ -11,14 +11,19 @@
  */
 
 import type { Order } from '../order.js';
+import { Money } from '../money/Money.js';
 import type {
   Discrepancy,
   ExchangeAccountSnapshot,
   LocalOrderLedger,
+  ReconcileOptions,
   ReconcileReport,
 } from './types.js';
 
 const TERMINAL: ReadonlySet<string> = new Set(['FILLED', 'CANCELED', 'REJECTED', 'EXPIRED']);
+
+/** Default tolerance for balance comparison: one smallest unit (exact by default). */
+const DEFAULT_BALANCE_TOLERANCE = Money.fromString('0.00000001');
 
 export class Reconciler {
   /**
@@ -28,8 +33,15 @@ export class Reconciler {
    * returns a partial snapshot when reads fail. If the snapshot itself is
    * incomplete (missing balances/open orders/history), we cannot determine
    * consistency and fail safe.
+   *
+   * Optional `ReconcileOptions.expectedBalances` enables local-vs-exchange
+   * available-balance drift detection (see ReconcileOptions for the rules).
    */
-  reconcile(local: LocalOrderLedger, snapshot: ExchangeAccountSnapshot): ReconcileReport {
+  reconcile(
+    local: LocalOrderLedger,
+    snapshot: ExchangeAccountSnapshot,
+    options: ReconcileOptions = {},
+  ): ReconcileReport {
     const discrepancies: Discrepancy[] = [];
 
     // If reads are missing/incomplete, fail safe: consistency is unknowable.
@@ -131,6 +143,11 @@ export class Reconciler {
       }
     }
 
+    // 5) Local-vs-exchange expected balance drift detection (when enabled).
+    if (options.expectedBalances) {
+      this.checkExpectedBalances(options.expectedBalances, snapshot, options, discrepancies);
+    }
+
     const consistent = discrepancies.length === 0;
     return {
       consistent,
@@ -143,6 +160,43 @@ export class Reconciler {
       ordersMatchedByExchangeId: matchedExchange,
       checkedAtMs: snapshot.fetchedAtMs,
     };
+  }
+
+  /**
+   * Compare locally-expected available balances against the exchange's
+   * authoritative balances, per ReconcileOptions rules. Never guesses or
+   * overwrites local state — it only flags a discrepancy.
+   */
+  private checkExpectedBalances(
+    expected: Map<string, Money>,
+    snapshot: ExchangeAccountSnapshot,
+    options: ReconcileOptions,
+    discrepancies: Discrepancy[],
+  ): void {
+    const tolerance = options.balanceTolerance ?? DEFAULT_BALANCE_TOLERANCE;
+    const byCurrency = new Map(snapshot.balances.map((b) => [b.currency, b]));
+
+    for (const [currency, expectedAvailable] of expected) {
+      const exchange = byCurrency.get(currency);
+      if (!exchange) {
+        // We expect this currency but the exchange shows none — cannot confirm.
+        discrepancies.push({
+          kind: 'BALANCE_MISMATCH',
+          currency,
+          detail: `expected local ${currency} balance ${expectedAvailable.toString()} but exchange reports no ${currency} balance`,
+        });
+        continue;
+      }
+      const diff = expectedAvailable.sub(exchange.available);
+      const absDiff = diff.isNegative() ? diff.negate() : diff;
+      if (absDiff.compareTo(tolerance) > 0) {
+        discrepancies.push({
+          kind: 'BALANCE_MISMATCH',
+          currency,
+          detail: `local ${currency} available ${expectedAvailable.toString()} != exchange ${exchange.available.toString()} (diff ${absDiff.toString()} > tol ${tolerance.toString()})`,
+        });
+      }
+    }
   }
 }
 

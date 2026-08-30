@@ -12,7 +12,12 @@
 import type { ExchangeAdapter } from '../exchanges/ExchangeAdapter.js';
 import type { OrderStore } from '../persistence/OrderStore.js';
 import { Reconciler, TERMINAL } from './Reconciler.js';
-import type { ExchangeAccountSnapshot, LocalOrderLedger, ReconcileReport } from './types.js';
+import type {
+  ExchangeAccountSnapshot,
+  LocalOrderLedger,
+  ReconcileOptions,
+  ReconcileReport,
+} from './types.js';
 
 export class ReconcileService {
   constructor(
@@ -37,10 +42,13 @@ export class ReconcileService {
   /**
    * Reconcile against the live exchange. Fails safe (safeToTrade=false) if any
    * read fails or if a discrepancy is found.
+   *
+   * `options.expectedBalances` enables local-vs-exchange available-balance drift
+   * detection (see ReconcileOptions for exact comparison rules and tolerance).
    */
-  async reconcile(): Promise<ReconcileReport> {
+  async reconcile(options: ReconcileOptions = {}): Promise<ReconcileReport> {
     const snapshot = await this.fetchSnapshot();
-    return this.reconciler.reconcile(this.localLedger(), snapshot);
+    return this.reconciler.reconcile(this.localLedger(), snapshot, options);
   }
 
   /**
