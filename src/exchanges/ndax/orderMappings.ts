@@ -143,10 +143,18 @@ export function mapSendOrderResponse(raw: unknown): PlaceOrderResult {
     throw new InvalidResponseError(`NDAX SendOrder returned unexpected shape: ${JSON.stringify(raw)}`);
   }
   const r = raw as Record<string, unknown>;
-  const status = String(r.status ?? '').toLowerCase();
+  const status = typeof r.status === 'string' ? r.status.toLowerCase() : '';
   const errormsg = typeof r.errormsg === 'string' ? r.errormsg : '';
   if (status === 'rejected') {
     throw new OrderRejectedError(`NDAX SendOrder rejected: ${errormsg || 'unknown reason'}`);
+  }
+  if (status !== 'accepted') {
+    // A missing/unrecognized status means we cannot parse the ack. The order may
+    // or may not have been accepted => AMBIGUOUS: fail closed, reconcile.
+    throw new InvalidResponseError(
+      `NDAX SendOrder returned an unrecognized status (${JSON.stringify(raw)}); ` +
+        'outcome is ambiguous, reconcile before acting',
+    );
   }
   const orderId = r.OrderId ?? r.orderid;
   return {

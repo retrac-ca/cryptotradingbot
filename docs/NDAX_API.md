@@ -358,11 +358,22 @@ isolated in the adapter — flag to confirm against the live API.
 
 ### Map to our adapter
 
-`src/exchanges/ndax/orderMappings.ts` encodes the above (pure + unit tested):
-`toNdaxSendOrderRequest`, `toNdaxCancelOrderRequest`, `mapSendOrderResponse`,
-`mapCancelOrderResponse`, plus enum mappers. These are **not** wired to any live
-path while `supportsOrderPlacement=false`; they are the reviewed isolation layer
-required before enabling.
+`src/exchanges/ndax/orderMappings.ts` encodes the above docs (pure + unit
+tested): `toNdaxSendOrderRequest`, `toNdaxCancelOrderRequest`,
+`mapSendOrderResponse`, `mapCancelOrderResponse`, plus enum mappers. **Gate 3
+(2026-08-30): these are now wired into `NdaxAdapter.placeOrder()`/`cancelOrder()`
+— the real SendOrder/CancelOrder network paths (POST via the shared
+`NdaxRestClient`).** `mapSendOrderResponse` fails closed: any response without a
+recognized `"Accepted"`/`"Rejected"` status throws `InvalidResponseError`
+(AMBIGUOUS), so a malformed ack can never be treated as a definite acknowledgement.
+
+The paths stay DISABLED: they only execute when the internal
+`enableOrderPlacement` option is set (a test-only switch NOT exposed through the
+bot configuration), and `capabilities.supportsOrderPlacement` remains `false`.
+`bot start` enforces an explicit `--confirm-live` flag (plus
+`TRADING_MODE=live` and `REAL_FUNDS_AT_RISK=true`) before it will even consider
+live mode, and then fails closed because the adapter does not advertise
+placement. See the checklist below and `DECISIONS.md` §24.
 
 - **OrderState**: 🔎 RESOLVED — REST returns **string** values: `"Accepted"`,
   `"Rejected"`, `"Working"`, `"Canceled"`, `"Expired"`, `"FullyExecuted"`
@@ -503,7 +514,11 @@ Still flagged (not yet exercised against a live account):
 
 ### What is required before `supportsOrderPlacement` can safely become `true`
 
-The safe-enablement checklist (each item is currently NOT satisfied):
+Status as of **Gate 3 (2026-08-30)**: the software pathway is fully implemented
+and unit-tested (order mappers, deterministic wire tests for SendOrder/CancelOrder,
+`--confirm-live` live-start gating), but **every item below that requires
+interaction with a real NDAX account is still NOT satisfied**, so the flag stays
+`false`.
 
 1. **Live, read-only auth validated** against a real NDAX account: header signing
    (`Nonce`/`APIKey`/`Signature`/`UserId`) accepted for private reads
@@ -514,14 +529,18 @@ The safe-enablement checklist (each item is currently NOT satisfied):
    testnet/sandbox or an explicit paper/demo key that NDAX confirms cannot move
    funds. **No such mechanism has been found. Until one exists, SendOrder and
    CancelOrder must NOT be exercised**, because they would place real orders with
-   real funds.
+   real funds. (Note: the network paths now exist behind the internal
+   `enableOrderPlacement` switch, but nothing in configuration exposes that
+   switch — it is a test-only seam.)
 3. **SendOrder/CancelOrder request + response empirically verified** on that safe
    mechanism: exact key casing (`quantity`), whether NDAX accepts a market order
    without `LimitPrice`, `ClientOrderId` numeric acceptance, and that
    `GetOrderStatus`/`GetOpenOrders` return the new order by `OrderId` and by
    `ClientOrderId`. This confirms the `toNdaxSendOrderRequest`/
    `toNdaxCancelOrderRequest`/`mapSendOrderResponse`/`mapCancelOrderResponse`
-   mappers and their enums.
+   mappers and their enums (the deterministic wire-shape tests in
+   `tests/unit/exchanges/ndaxPlacement.test.ts` pin the request/response shapes
+   that must be confirmed live).
 4. **Order-lifecycle confirmed**: after an ack (`status:"Accepted"`) the order
    appears via `GetOrderStatus`/`GetOpenOrders`; after `CancelOrder` the canceled
    state is observable there; async ack semantics understood (SendOrder is
@@ -530,37 +549,40 @@ The safe-enablement checklist (each item is currently NOT satisfied):
    `Trading` permission and any IP whitelist must include the bot's egress IP).
 6. **Fees confirmed** to use in risk/paper modeling (flat 0.20%).
 
-Until all six are satisfied, NDAX keeps `supportsOrderPlacement=false` and the
-adapter's `placeOrder`/`cancelOrder` throw `OrderRejectedError` — live mode fails
-closed (the `LiveOrderEngine` refuses to start). The uncertainty stays isolated
-behind the adapter; no endpoint, request field, auth header, or order semantic is
-guessed into the codebase. The pure order mappers in
-`src/exchanges/ndax/orderMappings.ts` are ready to be wired once items 1–6 are
-verified, and are covered by unit tests using deterministic fixtures.
+Until all six are satisfied, NDAX keeps `supportsOrderPlacement=false`, so live
+mode fails closed (the `LiveOrderEngine` refuses to construct, and `bot start`
+in live mode refuses even with `--confirm-live`). Gate 3 adds a redundant human
+gate in front of any future live start: `bot start` requires
+`TRADING_MODE=live` + `REAL_FUNDS_AT_RISK=true` + the per-invocation
+`--confirm-live` flag.
 
 ### V1 software readiness vs NDAX private-API verification vs live-trading authorization
 
 These three are deliberately distinct and each is a separate gate. Satisfying
 one does NOT satisfy the others.
 
-1. **V1 software readiness (this repo).** The code that would drive live
-   placement is complete and unit-tested: the `LiveOrderEngine` risk-gates every
-   placement through `RiskManager`, persists before submit, never auto-retries an
+1. **V1 software readiness (this repo).** The code that drives live placement is
+   complete and unit-tested: `LiveOrderEngine` risk-gates every placement
+   through `RiskManager`, persists before submit, never auto-retries an
    ambiguous outcome, and fail-closes on reconcile balance mismatches and stale
-   data. This proves the *software* is safe to reason about, but it never touches
-   a real account. Fulfilled at the V1 milestone.
-2. **NDAX private API verification.** The read and (future) order-path code is
-   exercised against a *real* NDAX account whose credentials the owner provisions
-   and authorizes. This is the slowest, environment-dependent phase (IP
+   data; the NDAX SendOrder/CancelOrder network paths are implemented and proven
+   against deterministic wire tests behind the internal `enableOrderPlacement`
+   switch; and `bot start` enforces an explicit `--confirm-live` flag. This
+   proves the *software* is safe to reason about, but it never touches a real
+   account. Fulfilled at the Gate 3 milestone.
+2. **NDAX private API verification.** The read and order-path code is exercised
+   against a *real* NDAX account whose credentials the owner provisions and
+   authorizes. This is the slowest, environment-dependent phase (IP
    allow-listing, key Trading permission, validating header signing for reads,
    then empirically validating `SendOrder`/`CancelOrder` semantics on a
    non-production key as described above). It requires the owner to act; the repo
    cannot do it on its own. NOT fulfilled.
 3. **Live-trading authorization.** The human owner gives explicit, deliberate
    approval to place orders that move real funds (in addition to
-   `supportsOrderPlacement=true` and the config `realFundsAtRisk=true`
-   acknowledgement). This is a people/process gate, not a code gate, and is the
-   final authority. NEVER fulfilled.
+   `supportsOrderPlacement=true`, the config `REAL_FUNDS_AT_RISK=true`
+   acknowledgement, and the per-invocation `--confirm-live` flag). This is a
+   people/process gate, not a code gate, and is the final authority. NEVER
+   fulfilled.
 
 Point 2 is a prerequisite for the `supportsOrderPlacement` flag to be armed;
 point 3 is what actually authorizes moving funds. Until point 2 passes, point 3

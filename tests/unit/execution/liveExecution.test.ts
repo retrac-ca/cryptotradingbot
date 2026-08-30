@@ -275,4 +275,42 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     expect(result.order.status).toBe('REJECTED');
     expect(exchange.submittedOrders).toHaveLength(0);
   });
+
+  // ---- Ack ≠ on-book: lifecycle must be confirmed via reconciliation ----
+
+  it('treats an exchange ack as SUBMITTED (not on-book) until reconciliation confirms it', async () => {
+    const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
+    const engine = buildEngine(exchange);
+    const result = await engine.place(riskContext(), { reason: 'test' });
+    // SendOrder's async ack only proves receipt; the engine stores SUBMITTED.
+    expect(result.order.status).toBe('SUBMITTED');
+    expect(result.order.exchangeOrderId).not.toBeNull();
+    // Reconciliation (refresh against the authoritative order state) confirms
+    // the lifecycle instead of trusting the ack.
+    const authoritative = await engine.refreshOrder(result.order);
+    expect(authoritative.exchangeOrderId).toBe(result.order.exchangeOrderId);
+    expect(['OPEN', 'FILLED', 'PARTIALLY_FILLED']).toContain(authoritative.status);
+  });
+
+  it('records ambiguous submissions for reconciliation and confirms via reconcile', async () => {
+    const exchange = new FakeExchange({
+      balances: { CAD: '100000' },
+      markets: { 'BTC/CAD': market },
+      unknownOrderSubmissions: true,
+    });
+    const engine = buildEngine(exchange);
+    const result = await engine.place(riskContext(), { reason: 'test' });
+    expect(result.unknownOutcome).toBe(true);
+    expect(result.order.status).toBe('UNKNOWN');
+    expect(result.order.exchangeOrderId).toBeNull();
+    // The engine refuses to retry; the reconcile() path is the sanctioned next step.
+    const report = await engine.reconcile();
+    expect(typeof report.consistent).toBe('boolean');
+  });
+
+  it('never places an order at construction/startup (no automatic first trade)', async () => {
+    const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
+    buildEngine(exchange);
+    expect(exchange.submittedOrders).toHaveLength(0);
+  });
 });

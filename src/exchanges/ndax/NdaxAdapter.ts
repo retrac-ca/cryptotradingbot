@@ -5,8 +5,13 @@
  *   - Public market data (ticker, order book, candles, markets) via REST.
  *   - Authenticated account reads (balances, open orders, order history, status)
  *     using NDAX header-signing auth (Nonce/APIKey/Signature/UserId).
- *   - Order placement / cancellation are NOT enabled. They throw OrderRejectedError
- *     until explicitly enabled, so this adapter can never place a real order.
+ *   - Order placement / cancellation: the SendOrder/CancelOrder NETWORK PATHS are
+ *     IMPLEMENTED via the shared NdaxRestClient (POST + signed headers + typed
+ *     errors) and the pure orderMapper layer, but they stay DISABLED by default
+ *     (`enableOrderPlacement=false`): they throw OrderRejectedError unless that
+ *     internal switch is set. `capabilities.supportsOrderPlacement` remains
+ *     `false`, so the live execution engine always fails closed and this adapter
+ *     can never place a real order through the live path.
  *
  * Wire behavior was aligned with the production-proven CCXT NDAX connector
  * (see docs/NDAX_API.md, Phase 4): GET for reads with url-encoded query params,
@@ -42,6 +47,12 @@ import {
   timeframeToInterval,
   ymdhms,
 } from './mappings.js';
+import {
+  mapCancelOrderResponse,
+  mapSendOrderResponse,
+  toNdaxCancelOrderRequest,
+  toNdaxSendOrderRequest,
+} from './orderMappings.js';
 import { ndaxSignature } from './signing.js';
 
 export interface NdaxCredentials {
@@ -71,6 +82,15 @@ export interface NdaxAdapterOptions {
    * against a live account, so authenticated reads stay gated.
    */
   enableAuthenticatedReads?: boolean;
+  /**
+   * If true, arm the SendOrder/CancelOrder network paths. Default false. This
+   * is an INTERNAL switch for deterministic wire tests ONLY — it is not exposed
+   * through the bot configuration, and `capabilities.supportsOrderPlacement`
+   * stays `false` regardless, so the live execution engine cannot start. It
+   * exists so the exact request/response behavior can be exercised with a
+   * scripted fetch without any production path reaching a real order endpoint.
+   */
+  enableOrderPlacement?: boolean;
   /** Minimum interval between REST requests. Defaults to the client's 1000ms. */
   throttleMs?: number;
   /** Provide instrumentId/market overrides for tests (avoids GetInstruments). */
@@ -88,6 +108,10 @@ const CAPABILITIES: ExchangeCapabilities = {
   supportsOrderBook: true,
   supportsFees: true,
   supportsMarketInfo: true,
+  // Deliberately kept false (Gate 2 → Gate 3): even though the SendOrder/
+  // CancelOrder network paths are now implemented behind `enableOrderPlacement`,
+  // the adapter does NOT advertise live placement to the engine. LiveOrderEngine
+  // reads THIS flag; while it is false, live trading fails closed.
   supportsOrderPlacement: false, // NOT enabled in this milestone
   // Public data does NOT require auth (verified live: public endpoints are
   // unsigned GETs). Only account reads need credentials.
@@ -101,6 +125,7 @@ export class NdaxAdapter implements ExchangeAdapter {
   private readonly client: NdaxRestClient;
   private readonly creds: NdaxCredentials;
   private readonly enableAuthenticatedReads: boolean;
+  private readonly enableOrderPlacement: boolean;
   private readonly marketOverrides: Record<string, string>;
   private marketsCache: Map<string, MarketInfo> | null = null;
   private lastNonceMs = 0;
@@ -108,6 +133,7 @@ export class NdaxAdapter implements ExchangeAdapter {
   constructor(opts: NdaxAdapterOptions) {
     this.creds = opts.credentials;
     this.enableAuthenticatedReads = opts.enableAuthenticatedReads ?? false;
+    this.enableOrderPlacement = opts.enableOrderPlacement ?? false;
     this.marketOverrides = opts.marketOverrides ?? {};
     const restOpts: NdaxRestClientOptions = {
       baseUrl: opts.baseUrl ?? 'https://api.ndax.io:8443/AP',
@@ -287,17 +313,39 @@ export class NdaxAdapter implements ExchangeAdapter {
     return m;
   }
 
-  // ---- order placement (disabled) ----
+  // ---- order placement (implemented, disabled unless enableOrderPlacement) ----
 
-  async placeOrder(_order: NewOrder): Promise<PlaceOrderResult> {
-    throw new OrderRejectedError(
-      'NDAX placeOrder is disabled in this milestone. Real order placement is ' +
-        'not enabled and must be explicitly reviewed before use.',
-    );
+  /**
+   * Send the real NDAX SendOrder POST (ASYNCHRONOUS) for a fully-specified
+   * NewOrder. The response only confirms RECEIPT (`{status:"Accepted"}`), NOT
+   * that the order reached the book — the execution engine reconciles via
+   * getOrderStatus/getOpenOrders to confirm the working order.
+   *
+   * Gated: throws OrderRejectedError unless `enableOrderPlacement` is true and
+   * authenticated reads are enabled. `capabilities.supportsOrderPlacement`
+   * stays false, so the live engine never reaches this path.
+   */
+  async placeOrder(order: NewOrder): Promise<PlaceOrderResult> {
+    this.assertOrderPlacementEnabled();
+    const auth = await this.requireAuth();
+    const market = await this.getMarketInfo(order.symbol);
+    const body = toNdaxSendOrderRequest(order, market, auth.accountId);
+    const data = await this.client.post('SendOrder', body, { requiresAuth: true });
+    const result = mapSendOrderResponse(data);
+    return { ...result, clientOrderId: order.clientOrderId };
   }
 
-  async cancelOrder(_symbol: string, _exchangeOrderId: string): Promise<CancelResult> {
-    throw new OrderRejectedError('NDAX cancelOrder is disabled in this milestone.');
+  /**
+   * Send the real NDAX CancelOrder POST for an exchangeOrderId. The response
+   * confirms only RECEIPT, not cancellation — confirm via getOrderStatus /
+   * getOpenOrders. Gated like placeOrder.
+   */
+  async cancelOrder(_symbol: string, exchangeOrderId: string): Promise<CancelResult> {
+    this.assertOrderPlacementEnabled();
+    const auth = await this.requireAuth();
+    const body = toNdaxCancelOrderRequest(exchangeOrderId, auth.accountId);
+    const data = await this.client.post('CancelOrder', body, { requiresAuth: true });
+    return mapCancelOrderResponse(data);
   }
 
   // ---- private helpers ----
@@ -329,6 +377,17 @@ export class NdaxAdapter implements ExchangeAdapter {
     const nonce = now > this.lastNonceMs ? now : this.lastNonceMs + 1;
     this.lastNonceMs = nonce;
     return String(nonce);
+  }
+
+  /** Refuse order placement unless the internal test-only switch is armed. */
+  private assertOrderPlacementEnabled(): void {
+    if (!this.enableOrderPlacement) {
+      throw new OrderRejectedError(
+        'NDAX order placement is disabled. The SendOrder/CancelOrder network ' +
+          'paths are implemented but not enabled: supportsOrderPlacement remains ' +
+          'false and live trading fails closed.',
+      );
+    }
   }
 
   private async requireAuth(): Promise<{ accountId: number }> {

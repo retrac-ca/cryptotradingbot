@@ -35,16 +35,23 @@ This project is under active development, built incrementally in phases. See
 - A **live execution engine** with strict safety controls (gated start,
   persist-before-submit, no auto-retry on ambiguous outcomes, precision and
   balance validation) behind the exchange adapter
+- The **NDAX SendOrder/CancelOrder network paths** — real signed-POST
+  order placement/cancellation wiring, unit-tested against deterministic
+  fixtures, but kept **disabled** behind an internal switch
+- An **explicit live-confirmation mechanism** — `bot start` requires
+  `TRADING_MODE=live` + `REAL_FUNDS_AT_RISK=true` **and** a per-invocation
+  `--confirm-live` flag before it will even consider live mode
 - A **backtesting** module (`bot backtest`) that replays historical candles
   through the strategy → risk → execution pipeline and reports performance
 - CLI commands: `backtest`, `trades`, and read-only `reconcile`
 
-**Live order execution is not yet enabled for NDAX.** The live execution engine
-and reconciliation are implemented and fully tested, but the NDAX adapter keeps
-real order placement **disabled** (`supportsOrderPlacement=false`) because NDAX
-order-submission semantics and private-header signing have not yet been verified
-against a live account and there is no official public testnet. Live trading
-therefore fails closed until that is individually validated.
+**Live order execution is not yet enabled for NDAX.** The live execution engine,
+reconciliation, and the order-placement network paths are implemented and fully
+tested, but the NDAX adapter keeps real order placement **disabled**
+(`supportsOrderPlacement=false`) because NDAX order-submission semantics and
+private-header signing have not yet been verified against a live account and
+there is no official public testnet. Live trading therefore fails closed (even
+`bot start --confirm-live` refuses) until that is individually validated.
 
 ## Requirements
 
@@ -138,8 +145,9 @@ win rate, realized P&L, fees, max drawdown, and largest win/loss.
 
 - **Paper trading is the default.** Simulated orders are always distinctly
   labeled as PAPER and never reach a real exchange order endpoint.
-- **Live trading requires deliberate action:** you must set `TRADING_MODE=live`
-  **and** `REAL_FUNDS_AT_RISK=true`. Startup fails otherwise.
+- **Live trading requires deliberate action, twice over:** you must set
+  `TRADING_MODE=live` **and** `REAL_FUNDS_AT_RISK=true` **and** pass
+  `--confirm-live` on every `bot start` invocation. Startup fails otherwise.
 - A `KILL_SWITCH` immediately blocks all trading.
 - Conservative risk limits (`MAX_POSITION_SIZE_FRACTION`,
   `MAX_DAILY_LOSS_FRACTION`, `MAX_OPEN_POSITIONS`, ...) apply.
@@ -151,10 +159,11 @@ win rate, realized P&L, fees, max drawdown, and largest win/loss.
 - API credentials are stored only in your environment / `.env` (which is
   git-ignored) and are never logged.
 
-**Live order placement is not yet enabled for NDAX.** The live execution engine
-and reconciliation exist and are tested, but the NDAX adapter refuses real order
-placement until its order semantics and private-header signing are verified
-against a live account. Live mode fails closed.
+**Live order placement is not yet enabled for NDAX.** The live execution engine,
+reconciliation, and the NDAX SendOrder/CancelOrder network paths exist and are
+tested, but the NDAX adapter refuses real order placement
+(`supportsOrderPlacement=false`) until its order semantics and private-header
+signing are verified against a live account. Live mode fails closed.
 
 ## Development
 

@@ -375,3 +375,41 @@ and ack-timeout gates were untested. All are now unit-tested. See the three-phas
 framing (software readiness vs NDAX private-API verification vs live-trading
 authorization) in `NDAX_API.md`.
 
+## 24. NDAX order-placement network paths — implemented but stay disabled (Gate 3, 2026-08-30)
+
+**Decision (Gate 3):** `NdaxAdapter.placeOrder()`/`cancelOrder()` now implement
+the **real SendOrder/CancelOrder network paths**: signed POST JSON bodies via the
+existing `NdaxRestClient` (same auth headers, throttle, and typed error mapping
+as every other call — no second HTTP implementation), composed from the pure
+`orderMappings.ts` layer (`toNdaxSendOrderRequest`/`toNdaxCancelOrderRequest`/
+`mapSendOrderResponse`/`mapCancelOrderResponse`). The paths are gated behind an
+internal `enableOrderPlacement` option that defaults to `false` and is **NOT
+reachable from any configuration**, and `capabilities.supportsOrderPlacement`
+stays `false` — so `LiveOrderEngine` refuses to construct and live trading
+remains impossible. `mapSendOrderResponse` now also **fails closed**: any ack
+without a recognized `"Accepted"`/`"Rejected"` status throws
+`InvalidResponseError` (AMBIGUOUS), so a malformed SendOrder response can never
+be mistaken for a definite acknowledgement.
+
+**Why:** Gate 3 builds the reviewed, deterministic, tested pathway for a future
+Gate that arms live trading: exact wire behavior is proven against scripted
+fetches, not guessed. Mirroring the existing `enableAuthenticatedReads` pattern
+lets tests exercise the full network path while nothing in production can turn it
+on, and the engine still keys off `supportsOrderPlacement` (the sole capability
+gate), which remains `false`. NDAX SendOrder is **asynchronous** (an ack is NOT
+an on-book confirmation) and CancelOrder's ack is **receipt-only**, so lifecycle
+is still confirmed via GetOrderStatus/GetOpenOrders reconciliation — unchanged
+from §19/§20. A redundant explicit mechanism was added for live start:
+`bot start` requires `TRADING_MODE=live` + `REAL_FUNDS_AT_RISK=true` **and** the
+per-invocation `--confirm-live` flag before it will even consider live mode, and
+then verifies the adapter's `supportsOrderPlacement` capability.
+
+**Alternatives rejected:** (a) flipping `supportsOrderPlacement=true` now —
+rejected, that is the explicit human Gate-4 review decision per the checklist in
+`NDAX_API.md`; (b) a second HTTP/private client — rejected, reuse
+`NdaxRestClient`; (c) relying on NDAX `ClientOrderId` as an idempotency key —
+rejected, NDAX documents it "may not be unique" so our persist-before-submit
+OrderStore plus reconcile-before-retry remains the duplicate protection; (d)
+letting live mode "start" without the confirmation flag — rejected, the flag is
+the required human acknowledgement in front of any future live start.
+

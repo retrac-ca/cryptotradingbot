@@ -128,6 +128,20 @@ describe('NDAX order mappings', () => {
       expect(() => mapSendOrderResponse([])).toThrow(InvalidResponseError);
       expect(() => mapSendOrderResponse(null)).toThrow(InvalidResponseError);
     });
+
+    it('fails closed as AMBIGUOUS when the ack status is missing or unrecognized', () => {
+      // A generic {result:true} wrapper is not the documented SendOrder shape:
+      // we cannot know whether the order was accepted => reconcile, don't claim ack.
+      expect(() => mapSendOrderResponse({ result: true })).toThrow(InvalidResponseError);
+      expect(() => mapSendOrderResponse({ status: 'Maybe', OrderId: 5 })).toThrow(InvalidResponseError);
+      expect(() => mapSendOrderResponse({})).toThrow(InvalidResponseError);
+    });
+
+    it('maps an Accepted response without OrderId to acknowledged with null exchange id', () => {
+      const res = mapSendOrderResponse({ status: 'Accepted', errormsg: '' });
+      expect(res.exchangeOrderId).toBe(null);
+      expect(res.unknownOutcome).toBe(false);
+    });
   });
 
   describe('mapCancelOrderResponse', () => {
