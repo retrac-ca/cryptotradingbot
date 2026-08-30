@@ -28,6 +28,15 @@ import type {
 import type { NewOrder, Order, OrderStatus } from '../../src/order.js';
 import type { ExchangeAdapter, ExchangeHealth, PlaceOrderResult, CancelResult } from '../../src/exchanges/ExchangeAdapter.js';
 import { ExchangeCapabilities, NO_CAPABILITIES } from '../../src/exchanges/types.js';
+import {
+  NetworkError,
+  TimeoutError,
+  RateLimitError,
+  AuthenticationError,
+  InvalidCredentialsError,
+  OrderRejectedError,
+  UnknownOrderOutcomeError,
+} from '../../src/exchanges/errors.js';
 
 export type FailureKind =
   | 'network'
@@ -354,13 +363,13 @@ export class FakeExchange implements ExchangeAdapter {
 export function makeFailure(kind: FailureKind, method: string): Error {
   const m = `FakeExchange[${method}]: `;
   switch (kind) {
-    case 'network': return new Error(m + 'simulated network failure');
-    case 'timeout': return new Error(m + 'simulated timeout');
-    case 'rateLimit': return new Error(m + 'simulated rate limit');
-    case 'auth': return new Error(m + 'simulated auth failure');
-    case 'invalidCredentials': return new Error(m + 'simulated invalid credentials');
-    case 'rejected': return new Error(m + 'simulated order rejection');
-    case 'unknownOutcome': return new Error(m + 'simulated unknown outcome');
+    case 'network': return new NetworkError(m + 'simulated network failure');
+    case 'timeout': return new TimeoutError(m + 'simulated timeout');
+    case 'rateLimit': return new RateLimitError(m + 'simulated rate limit');
+    case 'auth': return new AuthenticationError(m + 'simulated auth failure');
+    case 'invalidCredentials': return new InvalidCredentialsError(m + 'simulated invalid credentials');
+    case 'rejected': return new OrderRejectedError(m + 'simulated order rejection');
+    case 'unknownOutcome': return new UnknownOrderOutcomeError(m + 'simulated unknown outcome');
   }
 }
 

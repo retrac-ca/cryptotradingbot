@@ -15,7 +15,7 @@ the future without rewriting trading logic.
 This project is under active development, built incrementally in phases. See
 `docs/ARCHITECTURE.md` for the full plan and current progress.
 
-**Currently implemented (Phases 1–8):**
+**Currently implemented (Phases 1–9):**
 - Project scaffolding (TypeScript, Vitest, ESLint)
 - Safe fixed-point money type (`src/money/Money.ts`) — no floating-point money
 - Configuration loading + validation from `.env` (zod), with clear errors
@@ -27,8 +27,24 @@ This project is under active development, built incrementally in phases. See
 - A portfolio tracker with exact P&L, and a **continuous, restart-safe paper
   trading engine** that runs the whole real-time pipeline without touching a
   live order endpoint
+- A **durable order ledger** (`.order-ledger.json`) keyed by `clientOrderId`
+  that prevents duplicate order submission across crashes/restarts
+- A **reconciliation** module that compares the bot's local order ledger against
+  the exchange's authoritative balances/open orders/history and fails safe on
+  any discrepancy
+- A **live execution engine** with strict safety controls (gated start,
+  persist-before-submit, no auto-retry on ambiguous outcomes, precision and
+  balance validation) behind the exchange adapter
+- A **backtesting** module (`bot backtest`) that replays historical candles
+  through the strategy → risk → execution pipeline and reports performance
+- CLI commands: `backtest`, `trades`, and read-only `reconcile`
 
-Live order execution (Phase 11) is planned but not yet implemented.
+**Live order execution is not yet enabled for NDAX.** The live execution engine
+and reconciliation are implemented and fully tested, but the NDAX adapter keeps
+real order placement **disabled** (`supportsOrderPlacement=false`) because NDAX
+order-submission semantics and private-header signing have not yet been verified
+against a live account and there is no official public testnet. Live trading
+therefore fails closed until that is individually validated.
 
 ## Requirements
 
@@ -76,6 +92,9 @@ npm install
 | `paper` | Start the bot in SAFE simulated trading mode |
 | `start` | Start the bot (honors `TRADING_MODE`, paper by default) |
 | `status` | Show current bot/trading status |
+| `backtest <candles.json>` | Run a historical backtest and report performance |
+| `trades` | Show the durable order ledger |
+| `reconcile` | Reconcile local ledger against the exchange (read-only) |
 
 Run `npm start -- help` for usage.
 
@@ -97,7 +116,23 @@ Key settings:
   `PAPER_FEE_FRACTION`, `PAPER_SLIPPAGE_FRACTION`, `PAPER_FILL_FRACTION`,
   `EVALUATE_INTERVAL_SECONDS` (how often the engine re-evaluates), and
   `PAPER_STATE_FILE` (where the paper portfolio is persisted between restarts,
-  default `.paper-state.json`).
+  default `.paper-state.json`). `ORDER_LEDGER_FILE` (default `.order-ledger.json`)
+  is where the durable order ledger is kept.
+
+### Backtesting
+
+```bash
+npm start -- backtest <candles.json> --initial-capital 10000 --fee 0.002
+```
+
+The candles file is a JSON array of canonical candle objects
+(`symbol`, `timeframe`, `timestampMs`, `open`, `high`, `low`, `close`,
+`baseVolume`). The bot replays them through the strategy → risk → execution
+pipeline and reports starting/ending capital, total return, trade count,
+win rate, realized P&L, fees, max drawdown, and largest win/loss.
+
+> ⚠️ Backtest results are a **historical simulation** — not a prediction of
+> future performance.
 
 ## Safety
 
@@ -108,12 +143,18 @@ Key settings:
 - A `KILL_SWITCH` immediately blocks all trading.
 - Conservative risk limits (`MAX_POSITION_SIZE_FRACTION`,
   `MAX_DAILY_LOSS_FRACTION`, `MAX_OPEN_POSITIONS`, ...) apply.
+- The order ledger is written **before** any order is submitted, so a
+  crash/restart can never cause a duplicate order; ambiguous submissions are
+  reconciled with the exchange rather than auto-retried.
+- `bot reconcile` compares the local ledger against the exchange's authoritative
+  state and reports (read-only). Trading should pause while discrepancies exist.
 - API credentials are stored only in your environment / `.env` (which is
   git-ignored) and are never logged.
 
-**Live trading is NOT yet implemented in this build.** Do not set
-`REAL_FUNDS_AT_RISK=true` expecting it to place real orders — it is currently a
-safety scaffold only.
+**Live order placement is not yet enabled for NDAX.** The live execution engine
+and reconciliation exist and are tested, but the NDAX adapter refuses real order
+placement until its order semantics and private-header signing are verified
+against a live account. Live mode fails closed.
 
 ## Development
 
@@ -141,9 +182,10 @@ src/
 ├── risk/         # risk management
 ├── portfolio/    # position/portfolio management
 ├── execution/    # paper/live execution engines
-├── persistence/  # database layer
+├── persistence/  # paper state + order ledger
 ├── engine/       # main trading engine / orchestration
-└── backtest/     # backtesting (future)
+├── reconcile/    # order-ledger vs exchange reconciliation
+└── backtest/     # historical backtesting
 ```
 
 ## Security Notes

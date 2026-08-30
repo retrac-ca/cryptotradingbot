@@ -97,6 +97,9 @@ export const botConfigSchema = z.object({
   // Where the persisted paper state (portfolio, executed orders) is kept so a
   // restart does not reset the account.
   paperStateFile: z.string().default('.paper-state.json'),
+  // Where the durable order ledger (every order the bot attempts, keyed by
+  // clientOrderId) is kept for duplicate-order prevention and reconciliation.
+  orderLedgerFile: z.string().default('.order-ledger.json'),
   // How often the engine re-evaluates candles/signals (ms); also the market-data
   // candle poll cadence. Kept small in tests via override.
   evaluateIntervalSeconds: z.coerce.number().int().positive().default(60),

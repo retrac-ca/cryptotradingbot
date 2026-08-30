@@ -33,4 +33,5 @@ data/
 
 # Persisted bot runtime state (never commit; may contain account/config data)
 .paper-state.json
+.order-ledger.json
 .backtest-results*.json

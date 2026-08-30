@@ -1,9 +1,11 @@
 /**
  * Execution module.
  *
- * Phase 8 provides the PAPER execution engine (simulated fills, fees, slippage,
- * cancellations) that never touches a real exchange. LIVE execution is a later
- * phase and is intentionally not present here.
+ * `PaperExecutionEngine` simulates fills/fees/slippage and never touches a real
+ * exchange. `LiveOrderEngine` moves fully risk-approved orders to the real
+ * exchange with strict safety controls (gated start, persist-before-submit,
+ * no auto-retry on ambiguous outcomes, precision/balance validation) and treats
+ * the exchange as authoritative.
  */
 
 export { PaperExecutionEngine } from './PaperExecutionEngine.js';
@@ -15,3 +17,5 @@ export type {
   PaperMarket,
   PaperExecutionConfig,
 } from './PaperExecutionTypes.js';
+export { LiveOrderEngine, LiveGateError } from './LiveExecutionEngine.js';
+export type { LiveGate, LiveExecutionConfig, LiveOrderResult } from './LiveExecutionEngine.js';

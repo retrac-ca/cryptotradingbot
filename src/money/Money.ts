@@ -257,4 +257,13 @@ export class Money {
   toNumber(): number {
     return Number(this.scaled) / Number(SCALE_POW);
   }
+
+  /**
+   * JSON serialization as a decimal string (exact). This makes any object
+   * containing Money JSON-safe without BigInt serialization errors, at the cost
+   * of the consumer re-parsing decimal strings into `Money` where needed.
+   */
+  toJSON(): string {
+    return this.toString();
+  }
 }

@@ -2,16 +2,19 @@
  * CLI entrypoint.
  *
  * Command dispatcher for the `bot` binary. Each subcommand is a small module.
- * This is intentionally minimal at this phase; more commands (backtest,
- * trades, logs) are added in later phases.
+ * Commands cover setup/config, paper+start engines, status, backtesting, the
+ * order ledger (trades), and read-only reconciliation.
  */
 
 import { createLogger } from '../logging/logger.js';
+import { backtestCommand } from './backtest-cmd.js';
 import { configureCommand } from './config-cmd.js';
 import { paperCommand } from './paper-cmd.js';
+import { reconcileCommand } from './reconcile-cmd.js';
 import { setupCommand } from './setup-cmd.js';
 import { startCommand } from './start-cmd.js';
 import { statusCommand } from './status-cmd.js';
+import { tradesCommand } from './trades-cmd.js';
 
 export const COMMANDS = {
   setup: setupCommand,
@@ -19,6 +22,9 @@ export const COMMANDS = {
   paper: paperCommand,
   start: startCommand,
   status: statusCommand,
+  backtest: backtestCommand,
+  trades: tradesCommand,
+  reconcile: reconcileCommand,
 } as const;
 
 export type CommandName = keyof typeof COMMANDS;
@@ -28,12 +34,15 @@ const USAGE = `cryptotradingbot v${'0.0.1'}
 Usage: bot <command> [options]
 
 Commands:
-  setup    Create/configure the .env file interactively
-  config   Show the effective resolved (non-secret) configuration
-  paper    Start the bot in PAPER (simulated) trading mode
-  start    Start the bot (paper by default)
-  status   Show current bot / trading status
-  help     Show this help
+  setup     Create/configure the .env file interactively
+  config    Show the effective resolved (non-secret) configuration
+  paper     Start the bot in PAPER (simulated) trading mode
+  start     Start the bot (paper by default)
+  status    Show current bot / trading status
+  backtest  Run a historical backtest from a candles JSON file
+  trades    Show the durable order ledger
+  reconcile Reconcile the order ledger against the exchange (read-only)
+  help      Show this help
 
 Run "bot <command> --help" for command-specific options.
 `;

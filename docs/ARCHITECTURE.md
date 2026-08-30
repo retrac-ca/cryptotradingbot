@@ -20,11 +20,11 @@ behind the design. The guiding principles are:
 | 6 | Strategy engine | **DONE** |
 | 7 | Risk management | **DONE** |
 | 8 | Paper trading | **DONE** |
-| 9 | Persistence | Planned |
-| 10 | Backtesting | Planned |
-| 11 | Live trading safeguards | Planned (disabled until approved) |
-| 12 | CLI / UX | Planned |
-| 13 | Docs + packaging | Planned |
+| 9 | Persistence + reconciliation | **DONE** |
+| 10 | Backtesting | **DONE** |
+| 11 | Live trading safeguards | **DONE** (engine + reconciliation tested; NDAX order placement remains **disabled**, fail-closed, until verified against a live account) |
+| 12 | CLI / UX | **DONE** |
+| 13 | Docs + packaging | **DONE** |
 
 Phases are implemented and reviewed incrementally, not all at once.
 
@@ -66,10 +66,9 @@ Pino-based structured (JSON) logging with sane development pretty-printing and
   camelCase, validates, and returns a single typed `BotConfig`.
 
 ### `src/cli/` — User interface
-Minimal command dispatcher. Current commands: `setup`, `config`, `paper`,
-`start`, `status`. Each is a small module. Later phases add `backtest`,
-`trades`, `logs`, etc. The CLI is crafted so non-technical users can get
-running without editing source.
+Minimal command dispatcher. Commands: `setup`, `config`, `paper`, `start`,
+`status`, `backtest`, `trades`, and `reconcile`. Each is a small module. The
+CLI is crafted so non-technical users can get running without editing source.
 
 ### `src/exchanges/` — exchange adapters behind one interface
 - `src/exchanges/ExchangeAdapter.ts` — the interface engines depend on.
@@ -104,28 +103,57 @@ running without editing source.
 - **`src/execution/`** — `PaperExecutionEngine` simulates fills locally: market
   and limit orders, configurable fees, slippage, partial fills (`fillFraction`),
   order cancellation, and a long-only safety net. It has **no** reference to a
-  real exchange adapter and **no** live order-placement path. LIVE execution is
-  deliberately absent at this phase.
+  real exchange adapter and **no** live order-placement path.
+  `LiveOrderEngine` moves fully risk-approved orders to the real exchange with
+  strict safety controls: a **gated start** (`tradingMode=live` +
+  `realFundsAtRisk` + `supportsOrderPlacement`), **persist-before-submit**
+  (writes the order to the `OrderStore` as CREATED before any network call, so a
+  crash can never cause a duplicate), **no auto-retry on ambiguous outcomes**
+  (timeout/unknown → `UNKNOWN`, reconcile with the exchange instead), and
+  precision + balance validation against the live exchange. Any uncertainty
+  fails closed.
 - **`src/persistence/`** — `PaperStateStore`, a minimal JSON state file
   (atomic write via temp+rename) storing the portfolio plus executed paper order
-  ids, so a restart does not reset the account. A fuller SQLite layer is Phase 9.
+  ids, so a restart does not reset the account. `OrderStore` persists the
+  durable order ledger keyed by `clientOrderId` (Money stored as decimal
+  strings), which underpins duplicate-order prevention and reconciliation.
+- **`src/reconcile/`** — `Reconciler` compares the bot's local order ledger
+  against the exchange's **authoritative** balances/open orders/history and
+  classifies discrepancies; `ReconcileService` fetches the exchange snapshot via
+  the adapter (failing closed if any read fails). The exchange is authoritative;
+  the bot never "fixes" a discrepancy by guessing.
 - **`src/engine/`** — `PaperEngine` (Phase 8) wires everything into one
   continuously-running loop: `Market Data → Strategy → Signal → Risk → Paper
   Execution → Portfolio → Logging/Persistence`. It ticks on a fixed cadence
   (no busy loop), fails closed on stale/unknown market data, and shuts down
   gracefully, persisting on stop. `buildEngine.ts` is the composition root that
   assembles the dependency graph from config.
-- **`src/backtest/`** — reuses strategy + risk over historical data.
+- **`src/backtest/`** — `BacktestRunner` replays historical candles through the
+  strategy → risk → execution pipeline with simulated execution and reports the
+  required performance metrics. The `backtest` CLI reads candles from a JSON
+  file. `computeMetrics` produces starting/ending capital, total return, trade
+  count, win rate, realized P&L, fees, max drawdown, and largest win/loss.
+  Results are a historical simulation, not a prediction.
 
 ## Safety Model
 
 - Default mode is `paper`. Simulated orders never reach an exchange order
   endpoint and are always labeled PAPER.
 - `live` mode requires `TRADING_MODE=live` **and** `REAL_FUNDS_AT_RISK=true`.
-- `KILL_SWITCH` hard-stops trading.
+- `KILL_SWITCH` hard-stops trading; the `LiveOrderEngine` refuses to operate
+  while it is active.
 - Conservative risk limits apply.
-- Ambiguous order submissions are reconciled with the exchange before retrying
-  to prevent duplicate orders.
+- Every order is persisted **before** submission keyed by `clientOrderId`, so a
+  crash/restart cannot create a duplicate order.
+- Ambiguous order submissions (timeout/unknown/network errors) are **not**
+  auto-retried. The order is marked `UNKNOWN` and reconciled with the exchange
+  (`GetOrderStatus`/`GetOpenOrders`) before any action.
+- Reconciliation treats the exchange as authoritative and fails closed on any
+  read failure or discrepancy.
+- NDAX real order placement is **disabled** (`supportsOrderPlacement=false`)
+  and stays that way until its order semantics and private-header signing are
+  verified against a live account. The live execution engine still enforces all
+  gates and is fully tested via the exchange adapter interface.
 
 ## Security Model
 

@@ -81,14 +81,18 @@ lowest-friction path for the eventual non-technical user while still being
 secure by default (file is never committed). A keychain/secret-manager path can
 be added later without changing the config interface.
 
-## 7. SQLite for persistence (planned Phase 9)
+## 7. Persistence — minimal JSON stores for Phases 8–9 (SQLite deferred)
 
-**Decision (planned):** Use embedded SQLite for persistence behind an abstract
-repository layer.
+**Decision (revised in Phase 9):** Persistence is two minimal JSON stores with
+atomic temp-file+rename writes: `PaperStateStore` (the paper portfolio) and
+`OrderStore` (the durable order ledger keyed by `clientOrderId`). Embedded
+SQLite remains a possible future step but is **not** required for V1.
 
 **Why:** Zero-configuration, single-file, and synchronous (fits the bot's
-single-threaded operation). The persistence is hidden behind repository
-interfaces so it can be swapped later if needed (e.g. Postgres for multi-user).
+single-threaded operation). The stores are hidden behind small repository
+classes so a later SQLite/Postgres backend can be swapped in without changing
+callers. For V1's scope (restart-safe paper portfolio + duplicate-order-proof
+order ledger + reconciliation), JSON is sufficient, honest, and auditable.
 
 ## 8. Vitest for testing
 
@@ -237,3 +241,76 @@ flats, or forget executed orders.
 its book across restarts. A full SQLite repository with order/trade history and
 reconciliation is Phase 9; JSON is sufficient and honest for Phase 8's scope.
 `Money` is stored as its canonical decimal string so values survive exactly.
+
+## 18. Durable order ledger keyed by `clientOrderId` (duplicate-order prevention)
+
+**Decision (Phase 9):** `OrderStore` (`src/persistence/OrderStore.ts`) persists
+every order the bot attempts in `.order-ledger.json`, keyed by its local
+`clientOrderId`, with the order **written as `CREATED` before any network call**
+(persist-before-submit).
+
+**Why:** No matter what happens (crash, timeout, restart), a fresh process can
+look up whether an order with a given key was already attempted. The
+`LiveOrderEngine` refuses to re-submit an existing `clientOrderId`, so a retry
+can never create a duplicate real order — the #1 live-trading hazard. Money
+values are stored as decimal strings (exact) rather than BigInt, so JSON
+serialization is lossless.
+
+## 19. Reconciliation — the exchange is authoritative; fail closed
+
+**Decision (Phase 9):** `ReconcileService` fetches the exchange's account state
+(balances, open orders, order history) via the `ExchangeAdapter` and
+`Reconciler` compares it against the bot's local ledger. Discrepancies
+(`LOCAL_OPEN_MISSING_ON_EXCHANGE`, status mismatch, unknown exchange orders,
+negative balances) make the account `safeToTrade=false`. If any read fails, the
+snapshot is treated as incomplete and the report fails closed
+(`CANNOT_DETERMINE`).
+
+**Why:** In live trading the exchange is the source of truth. The bot never
+"fixes" a mismatch by guessing (e.g. never blind-resubmits an order it believes
+is open but the exchange no longer shows). Reconciliation is read-only
+(`bot reconcile`) and must pass before new orders are considered safe. This is
+the safety loop referenced by the "reconcile before retry" rule.
+
+## 20. Live execution engine — gated, fail-closed, no-auto-retry
+
+**Decision (Phase 9):** `LiveOrderEngine` is exchange-agnostic and enforces hard
+safety properties:
+1. **Gated start** — refuses to operate unless `tradingMode=live` **and**
+   `realFundsAtRisk=true` **and** the adapter declares `supportsOrderPlacement`
+   **and** no kill switch.
+2. **Persist-before-submit** — records the order as `CREATED` before any network
+   call (see §18); a pre-existing key yields a defensive duplicate rejection.
+3. **No auto-retry on ambiguous outcomes** — a timeout / network / invalid
+   response / unknown submission marks the order `UNKNOWN` (no retry); the caller
+   must reconcile with the exchange before any action. Only a **definite**
+   rejection (`OrderRejectedError`) is treated as non-ambiguous.
+4. **Precision & balance validation** — quantity and limit price are checked
+   against the market's tick grid, minimum order size, and the live available
+   balance before submission; anything off-grid or unaffordable is rejected
+   without touching the exchange.
+
+**Why:** The error hierarchy in `src/exchanges/errors.ts` distinguishes
+AMBIGUOUS (may have reached the exchange → must reconcile) from DEFINITE
+(safe to treat as failed). The engine leans on that distinction so the rule
+"never blindly re-submit an order whose outcome is unknown" is enforced in code,
+not by convention. Because NDAX order placement is not yet live-verified, the
+engine is proven against the `ExchangeAdapter` interface (via `FakeExchange`),
+and NDAX itself keeps `supportsOrderPlacement=false` so live mode fails closed.
+
+## 21. Backtesting — historical simulation, explicit simplifications
+
+**Decision (Phase 9):** `BacktestRunner` replays candles through the **real**
+strategy → risk → execution pipeline (the same `Strategy` and `RiskManager`
+used live), with simulated execution filled at each candle's close plus
+configurable fee and slippage fractions. `computeMetrics` reports the required
+set: starting/ending capital, total return, trade count, winning/losing trades
+and win rate, realized P&L, fees, max drawdown, and largest win/loss.
+
+**Why:** Reusing the live strategy/risk classes means the backtest measures the
+actual system, not a parallel approximation. Documented simplifications: fills
+execute the full requested quantity at the close price (no partial fills,
+no intra-candle price path), and a synthetic `MarketInfo` supplies the tick
+grid (price tick 0.01, quantity tick 1e-8, flat 0.2% fee). Results are labeled a
+**historical simulation, not a prediction of future performance** — and the CLI
+prints that warning on every run.
