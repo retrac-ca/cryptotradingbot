@@ -314,3 +314,32 @@ no intra-candle price path), and a synthetic `MarketInfo` supplies the tick
 grid (price tick 0.01, quantity tick 1e-8, flat 0.2% fee). Results are labeled a
 **historical simulation, not a prediction of future performance** — and the CLI
 prints that warning on every run.
+
+## 22. NDAX private order placement — documentation + isolation milestone (V1)
+
+**Decision (Phase 9 follow-up, 2026-08-29):** Live NDAX order placement stays
+**disabled** (`supportsOrderPlacement=false`, `placeOrder`/`cancelOrder` throw
+`OrderRejectedError`). What was produced instead is a precise, evidence-backed
+map of NDAX's private trading API plus a pure, unit-tested order-mapping layer
+(`src/exchanges/ndax/orderMappings.ts`) that encodes the documented SendOrder /
+CancelOrder request + response shapes — **not wired to any network call**.
+
+**Verified from the current official apidoc.ndax.io (v3.3):** SendOrder is a
+POST, ASYNCHRONOUS, returning only `{status:"Accepted"/"Rejected", OrderId}` —
+an ack is not an on-book confirmation, so reconciliation is mandatory. CancelOrder
+is a POST, synchronous, and its `{result,...}` response confirms only
+**receipt**, not cancellation — confirm via GetOrderStatus/GetOpenOrders.
+NDAX `ClientOrderId` is a long integer and is **not** documented as a uniqueness
+/idempotency key (the CancelOrder doc warns it "may not be unique").
+
+**Why (safety):** This directly confirms our V1 engine's design: the local
+OrderStore (persist-before-submit) plus "reconcile before retry" — NOT NDAX's
+`ClientOrderId` — is the duplicate-order protection. Enabling placement also
+cannot be tested on any NDAX-provided mechanism (no official public testnet;
+the staging host is third-party/conflicting), so **no SendOrder/CancelOrder call
+was or can safely be made without risking real funds**, per the late-2026 rules.
+The mappers are left ready-to-wire and covered by deterministic-fixture tests;
+the `NDAX_API.md` "what is required before supportsOrderPlacement can become
+true" checklist enumerates the six items (live read auth, a safe placement
+mechanism, wire-shape verification, lifecycle confirmation, key/IP permissions,
+fees) that must pass first.

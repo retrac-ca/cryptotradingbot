@@ -16,6 +16,19 @@ export { NdaxAdapter } from './NdaxAdapter.js';
 export { ndaxSignature, ndaxNonce, signaturesMatch, isHexDigest } from './signing.js';
 export { mapLevel1ToTicker, mapInstrumentToMarketInfo, mapOrder, mapL2ToOrderBook, mapTickerHistoryRow } from './mappings.js';
 
+// Order submission/cancellation request+response mappers. Pure and tested. NOT
+// wired to any live order path while supportsOrderPlacement is false — they are
+// the reviewed, isolated foundation needed before live placement can be enabled.
+export {
+  toNdaxSendOrderRequest,
+  toNdaxCancelOrderRequest,
+  mapSendOrderResponse,
+  mapCancelOrderResponse,
+  toNdaxOrderType,
+  toNdaxTimeInForce,
+  toNdaxClientOrderId,
+} from './orderMappings.js';
+
 registerExchange('ndax', ({ credentials, config }) => {
   return new NdaxAdapter({
     credentials: {

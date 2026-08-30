@@ -1,7 +1,7 @@
 # NDAX API Reference (Retail Canadian Platform)
 
 This document records what was verified about the **retail Canadian NDAX**
-trading API (`ndax.io`, pairs such as `BTC/CAD`) as of **2026-08-28**, and how
+trading API (`ndax.io`, pairs such as `BTC/CAD`) as of **2026-08-29**, and how
 the NDAX adapter implements it. Update this file whenever a ⚠️/🔎 item is
 empirically confirmed or refuted.
 
@@ -272,7 +272,19 @@ All ✅ from apidoc.ndax.io.
 
 ## 6. Order management
 
-- **SendOrder** (async) request:
+> Re-verified against the current official apidoc.ndax.io (v3.3) on
+> **2026-08-29**. Status labels: ✅ CONFIRMED in official doc, 🔎 CORROBORATED
+> (CCXT connector), ⚠️ VERIFY (ambiguous / not yet live-tested).
+
+### SendOrder — POST (mutation, JSON body) — ✅
+
+**Endpoint:** `POST https://api.ndax.io:8443/AP/SendOrder` (private, signed).
+**Call Type: ASYNCHRONOUS** (✅ "Note: Call Type is asynchronous") — the response
+only records whether the request was *accepted*, NOT that the order is on the
+book. Always reconcile via `GetOrderStatus`/`GetOpenOrders` to confirm.
+
+✅ Documented request (v3.3, note `quantity` is **lowercase** in the example,
+lower still appears in the field table as `Quantity` — see caveat below):
 
 ```json
 { "InstrumentId":1, "OMSId":1, "AccountId":1, "TimeInForce":1,
@@ -280,18 +292,77 @@ All ✅ from apidoc.ndax.io.
   "Side":0, "quantity":1, "OrderType":2, "PegPriceType":3, "LimitPrice":8800 }
 ```
 
-Response: `{ "status":"Accepted", "errormsg":"", "OrderId":123 }`
-(`status` = "Accepted"/"Rejected").
+✅ Documented response (only acknowledgement):
 
-  - **Side:** 0 Buy, 1 Sell, 2 Short, 3 Unknown
-  - **OrderType:** 0 Unknown, 1 Market, 2 Limit, 3 StopMarket, 4 StopLimit,
-    5 TrailingStopMarket, 6 TrailingStopLimit, 7 BlockTrade
-  - **TimeInForce:** 0 Unknown, 1 GTC (default), 2 OPG, 3 IOC, 4 FOK, 5 GTX, 6 GTD
-  - `ClientOrderId` = long integer (defaults 0); duplicate-order idempotency input.
+```json
+{ "status":"Accepted", "errormsg":"", "OrderId":123 }
+```
 
-- **CancelOrder** `{ OMSId, AccountId?(conditional), OrderId?, ClientOrderId? }` →
-  generic `{ result, errormsg, errorcode, detail }`. ⚠️ Doc warns the response only
-  confirms the call was **received** — call GetOrderStatus to confirm cancellation.
+`status` = `"Accepted"`/`"Rejected"` (string). `OrderId` = server order id.
+
+✅ Enum values (documented):
+  - **Side:** 0 Buy, 1 Sell, 2 Short, 3 Unknown; **OrderType:** 0 Unknown, 1
+    Market, 2 Limit, 3 StopMarket, 4 StopLimit, 5 TrailingStopMarket, 6
+    TrailingStopLimit, 7 BlockTrade; **TimeInForce:** 0 Unknown, 1 GTC (default),
+    2 OPG, 3 IOC, 4 FOK, 5 GTX, 6 GTD; **PegPriceType:** 1 Last, 2 Bid, 3 Ask,
+    4 Midpoint.
+
+✅ **`ClientOrderId` is a LONG INTEGER** ("user-assigned ID… useful for
+recognizing future states"; defaults to 0). ⚠️ **Important:** the doc does NOT
+present it as a unique/idempotency key — for CancelOrder the doc explicitly says
+"the Client Order ID may not be unique." Therefore **do NOT rely on NDAX
+`ClientOrderId` for cross-process duplicate protection**; our persist-before-
+submit OrderStore + reconcile-before-retry remain the source of duplicate
+protection. Our adapter forwards a numeric `ClientOrderId` only when the caller
+wants NDAX-side recognition; otherwise it sends 0.
+
+⚠️ **Key-size/string ambiguity:** the official Request example uses lowercase
+`quantity`, the field table capitalizes it (`Quantity`). We use the example form
+(`quantity`) in `toNdaxSendOrderRequest`. This is an UNVERIFIED wire detail that
+must be confirmed on a real account before enabling placement.
+
+### CancelOrder — POST (mutation, JSON body) — ✅
+
+**Endpoint:** `POST https://api.ndax.io:8443/AP/CancelOrder` (private, signed).
+**Call Type: Synchronous.**
+
+✅ Documented request (v3.3 — `AccountId` added; `OrderId`, `ClientOrderId`,
+`AccountId` all **conditionally optional**):
+
+```json
+{ "OMSId": 0, "AccountId": 0, "OrderId": 0, "ClientOrderId": 0 }
+```
+
+The doc says OMS ID + Order ID precisely identify the order (Order ID unique
+across an OMS); if you give OMS ID + Account ID you must also give at least the
+Client Order ID (Client Order ID alone is not unique).
+
+✅ Documented response = generic `{ result, errormsg, errorcode, detail }` and
+**only confirms the call was RECEIVED, not that the order was canceled.** The doc
+is explicit: "To verify that an order has been canceled, call **GetOrderStatus**
+or **GetOpenOrders**." → `CancelResult.acknowledged` reflects receipt and
+`orderStatus` stays `null`; confirmation is a reconciliation step.
+
+### GetOrderStatus — POST? — ⚠️ method ambiguity
+
+✅ Documented request `{ omsId, accountId, orderId }` and response (a single
+order object array; the "New" response shape shown in §"Revised calls"). The
+doc's response example uses capitalized keys (`OrderId`, `OrderState`, …) with
+`OrderState` as a **string** ("Working"/"Rejected"/"Canceled"/"Expired"/"Fully
+Executed") and `Side`/`OrderType` as strings.
+
+⚠️ The apidoc does not state an HTTP verb for `GetOrderStatus`, and lists it only
+as a User-category WS call in the function index. CCXT exposes it as a **GET**
+private read (`privateGetGetOrderStatus`). We treat it as GET (matches CCXT),
+isolated in the adapter — flag to confirm against the live API.
+
+### Map to our adapter
+
+`src/exchanges/ndax/orderMappings.ts` encodes the above (pure + unit tested):
+`toNdaxSendOrderRequest`, `toNdaxCancelOrderRequest`, `mapSendOrderResponse`,
+`mapCancelOrderResponse`, plus enum mappers. These are **not** wired to any live
+path while `supportsOrderPlacement=false`; they are the reviewed isolation layer
+required before enabling.
 
 - **OrderState**: 🔎 RESOLVED — REST returns **string** values: `"Accepted"`,
   `"Rejected"`, `"Working"`, `"Canceled"`, `"Expired"`, `"FullyExecuted"`
@@ -347,11 +418,16 @@ succeeded. Always reconcile via GetOrderStatus/GetOpenOrders.
 
 ## 11. Sandbox / testnet ❌ / ⚠️
 
-- ❌ **No official public testnet is documented** for the retail platform.
+- ❌ **No official public testnet is documented** for the retail platform (re-
+  confirmed 2026-08-29: apidoc.ndax.io and ndax.io support pages offer no
+  sandbox/testnet for spot order placement; the help center only advises testing
+  "in a development environment" — with no such environment provided).
 - ⚠️ A third-party host `https://ndaxmarginstaging.cdnhop.net:8443/AP/` is used
   by CCXT/Hummingbot as a "testnet", and SignalBee states "NDAX does not offer a
   public testnet for spot trading." These conflict. **Needs verification with
-  NDAX directly.**
+  NDAX directly.** Because it is third-party and unverified, it is NOT used for
+  order-placement validation. There is no known safe non-production mechanism to
+  place real SendOrder/CancelOrder calls without risking funds.
 
 ## 12. Symbol format & base/quote
 
@@ -399,18 +475,65 @@ presence + `MinimumPrice` semantics (§4), `GetL2Snapshot` row indices (§4),
 `OrderState`/`Side`/`OrderType` (§6), applied rate limiting (§8), tick sizes
 (§14), and that public data does not require credentials.
 
+Re-verified 2026-08-29 (documentation only): SendOrder (POST, async, request +
+response shapes + enums), CancelOrder (POST, sync, receipt-only response +
+confirmation requirement), GetOrderStatus / GetOpenOrders response shapes, and
+that `ClientOrderId` is NOT documented as a uniqueness/idempotency key.
+
 Still flagged (not yet exercised against a live account):
 
 1. **WS `AuthenticateUser` + REST header signing** against a **live account**
    (no official testnet). The read-only verifier `npm run verify:ndax` exercises
    this non-destructively with `ENABLE_AUTHENTICATED_READS=true`.
 2. **Testnet availability** — `https://ndaxmarginstaging.cdnhop.net:8443/AP` is
-   third-party; no official public testnet documented.
+   third-party; no official public testnet documented. No safe non-production
+   order-placement path exists.
 3. **`GetUserAccounts` requiring the login email** (`userName`) — provide
    `NDAX_USER_NAME` or an explicit `NDAX_ACCOUNT_ID` if account-id lookup fails.
 4. **Fees** — official flat 0.20% vs CCXT's maker 0.2% / taker 0.25%.
+5. **SendOrder wire details** — lowercase `quantity` vs `Quantity` key casing,
+   and the exact request serialization NDAX accepts, are UNVERIFIED (docs use
+   example form `quantity`).
+6. **HTTP `Authenticate` + `APToken` session-token mode** — the official retail
+   doc documents only WS `AuthenticateUser`/`Authenticate2FA`; the CCXT
+   `Authenticate`-over-HTTP (Basic auth) + `APToken` header mode is NOT in the
+   official retail doc and is UNVERIFIED/possibly incorrect. Not required for the
+   header-signing read path, but must be reconciled before relying on it for
+   order placement.
 
-> These items are documented and isolated rather than assumed. NDAX-specific
-> behavior lives in `src/exchanges/ndax/`; `scripts/verify-ndax.ts` is the
-> controlled, non-destructive path to validate them against the live API before
-> real order execution is enabled.
+### What is required before `supportsOrderPlacement` can safely become `true`
+
+The safe-enablement checklist (each item is currently NOT satisfied):
+
+1. **Live, read-only auth validated** against a real NDAX account: header signing
+   (`Nonce`/`APIKey`/`Signature`/`UserId`) accepted for private reads
+   (`GetUserAccounts`, `GetAccountPositions`, `GetOpenOrders`), so we can read
+   balances/open orders to satisfy the LiveOrderEngine's balance + reconcile
+   gates. Uses `ENABLE_AUTHENTICATED_READS=true` via `npm run verify:ndax`.
+2. **An explicitly safe, non-production mechanism for placement** — an official
+   testnet/sandbox or an explicit paper/demo key that NDAX confirms cannot move
+   funds. **No such mechanism has been found. Until one exists, SendOrder and
+   CancelOrder must NOT be exercised**, because they would place real orders with
+   real funds.
+3. **SendOrder/CancelOrder request + response empirically verified** on that safe
+   mechanism: exact key casing (`quantity`), whether NDAX accepts a market order
+   without `LimitPrice`, `ClientOrderId` numeric acceptance, and that
+   `GetOrderStatus`/`GetOpenOrders` return the new order by `OrderId` and by
+   `ClientOrderId`. This confirms the `toNdaxSendOrderRequest`/
+   `toNdaxCancelOrderRequest`/`mapSendOrderResponse`/`mapCancelOrderResponse`
+   mappers and their enums.
+4. **Order-lifecycle confirmed**: after an ack (`status:"Accepted"`) the order
+   appears via `GetOrderStatus`/`GetOpenOrders`; after `CancelOrder` the canceled
+   state is observable there; async ack semantics understood (SendOrder is
+   ASYNCHRONOUS — ack ≠ on-book).
+5. **IP allow-listing / API-key trading permission** confirmed (the key must have
+   `Trading` permission and any IP whitelist must include the bot's egress IP).
+6. **Fees confirmed** to use in risk/paper modeling (flat 0.20%).
+
+Until all six are satisfied, NDAX keeps `supportsOrderPlacement=false` and the
+adapter's `placeOrder`/`cancelOrder` throw `OrderRejectedError` — live mode fails
+closed (the `LiveOrderEngine` refuses to start). The uncertainty stays isolated
+behind the adapter; no endpoint, request field, auth header, or order semantic is
+guessed into the codebase. The pure order mappers in
+`src/exchanges/ndax/orderMappings.ts` are ready to be wired once items 1–6 are
+verified, and are covered by unit tests using deterministic fixtures.

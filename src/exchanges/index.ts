@@ -7,7 +7,13 @@
 
 import './ndax/index.js';
 
-export { ExchangeAdapter, type ExchangeHealth, type PlaceOrderResult, type CancelResult, type OrderPlacementSafety } from './ExchangeAdapter.js';
+export type {
+  ExchangeAdapter,
+  ExchangeHealth,
+  PlaceOrderResult,
+  CancelResult,
+  OrderPlacementSafety,
+} from './ExchangeAdapter.js';
 export type { ExchangeCapabilities } from './types.js';
 export {
   ExchangeError,
