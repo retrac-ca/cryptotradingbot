@@ -11,8 +11,9 @@ import { signal } from '../../../src/strategy/Signal.js';
 import type { Balance, MarketInfo } from '../../../src/types.js';
 import type { NewOrder } from '../../../src/order.js';
 import { FakeExchange } from '../../fakes/FakeExchange.js';
+import { statePath } from '../../helpers/state.js';
 
-const LEDGER = '/tmp/opencode/live-engine-ledger.json';
+const LEDGER = statePath('liveengine', 'ledger.json');
 
 const market: MarketInfo = {
   symbol: 'BTC/CAD',
@@ -37,7 +38,10 @@ function riskConfig(overrides: Partial<RiskConfig> = {}): RiskConfig {
     maxDailyLossFraction: 1,
     maxDrawdownFraction: 1,
     cooldownAfterLossMs: 0,
+    maxOpenPositions: 1,
     marketDataMaxAgeMs: 60_000,
+    marketDataTransportMaxAgeMs: 60_000,
+    maxClockSkewMs: 120_000,
     ...overrides,
   };
 }
@@ -54,13 +58,17 @@ function riskContext(overrides: Partial<RiskContext> = {}, price = '40000'): Ris
     signal: signal('BTC/CAD', 'BUY'),
     nowMs: 1_000_000,
     marketDataTimestampMs: 1_000_000,
+    marketDataObservedAtMs: 1_000_000,
     price: Money.fromString(price),
     marketInfo: market,
     quoteBalance: bal,
+    deployableQuote: Money.fromString('1000000'),
     portfolioValue: Money.fromString('100000'),
     peakPortfolioValue: Money.fromString('100000'),
     portfolioExposure: Money.fromString('0'),
     currentPosition: Money.fromString('0'),
+    externalPosition: Money.fromString('0'),
+    openManagedPositionCount: 0,
     realizedPnlToday: Money.fromString('0'),
     unrealizedPnlToday: Money.fromString('0'),
     ...overrides,
@@ -136,6 +144,26 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     expect(exchange.submittedOrders).toHaveLength(1);
     // No externally-supplied clientOrderId is ever used: the engine generates it.
     expect(result.order.clientOrderId.startsWith('live-')).toBe(true);
+  });
+
+  it('submits a partial SELL sized to the bounded sellTarget (never an injected quantity)', async () => {
+    const exchange = new FakeExchange({ balances: { CAD: '100000', BTC: '0.25' }, markets: { 'BTC/CAD': market } });
+    const engine = buildEngine(exchange);
+    const result = await engine.place(
+      riskContext({
+        signal: signal('BTC/CAD', 'SELL'),
+        currentPosition: Money.fromString('0.25'),
+        sellTarget: { notional: Money.fromString('1000') },
+      }),
+      { reason: 'test-partial-sell' },
+    );
+    expect(result.order.status).toBe('SUBMITTED');
+    expect(result.unknownOutcome).toBe(false);
+    // Risk approved 1000/40000 = 0.025 BTC (floored to the 1e-8 tick), and the
+    // engine submitted exactly that — the caller could not inject a raw qty.
+    expect(exchange.submittedOrders).toHaveLength(1);
+    expect(exchange.submittedOrders[0]!.quantity.toFixed(8)).toBe('0.02500000');
+    expect(result.order.quantity.toFixed(8)).toBe('0.02500000');
   });
 
   it('rejects a risk-unapproved order as REJECTED without ever contacting the exchange', async () => {
@@ -312,5 +340,24 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     buildEngine(exchange);
     expect(exchange.submittedOrders).toHaveLength(0);
+  });
+
+  it('rejects an unsupported (non-market) live order type rather than silently converting it', async () => {
+    const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
+    const engine = buildEngine(exchange);
+    await expect(engine.place(riskContext(), { reason: 'test', type: 'limit' })).rejects.toThrow(
+      /unsupported live order type "limit"/,
+    );
+    // No order was submitted and nothing was persisted for a non-existent order.
+    expect(exchange.submittedOrders).toHaveLength(0);
+    expect(new OrderStore(LEDGER).allOrders().size).toBe(0);
+  });
+
+  it('explicitly declares a market order type and submits it (no silent default ambiguity)', async () => {
+    const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
+    const engine = buildEngine(exchange);
+    const result = await engine.place(riskContext(), { reason: 'test', type: 'market' });
+    expect(result.order.type).toBe('market');
+    expect(result.order.status).toBe('SUBMITTED');
   });
 });

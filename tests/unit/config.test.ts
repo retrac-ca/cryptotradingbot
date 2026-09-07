@@ -23,6 +23,7 @@ describe('loadConfig', () => {
     expect(cfg.tradingMode).toBe('paper');
     expect(cfg.exchange).toBe('ndax');
     expect(cfg.tradingPairs).toEqual(['BTC/CAD']);
+    expect(cfg.universeMarkets).toEqual(['BTC/CAD', 'ETH/CAD', 'SOL/CAD', 'XRP/CAD', 'ADA/CAD']);
     expect(cfg.strategy).toBe('moving-average-crossover');
     expect(cfg.killSwitch).toBe(false);
     expect(cfg.maxOpenPositions).toBe(1);
@@ -79,6 +80,8 @@ describe('loadConfig', () => {
     expect(cfg.maxPortfolioExposureFraction).toBe(0.5);
     expect(cfg.maxDrawdownFraction).toBe(0.1);
     expect(cfg.marketDataMaxAgeMs).toBe(60000);
+    expect(cfg.marketDataTransportMaxAgeMs).toBe(60000);
+    expect(cfg.maxClockSkewMs).toBe(120000);
     expect(cfg.killSwitch).toBe(false);
   });
 
@@ -88,12 +91,16 @@ describe('loadConfig', () => {
       MAX_PORTFOLIO_EXPOSURE_FRACTION: '0.8',
       MAX_DRAWDOWN_FRACTION: '0.2',
       MARKET_DATA_MAX_AGE_MS: '30000',
+      MARKET_DATA_TRANSPORT_MAX_AGE_MS: '45000',
+      MAX_CLOCK_SKEW_MS: '90000',
       KILL_SWITCH: 'true',
     };
     const cfg = loadConfig(env as NodeJS.ProcessEnv);
     expect(cfg.maxPortfolioExposureFraction).toBe(0.8);
     expect(cfg.maxDrawdownFraction).toBe(0.2);
     expect(cfg.marketDataMaxAgeMs).toBe(30000);
+    expect(cfg.marketDataTransportMaxAgeMs).toBe(45000);
+    expect(cfg.maxClockSkewMs).toBe(90000);
     expect(cfg.killSwitch).toBe(true);
   });
 

@@ -67,8 +67,20 @@ Pino-based structured (JSON) logging with sane development pretty-printing and
 
 ### `src/cli/` — User interface
 Minimal command dispatcher. Commands: `setup`, `config`, `paper`, `start`,
-`status`, `backtest`, `trades`, and `reconcile`. Each is a small module. The
-CLI is crafted so non-technical users can get running without editing source.
+`status`, `backtest`, `trades`, `reconcile`, `live-test`, and `manual`. Each is a
+small module. The CLI is crafted so non-technical users can get running without
+editing source.
+
+- **`bot manual`** — the **CONSTRAINED MANUAL EXECUTION BRIDGE** operator
+  interface (Gate 9.6). It is NOT a trading terminal or order-placement
+  interface: RETRAC never places, cancels, or modifies an exchange order through
+  it. The exchange adapter it uses is wrapped in a **read-only proxy** that
+  throws on `placeOrder`/`cancelOrder`, so there is no code path to an exchange
+  write. It reuses the existing `ManualTradeBridge` domain API for propose /
+  show / confirm / instructions / evidence / verify / settle / reconcile /
+  cancel-intent / reservations / list, with explicit, state-aware output, a
+  `--json` structured mode, and fail-closed exit codes (0 = completed safely,
+  2 = blocked/fail-closed, 1 = error). See `docs/DECISIONS.md` §37.
 
 ### `src/exchanges/` — exchange adapters behind one interface
 - `src/exchanges/ExchangeAdapter.ts` — the interface engines depend on.
@@ -123,17 +135,44 @@ CLI is crafted so non-technical users can get running without editing source.
   the adapter (failing closed if any read fails). The exchange is authoritative;
   the bot never "fixes" a discrepancy by guessing.
 - **`src/engine/`** — `PaperEngine` (Phase 8) wires everything into one
-  continuously-running loop: `Market Data → Strategy → Signal → Risk → Paper
-  Execution → Portfolio → Logging/Persistence`. It ticks on a fixed cadence
-  (no busy loop), fails closed on stale/unknown market data, and shuts down
-  gracefully, persisting on stop. `buildEngine.ts` is the composition root that
-  assembles the dependency graph from config.
-- **`src/backtest/`** — `BacktestRunner` replays historical candles through the
-  strategy → risk → execution pipeline with simulated execution and reports the
-  required performance metrics. The `backtest` CLI reads candles from a JSON
-  file. `computeMetrics` produces starting/ending capital, total return, trade
-  count, win rate, realized P&L, fees, max drawdown, and largest win/loss.
-  Results are a historical simulation, not a prediction.
+  continuously-running loop: `Market Data → Universe → Coordinator → Strategy →
+  Signal → Risk → Paper Execution → Managed Portfolio → Logging/Persistence`. It
+  ticks on a fixed cadence (no busy loop), fails closed on stale/unknown market
+  data, and shuts down gracefully, persisting on stop. `buildEngine.ts` is the
+  composition root that assembles the dependency graph from config.
+- **Multi-asset (Gate 5):** `src/engine/universe.ts` builds the eligible market
+  universe from the curated `UNIVERSE_MARKETS` filtered by metadata eligibility
+  (quote currency, valid ticks, min order, fees, market orders — never the
+  unreliable order-count fields). `src/engine/MarketCoordinator.ts` evaluates
+  every eligible market, runs Strategy → RiskManager per market, collects
+  risk-approved opportunities, ranks them deterministically, and returns **at most
+  one** selected trade per cycle (SELL exits before BUYs; then BUYs by lower
+  relative spread, then symbol). It never manufactures a signal and never executes
+  two trades in one cycle.
+- **Ownership (Gate 5):** `src/portfolio/` is the **bot-managed** portfolio. It
+  tracks managed positions (with `source: 'BOT' | 'EXTERNAL_AUTHORIZED'`), an
+  `externalSnapshot` of assets the bot does not own, an `authorizedExternal` set,
+  and `reserved` quote (deployable = cash − reserved). Risk denominators
+  (`portfolioValue`, `portfolioExposure`, `currentPosition`) are managed-only, so
+  external holdings never inflate the equity denominator, never consume the
+  per-asset position cap, and can never be sold by a SELL (external+managed=0 →
+  `SELL_EXCEEDS_MANAGED_POSITION`).
+- **`src/manual/`** — **Gate 9 manual-execution bridge** (operator-executed).
+  `ManualTradeBridge` recommends a trade (RiskManager-evaluated), the operator
+  executes it EXTERNALLY on the exchange, and RETRAC records `ManualEvidence`,
+  validates it against an authoritative `getOrderStatus` read (`validation.ts`),
+  and accounts the result at the **order level** via the separate
+  `Portfolio.settleManualOrder` path. It NEVER submits or cancels an order, NEVER
+  fabricates an execution identity, and NEVER treats an exchange `OrderId` as an
+  execution id. `ManualIntentStore` is a durable, fail-closed intent ledger
+  (corruption throws, never "no intents"). Core security invariants, the
+  crash/recovery model, and the **Gate 9.4 architecture freeze + Gate 9.5
+  state-semantics split** are recorded in `docs/DECISIONS.md` §32–§37. The manual
+  bridge's terminal accounting states are explicitly split (Gate 9.5): the old
+  conflated `SETTLED` was replaced by `ACCOUNTED_WITH_EXCHANGE_VALIDATION` and
+  `ACCOUNTED_WITH_OPERATOR_ATTESTATION`, plus a distinct `RECONCILIATION_REQUIRED`
+  (consistent evidence but accounting cannot be safely completed) that is NEVER a
+  synonym for `AMBIGUOUS` (contradictory evidence).
 
 ## Safety Model
 
@@ -154,6 +193,50 @@ CLI is crafted so non-technical users can get running without editing source.
   and stays that way until its order semantics and private-header signing are
   verified against a live account. The live execution engine still enforces all
   gates and is fully tested via the exchange adapter interface.
+
+### Manual-execution bridge safety boundary (Gate 9.4)
+
+The manual bridge is a **non-autonomous, operator-in-the-loop, order-level**
+workflow — it is NOT autonomous trading. Its safety boundaries:
+
+- **RETRAC never submits or cancels an order** on the manual path; it only reads
+  (`getOrderStatus`) and accounts results the operator reports. `supportsOrderPlacement`
+  stays `false`; `SendOrder`/`CancelOrder` are never called.
+- **Four identities never conflated:** intent identity (`intentId`, local) ≠
+  exchange order identity (`OrderId`) ≠ execution identity (`executionId`/`tradeId`)
+  ≠ provenance proof. Order-level accounting is keyed by `intentId`; `OrderId` is
+  evidence; there is no execution id and none is fabricated; provenance is
+  operator-attestation plus consistency, never proof.
+- **Accounting authority is explicit (Gate 9.5).** Terminal success is
+  `ACCOUNTED_WITH_EXCHANGE_VALIDATION` (numbers from authoritative exchange
+  evidence) or `ACCOUNTED_WITH_OPERATOR_ATTESTATION` (numbers attributed via an
+  explicit operator attestation; exchange consistency still validated). Both carry
+  `settlementMode` and `provenanceProof: false` on the settlement — accounting is
+  never exchange-proven provenance.
+- **Operator-entered evidence is a HINT, never authoritative.** Authority comes
+  only from an exchange read. `evidenceSource` records the origin but never
+  upgrades it.
+- **Fee accounting is strict and fail-closed.** Only an authoritative,
+  quote-denominated, provably-complete fee is accounted. NDAX order-level fee
+  currency is `'unknown'` (not resolvable from `GetOrderStatus`), so a real NDAX
+  order can never be auto-fee-accounted — it routes to `RECONCILIATION_REQUIRED`
+  (never `SETTLED`/accounted, never a fake `AMBIGUOUS`).
+- **`executionId` is display/evidence/dedupe only** — never authoritative and
+  never exactly-once accounting (uniqueness unproven; per-order enumeration not
+  correctness-guaranteed).
+- **Reservations** are created before operator execution, tied 1:1 to the intent,
+  consumed by actual cost, leftover released exactly once, and never auto-released
+  where a positive external execution may exist. `RECONCILIATION_REQUIRED` and
+  `AMBIGUOUS` both retain the reservation; a terminal zero-fill releases it exactly
+  once.
+- **Reconciliation** never fabricates a fill, never auto-releases on uncertainty,
+  and never treats an ambiguous/reconciliation-required state as success. The two
+  terminal ACCOUNTED states are idempotent: no second accounting, and a
+  conflicting repeat fails closed.
+- A future operator CLI must classify every operation as SAFE / SAFE WITH EXPLICIT
+  LIMITATION / UNSAFE and must never claim exchange-proven provenance or
+  exactly-once live execution. The full classification is in
+  `docs/DECISIONS.md` §35.8.
 
 ## Security Model
 

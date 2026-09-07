@@ -8,6 +8,18 @@
  */
 
 export { LiveMarketData } from './LiveMarketData.js';
+export {
+  evaluateFreshness,
+  newestQuoteTimestampMs,
+  QUOTE_FRESHNESS_REASON,
+  isValidEpochMs,
+} from './freshness.js';
+export type {
+  FreshnessPolicy,
+  FreshnessCheck,
+  FreshnessInput,
+  QuoteFreshnessReason,
+} from './freshness.js';
 export type {
   MarketDataConfig,
   MarketDataKind,

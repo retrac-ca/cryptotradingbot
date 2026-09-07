@@ -229,4 +229,53 @@ describe('NdaxAdapter', () => {
     expect(o.quantity.toFixed(2)).toBe('0.50');
     expect(o.filledQuantity.toFixed(2)).toBe('0.10');
   });
+
+  it('reads account trades via GetAccountTrades (GET, maps execution/trade/fee ids) and filters by symbol', async () => {
+    const fetchImpl = scriptedFetch({
+      GetInstruments: () => [INSTRUMENT],
+      GetAccountTrades: () => [
+        {
+          ExecutionId: 111, TradeId: 222, OrderId: 42, AccountId: 449, SubAccountId: 0,
+          ClientOrderId: 0, InstrumentId: 1, Side: 'Buy', Quantity: 0.5, RemainingQuantity: 0,
+          Price: 88000.5, Value: 44000.25, TradeTimeMS: 1700000000000, Fee: 10.5, FeeProductId: 2,
+          OrderOriginator: 'api',
+        },
+        {
+          ExecutionId: 333, TradeId: 444, OrderId: 43, AccountId: 449, SubAccountId: 0,
+          ClientOrderId: 0, InstrumentId: 2, Side: 'Sell', Quantity: 0.1, RemainingQuantity: 0,
+          Price: 90000, Value: 9000, TradeTimeMS: 1700000001000, Fee: 2.0, FeeProductId: 9,
+          OrderOriginator: 'api',
+        },
+      ],
+    });
+    const adapter = new NdaxAdapter({
+      credentials: { apiKey: 'k', apiSecret: 's', userId: '7', accountId: 449 },
+      baseUrl: BASE,
+      fetchImpl,
+      enableAuthenticatedReads: true,
+      throttleMs: 0,
+    });
+    const all = await adapter.getAccountTrades();
+    expect(all.length).toBe(2);
+    expect(all[0]!.executionId).toBe('111');
+    expect(all[0]!.tradeId).toBe('222');
+    expect(all[0]!.orderId).toBe('42');
+    expect(all[0]!.symbol).toBe('BTC/CAD');
+    expect(all[0]!.side).toBe('BUY');
+    expect(all[0]!.feeProductId).toBe('2');
+    expect(all[1]!.symbol).toBeNull(); // instrument 2 not in the resolver => null, never guessed
+    expect(all[1]!.side).toBe('SELL');
+    // symbol filter narrows to the BTC/CAD market.
+    const btc = await adapter.getAccountTrades('BTC/CAD');
+    expect(btc.length).toBe(1);
+    expect(btc[0]!.executionId).toBe('111');
+    // request was a GET with the documented params.
+    const { init, url } = lastCall(fetchImpl);
+    expect(init.method).toBe('GET');
+    expect(url).toContain('GetAccountTrades');
+    expect(url).toContain('OMSId=1');
+    expect(url).toContain('AccountId=449');
+    expect(url).toContain('StartIndex=0');
+    expect(url).toContain('Count=200');
+  });
 });

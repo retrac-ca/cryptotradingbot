@@ -18,4 +18,18 @@ export type {
   PaperExecutionConfig,
 } from './PaperExecutionTypes.js';
 export { LiveOrderEngine, LiveGateError } from './LiveExecutionEngine.js';
-export type { LiveGate, LiveExecutionConfig, LiveOrderResult } from './LiveExecutionEngine.js';
+export type { LiveGate, LiveExecutionConfig, LiveOrderResult, RecoveryResult } from './LiveExecutionEngine.js';
+export { classifyReattachment, isProvableReattachmentMatch } from './recovery.js';
+export type {
+  ReattachmentOutcome,
+  ReattachmentResult,
+  ReattachmentPolicy,
+} from './recovery.js';
+export { evaluateLiveBuyReadiness, ndaxLiveBuyFacts } from './readiness.js';
+export type {
+  LiveBuyReadinessInput,
+  LiveBuyReadinessReport,
+  ReadinessCondition,
+  ReadinessVerdict,
+  ConditionStatus,
+} from './readiness.js';

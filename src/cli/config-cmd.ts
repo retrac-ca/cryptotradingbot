@@ -28,6 +28,8 @@ export const configureCommand: CommandHandler = (): number => {
   // eslint-disable-next-line no-console
   console.log('  Trading pairs:   ' + cfg.tradingPairs.join(', '));
   // eslint-disable-next-line no-console
+  console.log('  Universe:        ' + cfg.universeMarkets.join(', '));
+  // eslint-disable-next-line no-console
   console.log('  Strategy:        ' + cfg.strategy);
   // eslint-disable-next-line no-console
   console.log('  Timeframe:       ' + cfg.timeframe);
@@ -42,13 +44,19 @@ export const configureCommand: CommandHandler = (): number => {
   // eslint-disable-next-line no-console
   console.log('    Max trade:     ' + (cfg.maxTradeAmount > 0 ? cfg.maxTradeAmount : 'unlimited') + ' (quote)');
   // eslint-disable-next-line no-console
-  console.log('    Stop loss:     ' + cfg.stopLossFraction);
-  // eslint-disable-next-line no-console
-  console.log('    Take profit:   ' + cfg.takeProfitFraction);
+  console.log('    Max positions: ' + cfg.maxOpenPositions + (cfg.maxOpenPositions <= 0 ? ' (no limit)' : ' (enforced)'));
   // eslint-disable-next-line no-console
   console.log('    Max daily loss:' + cfg.maxDailyLossFraction);
   // eslint-disable-next-line no-console
-  console.log('    Max positions: ' + cfg.maxOpenPositions);
+  console.log('    Data max age:  ' + cfg.marketDataMaxAgeMs + 'ms');
+  // eslint-disable-next-line no-console
+  console.log('    Transport age: ' + cfg.marketDataTransportMaxAgeMs + 'ms');
+  // eslint-disable-next-line no-console
+  console.log('    Clock skew:    ' + cfg.maxClockSkewMs + 'ms');
+  // eslint-disable-next-line no-console
+  console.log('    Stop loss:     ' + cfg.stopLossFraction + ' (NOT ENFORCED yet)');
+  // eslint-disable-next-line no-console
+  console.log('    Take profit:   ' + cfg.takeProfitFraction + ' (NOT ENFORCED yet)');
   // eslint-disable-next-line no-console
   console.log('  System:');
   // eslint-disable-next-line no-console
@@ -57,6 +65,10 @@ export const configureCommand: CommandHandler = (): number => {
   console.log('    Reconcile sec: ' + cfg.reconcileIntervalSeconds);
   // eslint-disable-next-line no-console
   console.log('    Kill switch:   ' + cfg.killSwitch);
+  // eslint-disable-next-line no-console
+  console.log('    Paper state:   ' + cfg.paperStateFile);
+  // eslint-disable-next-line no-console
+  console.log('    Live managed:  ' + cfg.liveManagedStateFile + ' (separate from paper state)');
   // eslint-disable-next-line no-console
   console.log('\n(API credentials are not displayed.)');
   return 0;

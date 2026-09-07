@@ -17,6 +17,7 @@
 
 import { Money } from '../../src/money/Money.js';
 import type {
+  AccountTrade,
   Balance,
   Candle,
   MarketInfo,
@@ -108,6 +109,7 @@ export class FakeExchange implements ExchangeAdapter {
   private unknownOrderSubmissions: boolean;
   readonly submittedOrders: NewOrder[];
   private orders: Order[] = [];
+  private accountTrades: AccountTrade[] = [];
   private nextOrderId = 1;
   private nowMs: number;
   private healthLatencyMs: number;
@@ -161,6 +163,16 @@ export class FakeExchange implements ExchangeAdapter {
 
   getOrders(): Order[] {
     return this.orders;
+  }
+
+  /** Directly seed the fake's order store (test helper for recovery scenarios). */
+  seedOrders(orders: Order[]): void {
+    this.orders = orders;
+  }
+
+  /** Directly seed the fake's authoritative account-trade store (Gate 9.2). */
+  seedAccountTrades(trades: AccountTrade[]): void {
+    this.accountTrades = trades;
   }
 
   /** Advance the fake's internal clock. */
@@ -233,6 +245,11 @@ export class FakeExchange implements ExchangeAdapter {
     const order = this.orders.find((o) => o.clientOrderId === clientOrderId || o.exchangeOrderId === exchangeOrderId);
     if (!order) throw new Error('FakeExchange: order not found');
     return order;
+  }
+
+  async getAccountTrades(symbol?: string): Promise<AccountTrade[]> {
+    this.maybeFail('getAccountTrades');
+    return symbol ? this.accountTrades.filter((t) => t.symbol === symbol) : this.accountTrades;
   }
 
   async getMarketInfo(symbol: string): Promise<MarketInfo> {

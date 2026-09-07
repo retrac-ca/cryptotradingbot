@@ -41,6 +41,9 @@ export const RISK_REASON = [
   // --- Intent ---
   'NO_ACTION', // HOLD signal, or a SELL when there is nothing to sell
   'SELL_EXCEEDS_POSITION', // SELL that would go short / exceed the held long
+  'INVALID_SELL_TARGET', // malformed/empty bounded sell target (fraction/notional)
+  'SELL_EXCEEDS_MANAGED_POSITION', // SELL that would sell EXTERNAL (non-bot) inventory
+  'MAX_OPEN_POSITIONS', // BUY would open more managed positions than maxOpenPositions
 
   // --- Approvals ---
   'APPROVED',
@@ -62,6 +65,8 @@ export interface AppliedRiskLimits {
   maxDrawdownFraction: number;
   /** Cooldown after a loss, in ms. Zero = disabled. */
   cooldownAfterLossMs: number;
+  /** Max open bot-managed positions. 0 = no limit. */
+  maxOpenPositions: number;
   /** Whether the kill switch is currently active. */
   killSwitchActive: boolean;
 }

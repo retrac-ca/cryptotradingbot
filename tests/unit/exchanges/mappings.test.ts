@@ -68,6 +68,36 @@ describe('NDAX mappings', () => {
       expect(ticker.last!.toFixed(2)).toBe('88100.75');
       expect(ticker.timestampMs).toBe(1700000000000);
     });
+
+    it('prefers `timestamp` over `lastTradeTime`', () => {
+      const raw = { timestamp: 1700000001000, lastTradeTime: 1700000000000 };
+      expect(mapLevel1ToTicker('BTC/CAD', raw as never).timestampMs).toBe(1700000001000);
+    });
+
+    it('F-3: a missing exchange timestamp becomes null (never local Date.now())', () => {
+      const raw = { bestBid: 1, bestOffer: 2, lastTradedPx: 1.5 };
+      const ticker = mapLevel1ToTicker('BTC/CAD', raw as never);
+      expect(ticker.timestampMs).toBeNull();
+    });
+
+    it('F-3: a zero timestamp fails closed and becomes null', () => {
+      expect(mapLevel1ToTicker('BTC/CAD', { timestamp: 0 } as never).timestampMs).toBeNull();
+    });
+
+    it('F-3: a negative timestamp fails closed and becomes null', () => {
+      expect(mapLevel1ToTicker('BTC/CAD', { timestamp: -5 } as never).timestampMs).toBeNull();
+    });
+
+    it('F-3: a NaN / non-numeric timestamp fails closed and becomes null', () => {
+      expect(mapLevel1ToTicker('BTC/CAD', { timestamp: NaN } as never).timestampMs).toBeNull();
+      expect(mapLevel1ToTicker('BTC/CAD', { timestamp: 'not-a-date' } as never).timestampMs).toBeNull();
+      expect(mapLevel1ToTicker('BTC/CAD', { timestamp: undefined } as never).timestampMs).toBeNull();
+      expect(mapLevel1ToTicker('BTC/CAD', { timestamp: '' } as never).timestampMs).toBeNull();
+    });
+
+    it('F-3: a numeric string epoch is still accepted', () => {
+      expect(mapLevel1ToTicker('BTC/CAD', { timestamp: '1700000000000' } as never).timestampMs).toBe(1700000000000);
+    });
   });
 
   describe('mapL2ToOrderBook', () => {
@@ -80,7 +110,7 @@ describe('NDAX mappings', () => {
         [3, 0, 1, 0, 0, 3, 88101.5, 1, 0.6, 1], // sell
         [4, 0, 1, 0, 0, 4, 88101.25, 1, 0.7, 1], // sell (lower)
       ];
-      const book = mapL2ToOrderBook('BTC/CAD', 1700000000000, rows as never);
+      const book = mapL2ToOrderBook('BTC/CAD', rows as never);
       expect(book.bids.length).toBe(2);
       expect(book.asks.length).toBe(2);
       // bids best-first (descending)
@@ -89,6 +119,30 @@ describe('NDAX mappings', () => {
       // asks best-first (ascending)
       expect(book.asks[0]!.price.toFixed(2)).toBe('88101.25');
       expect(book.asks[1]!.price.toFixed(2)).toBe('88101.50');
+    });
+
+    it('sets quoteTimestampMs and timestampMs to the newest valid ActionDateTime', () => {
+      const rows = [
+        [1, 0, 1700000000000, 0, 0, 1, 88100.5, 1, 0.5, 0],
+        [2, 0, 1700000001000, 0, 0, 2, 88100.75, 1, 0.4, 0],
+        [3, 0, 1700000002000, 0, 0, 3, 88101.5, 1, 0.6, 1],
+        [4, 0, -1, 0, 0, 4, 88101.25, 1, 0.7, 1], // invalid -> ignored
+      ];
+      const book = mapL2ToOrderBook('BTC/CAD', rows as never);
+      // The newest positive ActionDateTime is row [3] (1700000002000).
+      expect(book.quoteTimestampMs).toBe(1700000002000);
+      // F-3: timestampMs is the exchange quote time (never a local Date.now()).
+      expect(book.timestampMs).toBe(1700000002000);
+    });
+
+    it('omits quoteTimestampMs when no valid ActionDateTime exists (timestampMs null)', () => {
+      const rows = [
+        [1, 0, -5, 0, 0, 1, 88100.5, 1, 0.5, 0],
+        [2, 0, 0, 0, 0, 3, 88101.5, 1, 0.6, 1],
+      ];
+      const book = mapL2ToOrderBook('BTC/CAD', rows as never);
+      expect(book.quoteTimestampMs).toBeUndefined();
+      expect(book.timestampMs).toBeNull();
     });
   });
 
@@ -207,6 +261,32 @@ describe('NDAX mappings', () => {
 
     it('maps a string but unknown state to UNKNOWN (not crash)', () => {
       expect(mapOrder({ OrderId: 1, OrderState: 'Cancelled-odd', Symbol: 'BTCCAD' }).status).toBe('UNKNOWN');
+    });
+
+    it('F-3: maps exchange fill/order timestamps when present', () => {
+      const o = mapOrder({
+        OrderId: 55, OrderState: 'FullyExecuted', Symbol: 'BTCCAD', Quantity: 1,
+        ReceiveTime: 1700000000000, LastUpdatedTime: 1700000001000,
+        Fills: [{ Price: 88000, Quantity: 1, TradeTimeMs: 1700000000500 }],
+      });
+      expect(o.createdAtMs).toBe(1700000000000);
+      expect(o.updatedAtMs).toBe(1700000001000);
+      expect(o.fills[0]!.timestampMs).toBe(1700000000500);
+    });
+
+    it('F-3: a missing exchange order/fill timestamp is null (never Date.now())', () => {
+      // No ReceiveTime / TradeTime / LastUpdatedTime -> unknown, NOT fabricated.
+      const o = mapOrder({ OrderId: 7, OrderState: 'FullyExecuted', Symbol: 'BTCCAD', Quantity: 1, Fills: [{ Price: 1, Quantity: 1 }] });
+      expect(o.createdAtMs).toBeNull();
+      expect(o.updatedAtMs).toBeNull();
+      expect(o.fills[0]!.timestampMs).toBeNull();
+    });
+
+    it('F-3: zero/negative exchange timestamps fail closed to null', () => {
+      const byTs = mapOrder({ OrderId: 1, OrderState: 'Canceled', Symbol: 'BTCCAD', ReceiveTime: 0 });
+      const negTs = mapOrder({ OrderId: 1, OrderState: 'Canceled', Symbol: 'BTCCAD', ReceiveTime: -5 });
+      expect(byTs.createdAtMs).toBeNull();
+      expect(negTs.createdAtMs).toBeNull();
     });
   });
 

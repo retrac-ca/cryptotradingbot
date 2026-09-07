@@ -6,6 +6,23 @@
  */
 
 export { Portfolio } from './Portfolio.js';
-export type { PortfolioModel, PaperPosition, CashFlow } from './types.js';
-export { serializePortfolio, deserializePortfolio } from './serialization.js';
-export type { PortfolioJsonV1 } from './serialization.js';
+export type {
+  PortfolioModel,
+  PaperPosition,
+  CashFlow,
+  PositionSource,
+  SourceQuantities,
+  OrderReservation,
+  ReservationStatus,
+  AppliedExecution,
+} from './types.js';
+export { serializePortfolio, deserializePortfolio, PORTFOLIO_STATE_VERSION } from './serialization.js';
+export type {
+  PortfolioJsonV1,
+  PortfolioJsonV2,
+  PortfolioJson,
+  PositionJsonV1,
+  PositionJsonV2,
+  PositionJson,
+  StateRealm,
+} from './serialization.js';

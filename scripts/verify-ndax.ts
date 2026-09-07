@@ -110,6 +110,62 @@ async function main(): Promise<number> {
         const orders = await adapter.getOrderHistory();
         return `${orders.length} orders in history`;
       });
+      await run('GetAccountTrades', async () => {
+        const trades = await adapter.getAccountTrades();
+        if (trades.length === 0) return '0 account trades returned (no executions to inspect)';
+        const withExec = trades.filter((t) => t.executionId !== null).length;
+        const withTrade = trades.filter((t) => t.tradeId !== null).length;
+        const withFeed = trades.filter((t) => t.feeProductId !== null).length;
+        const withSymbol = trades.filter((t) => t.symbol !== null).length;
+        const withTime = trades.filter((t) => t.tradeTimeMs !== null).length;
+        const distinctExec = new Set(trades.map((t) => t.executionId)).size;
+        const distinctOrder = new Set(trades.map((t) => t.orderId)).size;
+        // executions-per-order distribution: can ONE order have >1 execution?
+        const perOrder = new Map<string | null, number>();
+        for (const t of trades) {
+          perOrder.set(t.orderId, (perOrder.get(t.orderId) ?? 0) + 1);
+        }
+        const maxPerOrder = Math.max(0, ...perOrder.values());
+        const ordersWithMultipleExecs = [...perOrder.values()].filter((n) => n > 1).length;
+        // ExecutionId stability across a repeated READ-ONLY read.
+        const second = await adapter.getAccountTrades();
+        const stable =
+          second.length === trades.length &&
+          new Set(second.map((t) => t.executionId)).size === distinctExec &&
+          second.every((t) => trades.some((o) => o.executionId === t.executionId && o.orderId === t.orderId && o.quantity.equals(t.quantity) && o.fee.equals(t.fee)));
+        // Only non-sensitive structural observations; NO account/id/trade VALUES.
+        return (
+          `${trades.length} trades; executionId present=${withExec}, tradeId present=${withTrade}, ` +
+          `feeProductId present=${withFeed}, symbol resolved=${withSymbol}, tradeTime present=${withTime}; ` +
+          `distinct executionIds=${distinctExec}, distinct orderIds=${distinctOrder}; ` +
+          `orderId→executions: max=${maxPerOrder}, orders-with->1-execution=${ordersWithMultipleExecs}; ` +
+          `executionId stable across repeat read=${stable}`
+        );
+      });
+      await run('GetProducts + feeProductId→currency resolution', async () => {
+        const products = await adapter.getProducts();
+        const trades = (await adapter.getAccountTrades()).filter((t) => t.feeProductId !== null && t.symbol !== null);
+        const resolved = { base: 0, quote: 0, other: 0, unknown: 0 };
+        const byKind = new Map<string, number>();
+        let resolvedNames = 0;
+        for (const t of trades) {
+          const r = await adapter.resolveFeeCurrency(t.feeProductId, t.symbol!);
+          resolved[r.kind] = (resolved[r.kind] ?? 0) + 1;
+          if (r.assetSymbol) {
+            resolvedNames += 1;
+            byKind.set(`${r.kind}:${r.assetSymbol}`, (byKind.get(`${r.kind}:${r.assetSymbol}`) ?? 0) + 1);
+          }
+        }
+        const foundProduct = products.length;
+        const productBySymbol = new Set(products.map((p) => p.symbol));
+        const distinctSymbols = productBySymbol.size;
+        const detail = [...byKind.entries()].map(([k, n]) => `${k}=${n}`).join(', ');
+        return (
+          `${foundProduct} products (${distinctSymbols} distinct symbols); resolved ${trades.length} fees: ` +
+          `base=${resolved.base}, quote=${resolved.quote}, other=${resolved.other}, unknown=${resolved.unknown}; ` +
+          `fee asset resolved to name on ${resolvedNames}; ${detail ? `kinds: ${detail}` : 'no fee assets resolvable'}`
+        );
+      });
     }
   } else {
     console.log('\nAuthenticated reads skipped (ENABLE_AUTHENTICATED_READS=false).');

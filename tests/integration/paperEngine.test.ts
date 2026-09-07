@@ -14,6 +14,7 @@ import { PaperStateStore } from '../../src/persistence/PaperStateStore.js';
 import type { MarketDataProvider } from '../../src/marketdata/types.js';
 import type { Candle, MarketInfo, Ticker, Timeframe } from '../../src/types.js';
 import type { Logger } from '../../src/logging/logger.js';
+import { statePath } from '../helpers/state.js';
 
 const SYMBOL = 'BTC/CAD';
 const TF: Timeframe = '5m';
@@ -34,7 +35,11 @@ class StubMarketData implements MarketDataProvider {
   ticker: Ticker | null = null;
   candles: Candle[] = [];
   getTicker(): Ticker | null {
-    return this.ticker;
+    // This stub simulates "data observed exactly when it was reported", so the
+    // transport (fetch) time falls back to the quote time. The production
+    // LiveMarketData stamps observedAtMs explicitly (see LiveMarketData.poll).
+    if (!this.ticker) return null;
+    return { ...this.ticker, observedAtMs: this.ticker.observedAtMs ?? this.ticker.timestampMs };
   }
   getOrderBook() {
     return null;
@@ -68,7 +73,7 @@ function cfg() {
     paperFeeFraction: 0.0005,
     paperSlippageFraction: 0.0005,
     paperFillFraction: 1,
-    paperStateFile: '/tmp/opencode/paper-engine-test.json',
+    paperStateFile: STATE_FILE,
     evaluateIntervalSeconds: 1,
   });
 }
@@ -101,7 +106,7 @@ function candles(closes: number[], nowMs: number): Candle[] {
   }));
 }
 
-const STATE_FILE = '/tmp/opencode/paper-engine-test.json';
+const STATE_FILE = statePath('paperengine', 'state.json');
 
 function buildDeps(
   over: {

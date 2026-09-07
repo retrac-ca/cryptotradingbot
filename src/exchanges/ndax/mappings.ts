@@ -6,6 +6,8 @@
 
 import { Money } from '../../money/Money.js';
 import type {
+  AssetProduct,
+  AssetProductType,
   Candle,
   MarketInfo,
   OrderBook,
@@ -120,8 +122,27 @@ export function mapLevel1ToTicker(symbol: string, raw: Record<string, unknown>):
     low: pick('sessionlow'),
     baseVolume: pick('rolling24hrvolume'),
     quoteVolume: null,
-    timestampMs: Number(r.timestamp ?? r.lasttradetime ?? Date.now()),
+    // F-3: the exchange timestamp is authoritative. If NDAX provides no usable
+    // `TimeStamp`/`LastTradeTime`, the ticker's timestamp is `null` (freshness
+    // fails closed) — NEVER a fabricated local `Date.now()` value.
+    timestampMs: exchangeEpochMs(r.timestamp ?? r.lasttradetime),
   };
+}
+
+/**
+ * Interpret an NDAX epoch timestamp field. Returns a valid positive ms epoch
+ * only when the input is actually usable; otherwise `null` (missing/malformed).
+ * `0`, negative, NaN, Infinity, and non-numeric values all fail closed.
+ */
+export function exchangeEpochMs(v: unknown): number | null {
+  if (v === null || v === undefined || v === '') return null;
+  const n = typeof v === 'number' ? v : Number(String(v).trim());
+  return isValidEpochMs(n) ? n : null;
+}
+
+/** True for a usable positive finite epoch-ms value. */
+function isValidEpochMs(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0;
 }
 
 /**
@@ -130,20 +151,34 @@ export function mapLevel1ToTicker(symbol: string, raw: Record<string, unknown>):
  *       OrderId, Price, ProductPairCode, Quantity, Side]
  * Side: 0 Buy, 1 Sell.
  */
-export function mapL2ToOrderBook(symbol: string, timestampMs: number, rows: unknown[][]): OrderBook {
+export function mapL2ToOrderBook(symbol: string, rows: unknown[][]): OrderBook {
   const bids: OrderBookLevel[] = [];
   const asks: OrderBookLevel[] = [];
+  let quoteTimestampMs: number | undefined;
   for (const row of rows) {
     const price = scaledStrToMoney(row[6], 8);
     const quantity = scaledStrToMoney(row[8], 8);
     const side = Number(row[9]);
+    const act = Number(row[2]);
+    if (Number.isFinite(act) && act > 0 && (quoteTimestampMs === undefined || act > quoteTimestampMs)) {
+      quoteTimestampMs = act;
+    }
     if (side === 0) bids.push({ price, quantity });
     else if (side === 1) asks.push({ price, quantity });
   }
   // Sort bids descending (best first), asks ascending (best first).
   bids.sort((a, b) => (b.price.compareTo(a.price) as number));
   asks.sort((a, b) => (a.price.compareTo(b.price) as number));
-  return { symbol, timestampMs, bids, asks };
+  // F-3: `timestampMs` is the exchange quote time (newest ActionDateTime), never a
+  // fabricated local `Date.now()`. `null` when the exchange provides none. The
+  // local observation time is tracked separately via `observedAtMs`.
+  return {
+    symbol,
+    timestampMs: quoteTimestampMs ?? null,
+    bids,
+    asks,
+    ...(quoteTimestampMs !== undefined ? { quoteTimestampMs } : {}),
+  };
 }
 
 /**
@@ -195,7 +230,7 @@ export function mapInstrumentToMarketInfo(raw: Record<string, unknown>): MarketI
   // sends a per-instrument PRICE FLOOR here (e.g. 25000 for BTCCAD), which is
   // not a minimum order notional and would wrongly block small orders.
   const minOrderQuote: Money | null = null;
-  return {
+  const info: MarketInfo = {
     symbol: symbolCanon,
     exchangeId: String(r.instrumentid ?? ''),
     priceTick: priceTick.isZero() ? Money.fromString('0.01') : priceTick,
@@ -205,8 +240,20 @@ export function mapInstrumentToMarketInfo(raw: Record<string, unknown>): MarketI
     minOrderBase,
     minOrderQuote,
     supportsMarketOrders: true,
+    // A market's fee MODEL is not exchange-authoritative; the flat 0.20% fee
+    // described by ndax.io/fees is a model for risk/paper, never a per-trade
+    // authoritative fee amount/currency. The authoritative fee asset is derived
+    // from `feeProductId` + the product metadata below, never assumed.
     feeInfo: { maker: 0.002, taker: 0.002, feeCurrency: 'quote' },
   };
+  // Authoritative product metadata (NDAX GetInstruments `product1`/`product2`
+  // ids + `product1Symbol`/`product2Symbol`). Absent => fee-currency resolution
+  // must fail closed. We NEVER infer base/quote from the symbol string.
+  if (r.product1 !== null && r.product1 !== undefined) info.baseProductId = String(r.product1);
+  if (r.product2 !== null && r.product2 !== undefined) info.quoteProductId = String(r.product2);
+  if (typeof r.product1symbol === 'string' && r.product1symbol !== '') info.baseProductSymbol = String(r.product1symbol);
+  if (typeof r.product2symbol === 'string' && r.product2symbol !== '') info.quoteProductSymbol = String(r.product2symbol);
+  return info;
 }
 
 /** Map a GetAccountPositions row into a Balance. */
@@ -249,16 +296,34 @@ export function mapOrder(raw: Record<string, unknown>, opts: MapOrderOptions = {
   const fillsRaw: unknown[] = Array.isArray(r.fills) ? (r.fills as unknown[]) : [];
   const fills: Fill[] = fillsRaw.map((f) => {
     const fr = lowerKeys(asRecord(f));
+    const fpid = fr.feeproductid !== null && fr.feeproductid !== undefined ? String(fr.feeproductid) : null;
     return {
       price: scaledStrToMoney(fr.price, 8),
       quantity: scaledStrToMoney(fr.quantity ?? fr.quantityexecuted, 8),
       fee: scaledStrToMoney(fr.fee ?? 0, 8),
-      feeCurrency: (fr.feeproductid as string) === 'base' ? 'base' : 'quote',
-      timestampMs: Number(fr.tradetimems ?? fr.tradetime ?? Date.now()),
+      // AUTHORITATIVE fee currency is ONLY resolved from `feeProductId` against
+      // product/instrument metadata. In this pure, context-free mapper we do NOT
+      // guess: a non-zero fee with no resolved currency is 'unknown' (downstream
+      // MUST fail closed), and `feeProductId` is surfaced verbatim so the caller
+      // can resolve it. We NEVER default an NDAX fee to 'quote'.
+      feeCurrency: 'unknown',
+      ...(fpid !== null ? { feeProductId: fpid } : {}),
+      // F-3: fill time is exchange time. If NDAX provides no usable
+      // `TradeTimeMs`/`TradeTime`, it is `null` (unknown) — NEVER `Date.now()`.
+      timestampMs: exchangeEpochMs(fr.tradetimems ?? fr.tradetime),
     };
   });
-  const createdAtMs = Number(r.receivetime ?? r.receivetimeticks ?? 0) || Date.now();
-  const updatedAtMs = Number(r.lastupdatedtime ?? r.lastupdatedtimeticks ?? createdAtMs) || createdAtMs;
+  // F-3: order create/update times are exchange receipt/update times. Represent
+  // "no authoritative time" as `null`, never a fabricated local `Date.now()`;
+  // the update time may fall back to the (already exchange-derived) create time.
+  const createdAtMs =
+    r.receivetime != null || r.receivetimeticks != null
+      ? exchangeEpochMs(r.receivetime ?? r.receivetimeticks)
+      : null;
+  const updatedAtMs =
+    r.lastupdatedtime != null || r.lastupdatedtimeticks != null
+      ? exchangeEpochMs(r.lastupdatedtime ?? r.lastupdatedtimeticks)
+      : createdAtMs;
   return {
     clientOrderId,
     exchangeOrderId: r.orderid != null ? String(r.orderid) : null,
@@ -272,7 +337,10 @@ export function mapOrder(raw: Record<string, unknown>, opts: MapOrderOptions = {
     price: price.isZero() ? null : price,
     fills,
     fee: scaledStrToMoney(r.fee ?? 0, 8),
-    feeCurrency: 'quote',
+    // Order-level NDAX fee currency is NOT determinable from GetOrderStatus
+    // fields; we surface the raw amount and leave the currency 'unknown' so the
+    // manual/execution layers FAIL CLOSED rather than assume quote.
+    feeCurrency: 'unknown',
     reason: String(r.rejectreason ?? r.cancelreason ?? ''),
     createdAtMs,
     updatedAtMs,
@@ -291,6 +359,24 @@ export function ymdhms(ms: number): string {
     `${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ` +
     `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`
   );
+}
+
+/** Map an NDAX GetProducts row to a canonical AssetProduct. */
+export function mapProduct(raw: Record<string, unknown>): AssetProduct {
+  const r = lowerKeys(raw);
+  const productTypeNum = Number(r.producttype ?? 0);
+  const type: AssetProductType =
+    productTypeNum === 1 ? 'nationalCurrency' : productTypeNum === 2 ? 'cryptoCurrency' : productTypeNum === 3 ? 'contract' : 'unknown';
+  const tick = r.tickSize != null ? String(r.platformtick ?? r.ticksize ?? r.tickSize) : null;
+  return {
+    productId: String(r.productid ?? r.product ?? ''),
+    symbol: String(r.product ?? ''),
+    name: String(r.productfullname ?? r.product ?? ''),
+    type,
+    decimalPlaces: typeof r.decimalplaces === 'number' ? r.decimalplaces : Number(r.decimalplaces ?? 0),
+    tickSize: tick || null,
+    noFees: r.nofees === true || r.nofees === 1,
+  };
 }
 
 /** Convert a canonical Timeframe to NDAX interval seconds. */

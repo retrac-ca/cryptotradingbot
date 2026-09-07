@@ -41,8 +41,9 @@
  *     UNKNOWN/Api-vs-local mismatch rather than a guess.
  */
 
+import { randomUUID } from 'node:crypto';
 import { Money } from '../money/Money.js';
-import type { NewOrder, Order, OrderStatus } from '../order.js';
+import type { NewOrder, Order, OrderStatus, OrderType } from '../order.js';
 import type { ExchangeAdapter } from '../exchanges/ExchangeAdapter.js';
 import {
   NetworkError,
@@ -56,6 +57,8 @@ import { ReconcileService } from '../reconcile/ReconcileService.js';
 import { RiskManager } from '../risk/RiskManager.js';
 import type { RiskApproval, RiskRejection } from '../risk/Reason.js';
 import type { RiskContext } from '../risk/RiskContext.js';
+import { classifyReattachment } from './recovery.js';
+import type { ReattachmentPolicy } from './recovery.js';
 
 export interface LiveGate {
   tradingMode: 'live';
@@ -69,12 +72,26 @@ export interface LiveExecutionConfig {
   killSwitch: boolean;
   /** Max ms to wait for exchange to acknowledge an order. Default 15s. */
   ackTimeoutMs?: number;
-  /** When a read/ack fails and we cannot determine the outcome. */
+  /**
+   * True ONLY when the exchange contract provably guarantees the client order id
+   * is a UNIQUE logical-order identifier (safe for client-order-id
+   * re-attachment). NDAX documents `ClientOrderId` as a long integer "(may not
+   * be unique)", so it is FALSE for NDAX; leaving recovery fail-closed there.
+   * Exchange-agnostic: a future exchange declaring uniqueness may set it.
+   */
+  reattachmentClientOrderIdIsUnique?: boolean;
 }
 
 export interface LiveOrderIntent {
   /** Human reason this order is being placed, for auditability. */
   reason: string;
+  /**
+   * The order type to submit. The live path only safely supports `'market'`
+   * (no limit price flows from the risk approval), so any other type is
+   * REJECTED rather than silently converted. Defaults to `'market'` for
+   * backward compatibility with existing callers.
+   */
+  type?: OrderType;
 }
 
 export interface LiveOrderResult {
@@ -82,6 +99,14 @@ export interface LiveOrderResult {
   /** True if the placement outcome is unknown and reconciliation is required. */
   unknownOutcome: boolean;
   /** Human-readable status message for CLI/logging (redacted). */
+  message: string;
+}
+
+/** Outcome of attempting to resolve an ambiguous/stale order against the exchange. */
+export interface RecoveryResult {
+  order: Order;
+  outcome: 'REFRESHED' | 'UNIQUE_ATTACHED' | 'UNRESOLVED';
+  /** Human-readable outcome, for logging/operator. */
   message: string;
 }
 
@@ -99,7 +124,6 @@ export class LiveOrderEngine {
   private readonly reconcileService: ReconcileService;
   private readonly riskManager: RiskManager;
   private readonly cfg: Required<LiveExecutionConfig>;
-  private readonly seq = { n: 0 };
 
   constructor(
     adapter: ExchangeAdapter,
@@ -114,6 +138,7 @@ export class LiveOrderEngine {
     this.riskManager = riskManager;
     this.cfg = {
       ackTimeoutMs: cfg.ackTimeoutMs ?? 15_000,
+      reattachmentClientOrderIdIsUnique: cfg.reattachmentClientOrderIdIsUnique ?? false,
       ...cfg,
     };
     this.assertGate();
@@ -164,7 +189,7 @@ export class LiveOrderEngine {
     if (!decision.approved) {
       return this.riskRejected(ctx.symbol, decision, intent.reason);
     }
-    const order = this.orderFromApproval(ctx.symbol, decision, intent.reason);
+    const order = this.orderFromApproval(ctx.symbol, decision, intent);
     return this.submit(order);
   }
 
@@ -186,7 +211,7 @@ export class LiveOrderEngine {
       price: null,
       fills: [],
       fee: Money.zero(),
-      feeCurrency: 'quote',
+      feeCurrency: 'unknown',
       reason: `${reason} [risk rejected: ${decision.reason}${decision.detail ? `: ${decision.detail}` : ''}]`,
       createdAtMs: now,
       updatedAtMs: now,
@@ -202,15 +227,25 @@ export class LiveOrderEngine {
   private orderFromApproval(
     symbol: string,
     approval: RiskApproval,
-    reason: string,
+    intent: LiveOrderIntent,
   ): NewOrder {
+    // The order type is explicit on the intent. The live path only safely
+    // supports 'market' (there is no limit price flowing from the risk approval),
+    // so an unsupported type is REJECTED rather than silently converted to a
+    // market order.
+    const type = intent.type ?? 'market';
+    if (type !== 'market') {
+      throw new LiveGateError(
+        `unsupported live order type "${type}"; only "market" is supported — refusing to silently convert an order type`,
+      );
+    }
     return {
       clientOrderId: this.nextClientOrderId(symbol),
       symbol,
       side: approval.side,
-      type: 'market',
+      type,
       quantity: approval.quantity,
-      reason,
+      reason: intent.reason,
     };
   }
 
@@ -255,10 +290,22 @@ export class LiveOrderEngine {
     }
   }
 
-  /** Monotonic, per-process unique local idempotency key for a live order. */
+  /**
+   * Durable, collision-resistant local order identity (Gate 7.1).
+   *
+   * The previous `live-<symbol>-<Date.now()>-<seq>` id was only unique within a
+   * single process and could be regenerated differently across a restart, which
+   * breaks exactly-once intent (a crash could lose the link between an attempt
+   * and a retried logical intent). This uses `crypto.randomUUID()` so uniqueness
+   * does not depend on wall-clock time or an in-memory sequence and holds across
+   * process restarts / concurrent logical orders. It is generated BEFORE
+   * submission and persisted as the `OrderStore` key, and it is never regenerated
+   * when an order is reloaded or refreshed (`refreshOrder` only mutates status /
+   * exchangeOrderId), so an order keeps one identity for its whole life,
+   * including through `UNKNOWN`.
+   */
   private nextClientOrderId(symbol: string): string {
-    this.seq.n += 1;
-    return `live-${symbol.replace('/', '')}-${Date.now()}-${this.seq.n}`;
+    return `live-${symbol.replace('/', '')}-${randomUUID()}`;
   }
 
   /** Poll the exchange for the authoritative state of an order (reconciliation). */
@@ -275,6 +322,106 @@ export class LiveOrderEngine {
   /** Convenience: full reconcile-and-store based on a single order. */
   async reconcile(): Promise<ReturnType<ReconcileService['reconcile']>> {
     return this.reconcileService.reconcile();
+  }
+
+  /**
+   * Resolve an ambiguous (`UNKNOWN`) or stale order against the exchange
+   * (Gate 7.3). READ-ONLY: it only calls account read methods and the local
+   * OrderStore; it NEVER submits, cancels, retries, releases a reservation, or
+   * applies a fill.
+   *
+   * - If the local order already has an `exchangeOrderId`, it refreshes the
+   *   authoritative state (existing path).
+   * - If the order has NO `exchangeOrderId` (a lost/ambiguous submission), it
+   *   gathers the exchange's open orders + history and classifies the result
+   *   using ONLY provable identities (`classifyReattachment`). A UNIQUE
+   *   provable match reattaches the exchange order id AND adopts the
+   *   authoritative status/fills; the durable local `clientOrderId` is preserved.
+   * - ZERO / MULTIPLE / MALFORMED / read-failure all leave the order as-is
+   *   (`UNRESOLVED`) so it REMAINS UNKNOWN: a zero match is NOT proof the order
+   *   was rejected, and we NEVER heuristically pick the "closest" order.
+   *
+   * Fills adopted here are trusted ONLY when they carry a trustworthy
+   * `executionId` (Gate 7.2); without one, Gate 7.2 blocks automatic accounting.
+   */
+  async recoverOrder(order: Order): Promise<RecoveryResult> {
+    if (order.exchangeOrderId) {
+      const live = await this.adapter.getOrderStatus(order.symbol, order.clientOrderId, order.exchangeOrderId);
+      this.store.save(live);
+      return { order: live, outcome: 'REFRESHED', message: 'order refreshed by exchange order id' };
+    }
+
+    let candidates: Order[];
+    try {
+      candidates = await this.gatherCandidates(order.symbol);
+    } catch (err) {
+      return {
+        order,
+        outcome: 'UNRESOLVED',
+        message: `recovery reads failed (${err instanceof Error ? err.name : 'unknown'}); order remains UNKNOWN`,
+      };
+    }
+    const res = classifyReattachment(order, candidates, this.reattachmentPolicy());
+    if (res.outcome === 'UNIQUE_MATCH' && res.order) {
+      // Same exchange order must never attach to TWO local logical orders: if a
+      // DIFFERENT local order already owns this exchange order id, fail closed.
+      const alreadyOwned = [...this.store.allOrders().values()].find(
+        (o) => o.exchangeOrderId === res.order!.exchangeOrderId && o.clientOrderId !== order.clientOrderId,
+      );
+      if (alreadyOwned) {
+        return {
+          order,
+          outcome: 'UNRESOLVED',
+          message: `exchange order ${res.order.exchangeOrderId} is already attached to local order ` +
+            `${alreadyOwned.clientOrderId}; refusing to reattach (fail closed)`,
+        };
+      }
+      // Merge authoritative exchange state, PRESERVING the durable local order id.
+      const attached: Order = {
+        ...res.order,
+        clientOrderId: order.clientOrderId,
+        reason: order.reason,
+        createdAtMs: order.createdAtMs,
+      };
+      this.store.save(attached);
+      return {
+        order: attached,
+        outcome: 'UNIQUE_ATTACHED',
+        message: `reattached to exchange order ${res.order.exchangeOrderId}`,
+      };
+    }
+    return {
+      order,
+      outcome: 'UNRESOLVED',
+      message: `recovery unresolved (${res.outcome}); order remains UNKNOWN; no automatic retry`,
+    };
+  }
+
+  private reattachmentPolicy(): ReattachmentPolicy {
+    return { clientOrderIdIsUnique: this.cfg.reattachmentClientOrderIdIsUnique };
+  }
+
+  private async gatherCandidates(symbol: string): Promise<Order[]> {
+    const open = await this.adapter.getOpenOrders(symbol);
+    const history = await this.adapter.getOrderHistory(symbol);
+    // An order may appear in BOTH open orders and history; dedupe by a
+    // trustable identity so a single order is never considered a MULTIPLE match.
+    // Unidentifiable orders (no exchange/client id) are kept as-is; they can
+    // never satisfy a provable match and are harmless to classification.
+    const out: Order[] = [];
+    const seen = new Set<string>();
+    for (const o of [...open, ...history]) {
+      if (o.exchangeOrderId) {
+        if (seen.has(o.exchangeOrderId)) continue;
+        seen.add(o.exchangeOrderId);
+      } else if (o.clientOrderId) {
+        const k = `c:${o.clientOrderId}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+      }
+      out.push(o);
+    }
+    return out;
   }
 
   // ---- internals ----
@@ -401,7 +548,7 @@ export class LiveOrderEngine {
       price: order.price ?? null,
       fills: [],
       fee: Money.zero(),
-      feeCurrency: 'quote',
+      feeCurrency: 'unknown',
       reason: order.reason,
       createdAtMs: now,
       updatedAtMs: now,

@@ -19,7 +19,12 @@ export function buildRiskConfig(cfg: BotConfig): RiskConfig {
     maxDailyLossFraction: cfg.maxDailyLossFraction,
     maxDrawdownFraction: cfg.maxDrawdownFraction,
     cooldownAfterLossMs: cfg.cooldownAfterLossSeconds * 1000,
+    maxOpenPositions: cfg.maxOpenPositions ?? 1,
     marketDataMaxAgeMs: cfg.marketDataMaxAgeMs,
+    // Conservative fallbacks so callers passing partial config (e.g. tests that
+    // cast a partial BotConfig) still fail closed rather than blowing up.
+    marketDataTransportMaxAgeMs: cfg.marketDataTransportMaxAgeMs ?? 60000,
+    maxClockSkewMs: cfg.maxClockSkewMs ?? 120000,
   };
 }
 

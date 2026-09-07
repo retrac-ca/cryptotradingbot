@@ -5,8 +5,9 @@ import { OrderStore } from '../../../src/persistence/OrderStore.js';
 import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import { FakeExchange } from '../../fakes/FakeExchange.js';
 import type { Order } from '../../../src/order.js';
+import { statePath } from '../../helpers/state.js';
 
-const LEDGER = '/tmp/opencode/reconcile-service-ledger.json';
+const LEDGER = statePath('reconservice', 'ledger.json');
 
 function order(clientOrderId: string, exchangeOrderId: string | null, status: Order['status']): Order {
   return {

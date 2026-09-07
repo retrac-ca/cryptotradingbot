@@ -24,7 +24,7 @@ export const tradesCommand: CommandHandler = (args): number => {
 
   const showOpen = args.includes('--open');
   const store = new OrderStore(cfg.orderLedgerFile);
-  const orders = [...store.allOrders().values()].sort((a, b) => a.createdAtMs - b.createdAtMs);
+  const orders = [...store.allOrders().values()].sort((a, b) => (a.createdAtMs ?? 0) - (b.createdAtMs ?? 0));
 
   if (orders.length === 0) {
     // eslint-disable-next-line no-console

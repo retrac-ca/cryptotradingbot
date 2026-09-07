@@ -43,10 +43,14 @@ import {
   mapLevel1ToTicker,
   mapOrder,
   mapPositionToBalance,
+  mapProduct,
   mapTickerHistoryRow,
   timeframeToInterval,
   ymdhms,
 } from './mappings.js';
+import { mapAccountTrades } from './tradeMappings.js';
+import { resolveFeeProduct, type FeeAssetResolution } from './feeResolver.js';
+import type { AccountTrade, AssetProduct } from '../../types.js';
 import {
   mapCancelOrderResponse,
   mapSendOrderResponse,
@@ -128,6 +132,7 @@ export class NdaxAdapter implements ExchangeAdapter {
   private readonly enableOrderPlacement: boolean;
   private readonly marketOverrides: Record<string, string>;
   private marketsCache: Map<string, MarketInfo> | null = null;
+  private productsCache: AssetProduct[] | null = null;
   private lastNonceMs = 0;
 
   constructor(opts: NdaxAdapterOptions) {
@@ -177,7 +182,7 @@ export class NdaxAdapter implements ExchangeAdapter {
       Depth: depth ?? 100,
     });
     if (!Array.isArray(data)) throw new Error(`NDAX GetL2Snapshot returned unexpected shape for ${symbol}`);
-    return mapL2ToOrderBook(symbol, Date.now(), data as unknown[][]);
+    return mapL2ToOrderBook(symbol, data as unknown[][]);
   }
 
   async getTrades(_symbol: string, _limit?: number): Promise<Trade[]> {
@@ -269,6 +274,46 @@ export class NdaxAdapter implements ExchangeAdapter {
     return mapOrder(data[0] as Record<string, unknown>, { resolveSymbol });
   }
 
+  /**
+   * Read the account's authoritative trade/fill records (NDAX `GetAccountTrades`).
+   *
+   * READ-ONLY. This exposes execution/trade ids and `feeProductId` so the manual
+   * and live paths can reason about exactly-once execution accounting and fee
+   * currency WITHOUT fabricating an identity or assuming a currency. Gated by
+   * the same `enableAuthenticatedReads` auth as every other account read; it is
+   * NEVER an order-placement call and NEVER mutates account state.
+   *
+   * BEST-EFFORT pagination: it pages `StartIndex` by `Count` (max 200 per page)
+   * until a short page, capped at `maxPages` (10_000 executions).
+   *
+   * NOTE (correctness): `GetAccountTrades` has NO `orderId`/time-range filter and
+   * the ordering/retention of results is NOT documented. Paging assumes a STABLE,
+   * contiguous ordering; if new executions arrive between pages (shifting the
+   * result window) the offsets can overlap/drift and a given order's FULL set of
+   * executions is NOT guaranteed to be enumerated. Callers must therefore treat
+   * the result as an observation, not a guaranteed-complete per-order set, unless
+   * this is verified against the live API for their account.
+   */
+  async getAccountTrades(symbol?: string, opts: { maxPages?: number } = {}): Promise<AccountTrade[]> {
+    const auth = await this.requireAuth();
+    const maxPages = opts.maxPages ?? 50;
+    const pageSize = 200;
+    const resolveSymbol = await this.orderSymbolResolver();
+    const all: AccountTrade[] = [];
+    for (let start = 0; start < maxPages * pageSize; start += pageSize) {
+      const data = await this.client.get('GetAccountTrades', {
+        OMSId: 1,
+        AccountId: auth.accountId,
+        StartIndex: start,
+        Count: pageSize,
+      }, { requiresAuth: true });
+      if (!Array.isArray(data) || data.length === 0) break;
+      all.push(...mapAccountTrades(data, { resolveSymbol }));
+      if (data.length < pageSize) break; // short page => reached the end of available records
+    }
+    return symbol ? all.filter((t) => t.symbol === symbol) : all;
+  }
+
   // ---- market metadata ----
 
   async getMarkets(): Promise<MarketInfo[]> {
@@ -311,6 +356,44 @@ export class NdaxAdapter implements ExchangeAdapter {
     const m = markets.find((x) => x.symbol === symbol);
     if (!m) throw new ResourceNotFoundError(`NDAX market ${symbol} not found`);
     return m;
+  }
+
+  /**
+   * Fetch the authoritative asset/product catalog (NDAX `GetProducts`). READ-ONLY.
+   * Supplies the vocabulary to resolve `feeProductId` → asset symbol.
+   */
+  async getProducts(): Promise<AssetProduct[]> {
+    if (this.productsCache) return [...this.productsCache];
+    const data = await this.client.get('GetProducts', { omsId: 1 }, { requiresAuth: false });
+    if (!Array.isArray(data)) return [];
+    const products: AssetProduct[] = [];
+    for (const row of data as Record<string, unknown>[]) {
+      try {
+        const p = mapProduct(row);
+        if (p.productId !== '') products.push(p);
+      } catch {
+        // skip unresolvable products
+      }
+    }
+    this.productsCache = products;
+    return products;
+  }
+
+  /**
+   * Resolve a raw `feeProductId` to an authoritative fee currency, using the
+   * instrument's explicit base/quote product ids (NDAX `product1`/`product2`)
+   * and the product catalog (`GetProducts`). READ-ONLY. NEVER assumes base/quote;
+   * a third-asset or unknown fee yields currency 'unknown' (fail closed).
+   */
+  async resolveFeeCurrency(feeProductId: string | null | undefined, symbol: string): Promise<FeeAssetResolution> {
+    const market = await this.getMarketInfo(symbol);
+    let products: AssetProduct[] | null = null;
+    try {
+      products = await this.getProducts();
+    } catch {
+      products = null;
+    }
+    return resolveFeeProduct(feeProductId, { market, products });
   }
 
   // ---- order placement (implemented, disabled unless enableOrderPlacement) ----

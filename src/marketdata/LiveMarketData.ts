@@ -188,12 +188,18 @@ export class LiveMarketData implements MarketDataProvider {
     try {
       if (kind === 'ticker') {
         const ticker = await this.adapter.getTicker(symbol);
-        this.upsert(key, { data: ticker, candles: null, updatedMs: Date.now(), error: null, consecutiveFailures: 0 });
-        this.events.emit('ticker', ticker);
+        // Stamp the local observation time on the stored snapshot so the risk
+        // layer can measure TRANSPORT freshness (now - observedAtMs), distinct
+        // from the exchange-reported quote time (ticker.timestampMs). We store
+        // a copy so the provider never mutates the adapter's object.
+        const stamped: Ticker = { ...ticker, observedAtMs: Date.now() };
+        this.upsert(key, { data: stamped, candles: null, updatedMs: Date.now(), error: null, consecutiveFailures: 0 });
+        this.events.emit('ticker', stamped);
       } else if (kind === 'orderBook') {
         const book = await this.adapter.getOrderBook(symbol);
-        this.upsert(key, { data: book, candles: null, updatedMs: Date.now(), error: null, consecutiveFailures: 0 });
-        this.events.emit('orderBook', book);
+        const stamped: OrderBook = { ...book, observedAtMs: Date.now() };
+        this.upsert(key, { data: stamped, candles: null, updatedMs: Date.now(), error: null, consecutiveFailures: 0 });
+        this.events.emit('orderBook', stamped);
       } else {
         const candles = await this.adapter.getCandles(symbol, timeframe!);
         this.upsert(key, { data: null, candles, updatedMs: Date.now(), error: null, consecutiveFailures: 0 });

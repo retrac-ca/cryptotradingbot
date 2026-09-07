@@ -11,6 +11,7 @@
  */
 
 import { z } from 'zod';
+import { resolve as pathResolve, sep as pathSep } from 'node:path';
 import type { Timeframe } from '../types.js';
 
 const SYMBOL_RE = /^[A-Za-z0-9]{2,12}\/[A-Za-z0-9]{2,12}$/;
@@ -69,6 +70,26 @@ export const botConfigSchema = z.object({
       z.array(z.string().regex(SYMBOL_RE, 'must be BASE/QUOTE, e.g. BTC/CAD')).min(1),
     ),
 
+  // --- Curated multi-asset universe ---
+  // The bot's approved UNIVERSE. The bot only ever evaluates markets in this
+  // approval whitelist (it never auto-trades every market an exchange lists).
+  // Each is further filtered through eligibility (quote currency, valid ticks,
+  // min order, fees, market orders) at runtime. Comma-separated canonical
+  // symbols. This is the effective symbol set the coordinator/polling use; if
+  // unset it falls back to `tradingPairs`.
+  universeMarkets: z
+    .string()
+    .default('BTC/CAD,ETH/CAD,SOL/CAD,XRP/CAD,ADA/CAD')
+    .transform((s) =>
+      s
+        .split(',')
+        .map((p) => p.trim().toUpperCase())
+        .filter(Boolean),
+    )
+    .pipe(
+      z.array(z.string().regex(SYMBOL_RE, 'must be BASE/QUOTE, e.g. BTC/CAD')).min(1),
+    ),
+
   // --- Strategy ---
   strategy: z.string().default('moving-average-crossover'),
   timeframe: timeframeSchema.default('5m'),
@@ -78,6 +99,10 @@ export const botConfigSchema = z.object({
   // --- Risk (conservative defaults) ---
   maxPositionSizeFraction: fractionZeroToOne.default(0.1),
   maxTradeAmount: z.coerce.number().min(0).default(0),
+  // NOTE: stopLossFraction / takeProfitFraction are parsed for configurability
+  // but are NOT yet enforced by the engine (see docs/DECISIONS.md Gate 5). They
+  // are surfaced only to make it explicit they are inactive, so we never imply a
+  // protection that does not exist.
   stopLossFraction: fractionZeroToOne.default(0.05),
   takeProfitFraction: fractionZeroToOne.default(0.1),
   maxDailyLossFraction: fractionZeroToOne.default(0.05),
@@ -87,6 +112,10 @@ export const botConfigSchema = z.object({
   maxPortfolioExposureFraction: fractionZeroToOne.default(0.5),
   maxDrawdownFraction: fractionZeroToOne.default(0.1),
   marketDataMaxAgeMs: z.coerce.number().int().positive().default(60000),
+  // Gate 4 (hybrid freshness): separate TRANSPORT (fetch) age limit and a
+  // bounded clock-skew guard for forward-dated exchange quote timestamps.
+  marketDataTransportMaxAgeMs: z.coerce.number().int().positive().default(60000),
+  maxClockSkewMs: z.coerce.number().int().min(0).default(120000),
   paperStartingBalance: z.coerce.number().positive().default(10000),
 
   // --- Paper execution / engine (Phase 8) ---
@@ -94,12 +123,27 @@ export const botConfigSchema = z.object({
   paperFeeFraction: fractionZeroToOne.default(0.0005),
   paperSlippageFraction: z.coerce.number().min(0).default(0.0005),
   paperFillFraction: fractionZeroToOne.default(1),
+  // The single state directory under which ALL durable state lives (paper, live
+  // managed, order ledger, manual intents, the mutation lock, and the init
+  // marker). All state domains must resolve under it (validated below).
+  stateDir: z.string().default('.state/'),
   // Where the persisted paper state (portfolio, executed orders) is kept so a
   // restart does not reset the account.
-  paperStateFile: z.string().default('.paper-state.json'),
+  paperStateFile: z.string().default('.state/paper-state.json'),
+  // Where the persisted LIVE managed state is kept. This is the bot's authorized
+  // inventory on the REAL exchange. It MUST be a DIFFERENT file from
+  // `paperStateFile` (validated below): paper-managed positions must never be
+  // able to masquerade as live-managed positions, and vice versa.
+  liveManagedStateFile: z.string().default('.state/live-managed-state.json'),
   // Where the durable order ledger (every order the bot attempts, keyed by
   // clientOrderId) is kept for duplicate-order prevention and reconciliation.
-  orderLedgerFile: z.string().default('.order-ledger.json'),
+  orderLedgerFile: z.string().default('.state/order-ledger.json'),
+  // Where the manual-execution intents are kept (Gate 9). These are RETRAC's
+  // RECOMMENDATIONS for an operator to execute externally — deliberately SEPARATE
+  // from `orderLedgerFile` (RETRAC-submitted orders) so a manual execution can
+  // never be confused with a submitted live order, and separate from the managed
+  // portfolio state file (which holds accounting, not intent).
+  manualIntentFile: z.string().default('.state/manual-intents.json'),
   // How often the engine re-evaluates candles/signals (ms); also the market-data
   // candle poll cadence. Kept small in tests via override.
   evaluateIntervalSeconds: z.coerce.number().int().positive().default(60),
@@ -135,9 +179,48 @@ export function validateConfig(cfg: BotConfig): void {
         'to confirm you understand the risks, or use TRADING_MODE=paper.',
     );
   }
+
+  // F-1 safety: paper and live managed state must be physically separate. If a
+  // single path were used, paper positions could be (mis)interpreted as the bot's
+  // live-managed inventory — a fundamental ownership violation. Refuse to run.
+  if (cfg.liveManagedStateFile === cfg.paperStateFile) {
+    throw new Error(
+      'Invalid config: LIVE_MANAGED_STATE_FILE and PAPER_STATE_FILE must be different paths. ' +
+        'Paper managed state and live managed state are separate and must never share a file.',
+    );
+  }
+
+  // Persistence: all four state domains must resolve under the single stateDir,
+  // so the mutation lock and init marker are shared and no domain can be placed
+  // in an unrelated directory. Only enforced when stateDir is present (the
+  // schema always sets it for env-loaded configs; partial config objects that
+  // omit it are treated as legacy/overrides).
+  if (cfg.stateDir) {
+    const dir = resolvePath(cfg.stateDir);
+    for (const [name, p] of [
+      ['PAPER_STATE_FILE', cfg.paperStateFile],
+      ['LIVE_MANAGED_STATE_FILE', cfg.liveManagedStateFile],
+      ['ORDER_LEDGER_FILE', cfg.orderLedgerFile],
+      ['MANUAL_INTENT_FILE', cfg.manualIntentFile],
+    ] as const) {
+      if (p) {
+        const resolved = resolvePath(p);
+        if (resolved !== dir && !resolved.startsWith(dir + pathSep)) {
+          throw new Error(
+            `Invalid config: ${name} (${p}) must be under STATE_DIR (${cfg.stateDir}). ` +
+              'All state domains must live in the same state directory.',
+          );
+        }
+      }
+    }
+  }
 }
 
 /** Validate the configured timeframe is one we support (compile-time safety helper). */
 export function isKnownTimeframe(tf: string): tf is Timeframe {
   return (['1m', '5m', '15m', '30m', '1h', '4h', '1d'] as string[]).includes(tf);
+}
+
+function resolvePath(p: string): string {
+  return pathResolve(p);
 }

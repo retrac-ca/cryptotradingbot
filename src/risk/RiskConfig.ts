@@ -25,6 +25,20 @@ export interface RiskConfig {
   maxDrawdownFraction: number;
   /** Cooldown (ms) after a losing trade before new trades are allowed. Zero = off. */
   cooldownAfterLossMs: number;
+  /** Maximum number of OPEN (bot-managed) positions. 0 = no limit. */
+  maxOpenPositions: number;
   /** Maximum acceptable age of market data before a decision fails closed. */
   marketDataMaxAgeMs: number;
+  /**
+   * Maximum acceptable age of the local *observation* (transport/fetch) of the
+   * snapshot before a decision fails closed. A fresh quote can still be held by
+   * a late transport; both the quote age and this must pass.
+   */
+  marketDataTransportMaxAgeMs: number;
+  /**
+   * Max acceptable skew for a quote timestamp that is AHEAD of the local clock
+   * before it is rejected as unreliable (`QUOTE_AHEAD_OF_CLOCK`). This is a
+   * future-dating guard, NOT a widening of `marketDataMaxAgeMs`.
+   */
+  maxClockSkewMs: number;
 }

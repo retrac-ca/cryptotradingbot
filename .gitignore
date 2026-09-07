@@ -35,3 +35,10 @@ data/
 .paper-state.json
 .order-ledger.json
 .backtest-results*.json
+
+# Persisted bot runtime state (never commit; may contain account/config data)
+.state/
+.soak/
+.live-managed-state.json
+.manual-intents.json
+*.legacy

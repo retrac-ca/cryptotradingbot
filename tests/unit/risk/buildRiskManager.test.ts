@@ -27,6 +27,8 @@ const baseConfig = (over: Partial<BotConfig> = {}): BotConfig =>
     maxPortfolioExposureFraction: 0.5,
     maxDrawdownFraction: 0.1,
     marketDataMaxAgeMs: 60000,
+    marketDataTransportMaxAgeMs: 60000,
+    maxClockSkewMs: 120000,
     paperStartingBalance: 10000,
     logLevel: 'info',
     reconcileIntervalSeconds: 60,
@@ -43,6 +45,8 @@ describe('buildRiskConfig / buildRiskManager', () => {
     expect(cfg.maxDrawdownFraction).toBe(0.1);
     expect(cfg.cooldownAfterLossMs).toBe(3600_000);
     expect(cfg.marketDataMaxAgeMs).toBe(60000);
+    expect(cfg.marketDataTransportMaxAgeMs).toBe(60000);
+    expect(cfg.maxClockSkewMs).toBe(120000);
     expect(cfg.maxTradeAmount.toFixed(2)).toBe('0.00');
   });
 

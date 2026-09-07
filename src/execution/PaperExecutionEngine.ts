@@ -39,6 +39,15 @@ export class PaperExecutionEngine {
   private portfolio: Portfolio;
   private readonly openOrders = new Map<string, PaperOrder>();
   private readonly allOrders: PaperOrder[] = [];
+  /**
+   * Durable executed-order identity restored from persisted state on restart.
+   *
+   * On a fresh process the in-session `allOrders` history starts empty, so this
+   * set carries the previously persisted `executedOrderIds` forward. It is the
+   * ONLY source of restored identity; it never fabricates order details (there
+   * are no fills/prices to reconstruct from the persisted ids).
+   */
+  private readonly knownExecutedIds = new Set<string>();
 
   constructor(config: PaperExecutionConfig, portfolio: Portfolio) {
     this.cfg = config;
@@ -55,6 +64,27 @@ export class PaperExecutionEngine {
 
   get orderHistory(): PaperOrder[] {
     return [...this.allOrders];
+  }
+
+  /**
+   * Restore the durable executed-order identity after a restart. The ids come
+   * from the persisted paper state (no historical details are invented); they
+   * are carried forward so a subsequent save cannot silently drop them.
+   */
+  restoreExecutedOrderIds(ids: string[]): void {
+    for (const id of ids) {
+      if (typeof id === 'string' && id.length > 0) this.knownExecutedIds.add(id);
+    }
+  }
+
+  /**
+   * The complete set of executed order ids for persistence: the restored durable
+   * ids UNION the in-session recorded orders. Order is deterministic.
+   */
+  get executedOrderIds(): string[] {
+    const ids = new Set(this.knownExecutedIds);
+    for (const o of this.allOrders) ids.add(o.clientOrderId);
+    return [...ids];
   }
 
   /** Validate basic order integrity; return an error string or null. */
@@ -87,6 +117,28 @@ export class PaperExecutionEngine {
     return exactFraction(notional, this.cfg.feeFraction);
   }
 
+  /**
+   * True when a BUY fill's ACTUAL cost (slippage-adjusted notional + fee) would
+   * consume more than the currently-deployable quote (cash minus reserved).
+   *
+   * C-2 invariant (accounting integrity): paper execution must NEVER spend more
+   * quote than is actually available, so it can never drive paper cash negative
+   * and never spend capital already reserved by another in-flight order. This is
+   * enforced HERE, at the execution boundary, using the real slippage-adjusted
+   * fill price and the real fee — not the reference-price approximation the risk
+   * layer used to pre-approve the order. The risk layer sizes/funds at the
+   * reference price; if positive slippage (or a fee model mismatch) pushes the
+   * true cost past the deployable pool, the paper engine refuses the fill rather
+   * than silently overdrawing or manufacturing quote currency.
+   *
+   * Fail-closed: an absent/missing quote map resolves to zero deployable, so any
+   * positive-cost BUY is refused rather than guessed at.
+   */
+  private costExceedsDeployable(symbol: string, cost: Money): boolean {
+    const quote = symbol.split('/')[1] ?? '';
+    return cost.compareTo(this.portfolio.deployableQuote(quote)) > 0;
+  }
+
   submitMarketOrder(req: PaperOrderRequest, market: PaperMarket, nowMs: number): PaperOrder {
     const posQty = this.portfolio.position(req.symbol)?.quantity ?? Money.zero();
     const integrityError = this.validateOrder(req, posQty);
@@ -97,6 +149,12 @@ export class PaperExecutionEngine {
     const fillPrice = this.slippageAdjusted(market.referencePrice, req.side);
     const fillQty = this.fillValue(req.quantity);
     const fee = this.feeOn(fillQty.mul(fillPrice));
+
+    // C-2: never execute a BUY whose true slippage-adjusted cost exceeds the
+    // deployable quote (cash minus reserved). Refuse rather than overdraw.
+    if (req.side === 'BUY' && this.costExceedsDeployable(req.symbol, fillQty.mul(fillPrice).add(fee))) {
+      return this.rejectOrder(req, nowMs, 'BUY cost exceeds available quote (would overdraw cash)');
+    }
 
     const order = this.recordOrder(
       req,
@@ -129,6 +187,12 @@ export class PaperExecutionEngine {
     const fillPrice = this.slippageAdjusted(market.referencePrice, req.side);
     const fillQty = this.fillValue(req.quantity);
     const fee = this.feeOn(fillQty.mul(fillPrice));
+
+    // C-2: never execute a BUY whose true slippage-adjusted cost exceeds the
+    // deployable quote (cash minus reserved). Refuse rather than overdraw.
+    if (req.side === 'BUY' && marketable && this.costExceedsDeployable(req.symbol, fillQty.mul(fillPrice).add(fee))) {
+      return this.rejectOrder(req, nowMs, 'BUY cost exceeds available quote (would overdraw cash)');
+    }
 
     if (marketable) {
       const order = this.recordOrder(

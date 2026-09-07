@@ -1,35 +1,40 @@
 import { describe, expect, it } from 'vitest';
-import { rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Money } from '../../../src/money/Money.js';
 import { Portfolio } from '../../../src/portfolio/Portfolio.js';
+import { PORTFOLIO_STATE_VERSION } from '../../../src/portfolio/serialization.js';
 import { PaperStateStore } from '../../../src/persistence/PaperStateStore.js';
 
-const STATE_FILE = '/tmp/opencode/paper-state-test.json';
+function freshFile(): string {
+  return join(mkdtempSync(join(tmpdir(), 'retrac-paper-')), 'state.json');
+}
 
 describe('PaperStateStore — minimal restart-safe persistence', () => {
-  it('returns null when no state file exists yet', () => {
-    rmSync(STATE_FILE, { force: true });
-    const store = new PaperStateStore(STATE_FILE);
-    expect(store.load()).toBeNull();
+  it('reports MISSING when no state file exists yet', () => {
+    const store = new PaperStateStore(freshFile());
+    expect(store.load().status).toBe('MISSING');
     expect(store.toPortfolio(null)).toBeNull();
   });
 
   it('persists and round-trips cash, positions, P&L, and executed order ids', () => {
-    rmSync(STATE_FILE, { force: true });
     const cash = new Map<string, Money>();
     cash.set('CAD', Money.fromString('5000'));
     let portfolio = Portfolio.empty(cash);
     portfolio = portfolio.applyFill('BTC/CAD', 'BUY', Money.fromString('0.1'), Money.fromString('40000'), Money.fromString('20'));
 
-    const store = new PaperStateStore(STATE_FILE);
+    const store = new PaperStateStore(freshFile());
     store.save(portfolio.stateModel, ['a', 'b', 'c']);
 
-    const file = store.load()!;
-    expect(file.version).toBe(1);
+    const r = store.load();
+    expect(r.status).toBe('OK');
+    if (r.status !== 'OK') return;
+    const file = r.data;
+    expect(file.version).toBe(PORTFOLIO_STATE_VERSION);
     expect(file.cash['CAD']).toBe('980.00000000');
     expect(file.positions['BTC/CAD'].quantity).toBe('0.10000000');
     expect(file.executedOrderIds).toEqual(['a', 'b', 'c']);
-    expect(file.savedAtMs).toBeGreaterThan(0);
 
     const model = store.toPortfolio(file)!;
     expect(model.positions.get('BTC/CAD')!.quantity.toFixed(8)).toBe('0.10000000');
@@ -38,7 +43,6 @@ describe('PaperStateStore — minimal restart-safe persistence', () => {
   });
 
   it('restoring a saved portfolio yields identical equity', () => {
-    rmSync(STATE_FILE, { force: true });
     const cash = new Map<string, Money>();
     cash.set('CAD', Money.fromString('100000'));
     const original = Portfolio.empty(cash).applyFill(
@@ -48,21 +52,23 @@ describe('PaperStateStore — minimal restart-safe persistence', () => {
       Money.fromString('52000'),
       Money.zero(),
     );
-    const store = new PaperStateStore(STATE_FILE);
+    const store = new PaperStateStore(freshFile());
     store.save(original.stateModel, []);
-    const restored = Portfolio.fromModel(store.toPortfolio(store.load())!);
+    const r = store.load();
+    expect(r.status).toBe('OK');
+    if (r.status !== 'OK') return;
+    const restored = Portfolio.fromModel(store.toPortfolio(r.data)!);
     const prices = new Map<string, Money>([['BTC/CAD', Money.fromString('52000')]]);
     expect(restored.markToMarket(prices).equity.toFixed(2)).toBe(
       original.markToMarket(prices).equity.toFixed(2),
     );
   });
 
-  it('toPortfolio returns null on a corrupt/version-mismatched file', () => {
-    const bad = '/tmp/opencode/paper-state-bad.json';
-    rmSync(bad, { force: true });
-    writeFileSync(bad, JSON.stringify({ version: 99, cash: 'garbage' }));
-    const store = new PaperStateStore(bad);
-    expect(store.toPortfolio(store.load())).toBeNull();
-    rmSync(bad, { force: true });
+  it('a corrupt/version-mismatched file is CORRUPT, never MISSING', () => {
+    const p = freshFile();
+    rmSync(p, { force: true });
+    writeFileSync(p, JSON.stringify({ version: 99, cash: 'garbage' }));
+    const store = new PaperStateStore(p);
+    expect(store.load().status).toBe('CORRUPT');
   });
 });

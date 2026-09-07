@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { Money } from '../../../src/money/Money.js';
-import { BacktestRunner } from '../../../src/backtest/BacktestRunner.js';
+import { runBacktest } from '../../../src/backtest/index.js';
 import { buildStrategy } from '../../../src/strategy/index.js';
 import { buildRiskManager } from '../../../src/risk/index.js';
 import type { BotConfig } from '../../../src/config/schema.js';
+import type { BacktestConfig } from '../../../src/backtest/types.js';
 import type { Candle } from '../../../src/types.js';
 
 const cfg = (over: Partial<BotConfig> = {}): BotConfig => ({
@@ -30,12 +31,15 @@ const cfg = (over: Partial<BotConfig> = {}): BotConfig => ({
   maxPortfolioExposureFraction: 1,
   maxDrawdownFraction: 0.5,
   marketDataMaxAgeMs: 60000,
+  marketDataTransportMaxAgeMs: 60000,
+  maxClockSkewMs: 120000,
   paperStartingBalance: 10000,
   paperFeeFraction: 0.0005,
   paperSlippageFraction: 0,
   paperFillFraction: 1,
   paperStateFile: '.paper-state.json',
   orderLedgerFile: '.order-ledger.json',
+  manualIntentFile: '.manual-intents.json',
   evaluateIntervalSeconds: 60,
   logLevel: 'info',
   reconcileIntervalSeconds: 60,
@@ -48,7 +52,7 @@ function candle(i: number, close: number): Candle {
     symbol: 'BTC/CAD',
     timeframe: '1d',
     timestampMs: 1_700_000_000_000 + i * 86_400_000,
-    open: Money.fromNumber(close * 0.99),
+    open: Money.fromNumber(close),
     high: Money.fromNumber(close * 1.02),
     low: Money.fromNumber(close * 0.98),
     close: Money.fromNumber(close),
@@ -57,34 +61,44 @@ function candle(i: number, close: number): Candle {
 }
 
 function risingSeries(n: number): Candle[] {
-  const out: Candle[] = [];
-  for (let i = 0; i < n; i++) out.push(candle(i, 100 + i));
-  return out;
+  return Array.from({ length: n }, (_, i) => candle(i, 100 + i));
 }
 
 function fallingSeries(n: number): Candle[] {
-  const out: Candle[] = [];
-  for (let i = 0; i < n; i++) out.push(candle(i, 200 - i));
-  return out;
+  return Array.from({ length: n }, (_, i) => candle(i, 200 - i));
 }
 
-describe('BacktestRunner — historical simulation with required metrics', () => {
-  it('reports the required metrics and a non-negative equity path', () => {
-    const strategy = buildStrategy(cfg());
-    const risk = buildRiskManager(cfg());
-    const runner = new BacktestRunner(strategy, risk);
-    const candles = risingSeries(40);
-    const result = runner.run(candles, {
-      symbol: 'BTC/CAD',
-      timeframe: '1d',
-      initialCash: Money.fromNumber(10000),
-      quoteCurrency: 'CAD',
-      feeFraction: 0.002,
-      slippageFraction: 0,
-    });
+function btConfig(over: Partial<BacktestConfig> = {}): BacktestConfig {
+  return {
+    symbol: 'BTC/CAD',
+    timeframe: '1d',
+    initialCash: Money.fromNumber(10000),
+    quoteCurrency: 'CAD',
+    feeModel: { kind: 'rate', currency: 'quote', rate: 0.002 },
+    slippageFraction: 0,
+    marketConstraints: {
+      priceTick: Money.fromString('0.01'),
+      quantityTick: Money.fromString('0.00000001'),
+      minOrderBase: null,
+    },
+    ...over,
+  };
+}
 
+function run(candles: Candle[], over?: Partial<BacktestConfig>) {
+  return runBacktest({
+    candles,
+    config: btConfig(over),
+    createStrategy: () => buildStrategy(cfg()),
+    createRiskManager: () => buildRiskManager(cfg()),
+  });
+}
+
+describe('Backtest runner — historical simulation with required metrics', () => {
+  it('reports the required metrics and a non-negative equity path', () => {
+    const result = run(risingSeries(40));
     const m = result.metrics;
-    expect(m.candles).toBe(40);
+    expect(m.barCount).toBe(40);
     expect(m.startingCapital.toFixed(2)).toBe('10000.00');
     expect(m.endingCapital.isPositive()).toBe(true);
     expect(m.tradeCount).toBeGreaterThanOrEqual(0);
@@ -95,38 +109,22 @@ describe('BacktestRunner — historical simulation with required metrics', () =>
     expect(m.maxDrawdownFraction).toBeGreaterThanOrEqual(0);
     expect(m.largestLoss.toNumber()).toBeLessThanOrEqual(0);
     expect(result.equityCurve.length).toBe(40);
+    expect(result.simulationLabel).toContain('NOT A PREDICTION');
   });
 
   it('produces a clean run over a falling series without going short', () => {
-    const strategy = buildStrategy(cfg());
-    const risk = buildRiskManager(cfg());
-    const runner = new BacktestRunner(strategy, risk);
-    const result = runner.run(fallingSeries(30), {
-      symbol: 'BTC/CAD',
-      timeframe: '1d',
-      initialCash: Money.fromNumber(10000),
-      quoteCurrency: 'CAD',
-      feeFraction: 0.002,
-      slippageFraction: 0,
-    });
-    expect(result.metrics.candles).toBe(30);
+    const result = run(fallingSeries(30));
+    expect(result.metrics.barCount).toBe(30);
     expect(result.finalQuoteCash.isNegative()).toBe(false);
   });
 
-  it('asks the risk manager to approve every trade (rejections recorded when blocked)', () => {
-    // A strict daily-loss cap will produce some rejections when losses occur.
-    const strategy = buildStrategy(cfg());
-    const risk = buildRiskManager(cfg({ maxDailyLossFraction: 1 }));
-    const runner = new BacktestRunner(strategy, risk);
-    const result = runner.run(risingSeries(25), {
-      symbol: 'BTC/CAD',
-      timeframe: '1d',
-      initialCash: Money.fromNumber(10000),
-      quoteCurrency: 'CAD',
-      feeFraction: 0.002,
-      slippageFraction: 0,
+  it('records rejections as an array when risk blocks', () => {
+    const result = runBacktest({
+      candles: risingSeries(25),
+      config: btConfig(),
+      createStrategy: () => buildStrategy(cfg({ maxDailyLossFraction: 1 })),
+      createRiskManager: () => buildRiskManager(cfg({ maxDailyLossFraction: 1 })),
     });
     expect(result.rejections).toBeInstanceOf(Array);
-    expect(result.metrics.tradeCount).toBeGreaterThanOrEqual(result.rejections.length === 0 ? 0 : 0);
   });
 });

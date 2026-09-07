@@ -1,10 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Money } from '../../../src/money/Money.js';
 import { OrderStore } from '../../../src/persistence/OrderStore.js';
 import type { Order } from '../../../src/order.js';
 
-const FILE = '/tmp/opencode/order-store-test.json';
+function freshFile(): string {
+  return join(mkdtempSync(join(tmpdir(), 'retrac-order-')), 'ledger.json');
+}
 
 function sampleOrder(clientOrderId: string, status: Order['status']): Order {
   const now = Date.now();
@@ -29,28 +33,26 @@ function sampleOrder(clientOrderId: string, status: Order['status']): Order {
 }
 
 describe('OrderStore — durable order ledger keyed by clientOrderId', () => {
-  it('returns null when no ledger exists yet', () => {
-    rmSync(FILE, { force: true });
-    const store = new OrderStore(FILE);
-    expect(store.load()).toBeNull();
+  it('reports MISSING when no ledger exists yet', () => {
+    const store = new OrderStore(freshFile());
+    expect(store.load().status).toBe('MISSING');
     expect(store.allOrders().size).toBe(0);
   });
 
   it('round-trips orders and is keyed by clientOrderId', () => {
-    rmSync(FILE, { force: true });
-    const store = new OrderStore(FILE);
+    const path = freshFile();
+    const store = new OrderStore(path);
     store.save(sampleOrder('a', 'CREATED'));
     store.save(sampleOrder('b', 'FILLED'));
 
-    const reloaded = new OrderStore(FILE);
+    const reloaded = new OrderStore(path);
     expect(reloaded.get('a')!.status).toBe('CREATED');
     expect(reloaded.get('b')!.status).toBe('FILLED');
     expect(reloaded.get('missing')).toBeNull();
   });
 
   it('upserts by clientOrderId (no duplicates)', () => {
-    rmSync(FILE, { force: true });
-    const store = new OrderStore(FILE);
+    const store = new OrderStore(freshFile());
     store.save(sampleOrder('a', 'CREATED'));
     store.save(sampleOrder('a', 'FILLED'));
     expect(store.allOrders().size).toBe(1);
@@ -58,8 +60,7 @@ describe('OrderStore — durable order ledger keyed by clientOrderId', () => {
   });
 
   it('lists open local orders as non-terminal states', () => {
-    rmSync(FILE, { force: true });
-    const store = new OrderStore(FILE);
+    const store = new OrderStore(freshFile());
     store.save(sampleOrder('open', 'OPEN'));
     store.save(sampleOrder('partial', 'PARTIALLY_FILLED'));
     store.save(sampleOrder('submitted', 'SUBMITTED'));
@@ -70,13 +71,20 @@ describe('OrderStore — durable order ledger keyed by clientOrderId', () => {
   });
 
   it('recovers after a simulated restart (duplicate-prevention test)', () => {
-    rmSync(FILE, { force: true });
-    const first = new OrderStore(FILE);
+    const path = freshFile();
+    const first = new OrderStore(path);
     first.save(sampleOrder('critical', 'CREATED'));
-    // "crash" — a fresh store instance reading the same file sees the claim.
-    const second = new OrderStore(FILE);
+    const second = new OrderStore(path);
     expect(second.get('critical')).not.toBeNull();
-    // Re-submitting the same clientOrderId is detectable as a duplicate.
     expect(second.get('critical')!.status).toBe('CREATED');
+  });
+
+  it('a corrupt ledger is CORRUPT and save() refuses to overwrite it', () => {
+    const path = freshFile();
+    rmSync(path, { force: true });
+    writeFileSync(path, '{ not json');
+    const store = new OrderStore(path);
+    expect(store.load().status).toBe('CORRUPT');
+    expect(() => store.save(sampleOrder('a', 'CREATED'))).toThrow(/refusing to overwrite/);
   });
 });

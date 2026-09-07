@@ -35,13 +35,19 @@ export const statusCommand: CommandHandler = (): number => {
   console.log('  State file:     ' + cfg.paperStateFile);
 
   const store = new PaperStateStore(cfg.paperStateFile);
-  const state = store.load();
-  if (!state) {
+  const r = store.load();
+  if (r.status === 'CORRUPT') {
+    // eslint-disable-next-line no-console
+    console.error('\n  Paper state is CORRUPT: ' + r.reason + '\n  Refusing to report a possibly-reset account. Operator intervention required.');
+    return 1;
+  }
+  if (r.status === 'MISSING') {
     // eslint-disable-next-line no-console
     console.log('\n  Paper portfolio: no state saved yet (run "bot paper" to begin).');
     return 0;
   }
 
+  const state = r.data;
   // eslint-disable-next-line no-console
   console.log('\n  Paper portfolio (persisted):');
   for (const [currency, amount] of Object.entries(state.cash)) {

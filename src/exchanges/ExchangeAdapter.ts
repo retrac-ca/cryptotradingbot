@@ -11,6 +11,7 @@
  */
 
 import type {
+  AccountTrade,
   Balance,
   Candle,
   MarketInfo,
@@ -73,6 +74,13 @@ export interface ExchangeAdapter {
   getOpenOrders(symbol?: string): Promise<Order[]>;
   getOrderHistory(symbol?: string): Promise<Order[]>;
   getOrderStatus(symbol: string, clientOrderId?: string, exchangeOrderId?: string): Promise<Order>;
+  /**
+   * Authoritative account trade/fill records (e.g. NDAX `GetAccountTrades`).
+   * READ-ONLY. Used to reason about per-execution identity and fee currency
+   * without fabricating an id or assuming a currency. Optional symbol filter
+   * narrows to one market when the exchange supports it.
+   */
+  getAccountTrades(symbol?: string): Promise<AccountTrade[]>
 
   // ---- Market metadata ----
   getMarketInfo(symbol: string): Promise<MarketInfo>;

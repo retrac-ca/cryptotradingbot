@@ -12,6 +12,18 @@ import type { SymbolStr } from './types.js';
 export type OrderSide = 'BUY' | 'SELL';
 export type OrderType = 'market' | 'limit';
 export type OrderTif = 'GTC' | 'IOC' | 'FOK';
+/**
+ * Currency in which a fee was (or may have been) charged.
+ * - `base`   : charged in the base asset.
+ * - `quote`  : charged in the quote (settlement) asset.
+ * - `unknown`: the fee asset could NOT be authoritatively resolved (e.g. NDAX
+ *   `feeProductId` present but not mapped to the instrument's base/quote, or not
+ *   provided). Switching on `unknown` MUST fail closed — never assume 'quote'.
+ * The adapter exposes raw `feeProductId` (via `AccountTrade`) rather than
+ * pretending to know the currency; a `'quote'` value here is only ever
+ * AUTHORITATIVE when resolved from exchange product metadata.
+ */
+export type FeeCurrency = 'base' | 'quote' | 'unknown';
 
 export const ORDER_STATUS = [
   'CREATED', // locally created, not yet submitted
@@ -59,8 +71,29 @@ export interface Fill {
   price: Money;
   quantity: Money;
   fee: Money;
-  feeCurrency: 'base' | 'quote';
-  timestampMs: number;
+  feeCurrency: FeeCurrency;
+  /**
+   * Raw exchange fee-asset id (e.g. NDAX `feeProductId`), VERBATIM. This is the
+   * authoritative input for resolving `feeCurrency` via exchange product/instrument
+   * metadata; it is NEVER coerced to base/quote here.
+   */
+  feeProductId?: string | null;
+  /**
+   * Exchange-reported fill timestamp (ms epoch). `null` means the exchange did
+   * NOT provide an authoritative fill time — NEVER a fabricated local time.
+   */
+  timestampMs: number | null;
+  /**
+   * Immutable execution/fill identity (Gate 7.2) used for idempotent Portfolio
+   * accounting. This must be a TRUSTWORTHY, exchange-derived or operator-asserted
+   * unique identifier of ONE execution/fill (e.g. a trade id); it must never be
+   * synthesized from price/quantity/timestamp (those do not prove exchange-level
+   * uniqueness). `null`/absent means the execution cannot be safely deduplicated,
+   * so `Portfolio.applyLiveFill` refuses to apply it (fail closed). Paper/backtest
+   * fills leave this unset — they are applied exactly once via the non-idempotent
+   * `applyFill` path, never through the live idempotent path.
+   */
+  executionId?: string | null;
 }
 
 export interface Order {
@@ -79,10 +112,16 @@ export interface Order {
   fills: Fill[];
   /** Overall order fee paid so far in the fee currency. */
   fee: Money;
-  feeCurrency: 'base' | 'quote';
+  feeCurrency: FeeCurrency;
   reason: string;
-  createdAtMs: number;
-  updatedAtMs: number;
+  /**
+   * When this order record was created. For bot-created orders this is local
+   * application time; for exchange-fetched orders it is the exchange receipt
+   * time when available, else `null` (unknown — never fabricated as local time).
+   */
+  createdAtMs: number | null;
+  /** Like `createdAtMs`, the exchange's last-update time, else unknown. */
+  updatedAtMs: number | null;
 }
 
 /** Signals produced by strategies. Never executed directly. */

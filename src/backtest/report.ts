@@ -1,56 +1,60 @@
 /**
- * Backtest metrics computation.
+ * Backtest metrics computation (Backtesting V1).
  *
- * Converts a raw backtest run into the required performance report: starting /
- * ending capital, total return, trade count, winning/losing trades and win
- * rate, realized P&L, fees, max drawdown, and largest win/loss.
- *
- * Max drawdown is computed over the equity curve (peak-to-trough of equity),
- * reported as a fraction of the peak.
+ * Converts a raw backtest run into the required performance report. All
+ * accounting is exact `Money`; ratios are computed only for display. Division by
+ * zero is guarded (zero starting capital / zero closed trades / zero peak).
  */
 
 import { Money } from '../money/Money.js';
 import type { BacktestMetrics, BacktestTrade } from './types.js';
 
 export interface MetricsInput {
-  candles: number;
+  barCount: number;
   startingCapital: Money;
   endingCapital: Money;
-  feesPaid: Money;
-  realizedPnl: Money;
   trades: BacktestTrade[];
-  /** Realized P&L per closed (SELL) trade, for win/loss statistics. */
-  realizedPnlValues: Money[];
   equityCurve: { timestampMs: number; equity: Money }[];
-  peak: { value: Money };
-  finalEquity: Money;
+  peakEquity: Money;
+  maxExposure: Money;
 }
 
 export function computeMetrics(input: MetricsInput): BacktestMetrics {
+  const absolutePnl = input.endingCapital.sub(input.startingCapital);
   const totalReturnFraction = input.startingCapital.isZero()
     ? 0
-    : input.endingCapital.sub(input.startingCapital).div(input.startingCapital).toNumber();
+    : absolutePnl.div(input.startingCapital).toNumber();
 
-  // Win/loss stats over closed trades (realized P&L > 0 wins, < 0 losses).
+  // Trade statistics over CLOSED trades (SELLs with a realized P&L).
   let winningTrades = 0;
   let losingTrades = 0;
+  let grossProfit = Money.zero();
+  let grossLoss = Money.zero();
   let largestWin = Money.zero();
   let largestLoss = Money.zero();
-  for (const pnl of input.realizedPnlValues) {
+  let feesPaid = Money.zero();
+
+  for (const t of input.trades) {
+    feesPaid = feesPaid.add(t.fee);
+    const pnl = t.realizedPnl;
+    if (pnl === null) continue; // an open (BUY) trade has no realized P&L yet
     if (pnl.isPositive()) {
-      winningTrades++;
+      winningTrades += 1;
+      grossProfit = grossProfit.add(pnl);
       if (pnl.compareTo(largestWin) > 0) largestWin = pnl;
     } else if (pnl.isNegative()) {
-      losingTrades++;
+      losingTrades += 1;
+      grossLoss = grossLoss.add(pnl.negate());
       if (pnl.compareTo(largestLoss) < 0) largestLoss = pnl;
     }
   }
-  const closedTrades = input.realizedPnlValues.length;
+
+  const closedTrades = winningTrades + losingTrades;
   const winRate = closedTrades === 0 ? 0 : winningTrades / closedTrades;
 
-  // Max drawdown from the equity curve.
+  // Max drawdown from the equity curve (peak-to-trough, as a fraction of peak).
   let maxDrawdownFraction = 0;
-  let runningPeak = input.peak.value;
+  let runningPeak = input.peakEquity;
   for (const point of input.equityCurve) {
     if (point.equity.compareTo(runningPeak) > 0) runningPeak = point.equity;
     if (!runningPeak.isZero()) {
@@ -60,18 +64,22 @@ export function computeMetrics(input: MetricsInput): BacktestMetrics {
   }
 
   return {
-    candles: input.candles,
+    barCount: input.barCount,
     startingCapital: input.startingCapital,
     endingCapital: input.endingCapital,
+    absolutePnl,
     totalReturnFraction,
     tradeCount: input.trades.length,
     winningTrades,
     losingTrades,
     winRate,
-    realizedPnl: input.realizedPnl,
-    feesPaid: input.feesPaid,
+    grossProfit,
+    grossLoss,
+    feesPaid,
     maxDrawdownFraction,
+    peakEquity: input.peakEquity,
     largestWin,
     largestLoss,
+    maxExposure: input.maxExposure,
   };
 }

@@ -42,7 +42,10 @@ const baseConfig: RiskConfig = {
   maxDailyLossFraction: 0.05,
   maxDrawdownFraction: 0.1,
   cooldownAfterLossMs: 3600_000,
+  maxOpenPositions: 1,
   marketDataMaxAgeMs: 60_000,
+  marketDataTransportMaxAgeMs: 60_000,
+  maxClockSkewMs: 120_000,
 };
 
 const NOW = 1_000_000_000;
@@ -55,13 +58,17 @@ function ctx(signalType: 'BUY' | 'SELL' | 'HOLD', over: Overrides = {}): RiskCon
     signal: signal('BTC/CAD', signalType, {}, NOW),
     nowMs: NOW,
     marketDataTimestampMs: NOW,
+    marketDataObservedAtMs: NOW,
     price: PRICE,
     marketInfo,
     quoteBalance: balance('100000'),
+    deployableQuote: Money.fromString('100000'),
     portfolioValue: PORTFOLIO,
     peakPortfolioValue: PORTFOLIO,
     portfolioExposure: Money.zero(),
     currentPosition: Money.zero(),
+    externalPosition: Money.zero(),
+    openManagedPositionCount: 0,
     realizedPnlToday: Money.zero(),
     unrealizedPnlToday: Money.zero(),
     ...over,
@@ -258,7 +265,7 @@ describe('RiskManager — cooldown', () => {
     const risk = mk();
     risk.recordLoss(NOW);
     const later = NOW + 3600_000;
-    const d = risk.evaluate(ctx('BUY', { nowMs: later, marketDataTimestampMs: later }));
+    const d = risk.evaluate(ctx('BUY', { nowMs: later, marketDataTimestampMs: later, marketDataObservedAtMs: later }));
     expect(d.approved).toBe(true);
   });
 
@@ -320,13 +327,13 @@ describe('RiskManager — max trade size', () => {
 
 describe('RiskManager — balance', () => {
   it('rejects a BUY when available balance is insufficient', () => {
-    const d = mk().evaluate(ctx('BUY', { quoteBalance: balance('100') }));
+    const d = mk().evaluate(ctx('BUY', { deployableQuote: Money.fromString('100') }));
     expect(d.approved).toBe(false);
     if (!d.approved) expect(d.reason).toBe('INSUFFICIENT_BALANCE');
   });
 
   it('fails closed when balance is unknown', () => {
-    const d = mk().evaluate(ctx('BUY', { quoteBalance: null }));
+    const d = mk().evaluate(ctx('BUY', { quoteBalance: null, deployableQuote: null }));
     expect(d.approved).toBe(false);
     if (!d.approved) expect(d.reason).toBe('UNKNOWN_BALANCE');
   });
@@ -435,5 +442,324 @@ describe('RiskManager — combinations & cannot-bypass', () => {
     expect(limits.maxPortfolioExposureFraction).toBe(0.5);
     expect(limits.maxDailyLossFraction).toBe(0.05);
     expect(limits.killSwitchActive).toBe(false);
+  });
+});
+
+// --- Bounded partial SELL (live-test / operator hedge) ---
+
+describe('RiskManager — bounded partial SELL (sellTarget)', () => {
+  it('sizes a partial exit down to a notional target (never exceeds it)', () => {
+    const d = mk().evaluate(
+      ctx('SELL', {
+        currentPosition: Money.fromString('0.25'),
+        sellTarget: { notional: Money.fromString('5000') },
+      }),
+    );
+    expect(d.approved).toBe(true);
+    if (d.approved) {
+      // 5000 / 40000 = 0.125 BTC, floored to tick.
+      expect(d.quantity.toFixed(8)).toBe('0.12500000');
+      expect(d.estimatedNotional.compareTo(Money.fromString('5000.00'))).toBeLessThanOrEqual(0);
+    }
+  });
+
+  it('sells only the target fraction of the held position', () => {
+    const d = mk().evaluate(
+      ctx('SELL', {
+        currentPosition: Money.fromString('0.25'),
+        sellTarget: { fraction: 0.5 },
+      }),
+    );
+    expect(d.approved).toBe(true);
+    if (d.approved) expect(d.quantity.toFixed(8)).toBe('0.12500000');
+  });
+
+  it('caps the target at the held position (no shorting / no over-sell)', () => {
+    const d = mk().evaluate(
+      ctx('SELL', {
+        currentPosition: Money.fromString('0.25'),
+        sellTarget: { notional: Money.fromString('100000') },
+      }),
+    );
+    expect(d.approved).toBe(true);
+    if (d.approved) expect(d.quantity.toFixed(8)).toBe('0.25000000');
+  });
+
+  it('uses the smallest bound when both fraction and notional are given', () => {
+    const d = mk().evaluate(
+      ctx('SELL', {
+        currentPosition: Money.fromString('0.25'),
+        // fraction 0.5 -> 0.125; notional 2000 -> 0.05. Smallest binds.
+        sellTarget: { fraction: 0.5, notional: Money.fromString('2000') },
+      }),
+    );
+    expect(d.approved).toBe(true);
+    if (d.approved) expect(d.quantity.toFixed(8)).toBe('0.05000000');
+  });
+
+  it('floors the target to the quantity tick (operator cannot inject an arbitrary quantity)', () => {
+    const d = mk().evaluate(
+      ctx('SELL', {
+        currentPosition: Money.fromString('0.25'),
+        sellTarget: { notional: Money.fromString('100') },
+      }),
+    );
+    expect(d.approved).toBe(true);
+    if (d.approved) expect(d.quantity.toFixed(8)).toBe('0.00250000');
+  });
+
+  it('rejects a target too small to clear the min quantity', () => {
+    const d = mk().evaluate(
+      ctx('SELL', {
+        currentPosition: Money.fromString('0.25'),
+        sellTarget: { notional: Money.fromString('1') }, // 0.000025 -> 0.00001 < min 0.0001
+      }),
+    );
+    expect(d.approved).toBe(false);
+    if (!d.approved) expect(d.reason).toBe('BELOW_MIN_QUANTITY');
+  });
+
+  it('rejects a malformed (empty) sell target', () => {
+    const d = mk().evaluate(
+      ctx('SELL', { currentPosition: Money.fromString('0.25'), sellTarget: {} }),
+    );
+    expect(d.approved).toBe(false);
+    if (!d.approved) expect(d.reason).toBe('INVALID_SELL_TARGET');
+  });
+
+  it('rejects out-of-range fractions and non-positive notionals', () => {
+    for (const sellTarget of [
+      { fraction: 0 },
+      { fraction: -0.1 },
+      { fraction: 1.5 },
+      { notional: Money.zero() },
+      { notional: Money.fromString('-5') },
+    ]) {
+      const d = mk().evaluate(
+        ctx('SELL', { currentPosition: Money.fromString('0.25'), sellTarget }),
+      );
+      expect(d.approved).toBe(false);
+      if (!d.approved) expect(d.reason).toBe('INVALID_SELL_TARGET');
+    }
+  });
+
+  it('ignores sellTarget on a BUY (it only bounds the risk-reducing SELL path)', () => {
+    const d = mk().evaluate(
+      ctx('BUY', { sellTarget: { notional: Money.fromString('1') } }),
+    );
+    expect(d.approved).toBe(true);
+    if (d.approved) expect(d.quantity.toFixed(8)).toBe('0.25000000');
+  });
+
+  it('still performs a full exit when no sellTarget is present', () => {
+    const d = mk().evaluate(ctx('SELL', { currentPosition: Money.fromString('0.25') }));
+    expect(d.approved).toBe(true);
+    if (d.approved) expect(d.quantity.toFixed(8)).toBe('0.25000000');
+  });
+});
+
+// --- Hybrid freshness (Gate 4) ---
+
+describe('RiskManager — hybrid market-data freshness', () => {
+  it('fails closed when the transport is fresh but the quote is stale', () => {
+    const d = mk().evaluate(
+      ctx('BUY', {
+        marketDataTimestampMs: NOW - 61_000,
+        marketDataObservedAtMs: NOW,
+      }),
+    );
+    expect(d.approved).toBe(false);
+    if (!d.approved) {
+      expect(d.reason).toBe('STALE_MARKET_DATA');
+      expect(d.detail).toContain('QUOTE_STALE');
+    }
+  });
+
+  it('fails closed when the quote is fresh but the transport is stale', () => {
+    const d = mk().evaluate(
+      ctx('SELL', {
+        currentPosition: Money.fromString('0.25'),
+        marketDataTimestampMs: NOW,
+        marketDataObservedAtMs: NOW - 61_000,
+      }),
+    );
+    expect(d.approved).toBe(false);
+    if (!d.approved) {
+      expect(d.reason).toBe('STALE_MARKET_DATA');
+      expect(d.detail).toContain('TRANSPORT_STALE');
+    }
+  });
+
+  it('fails closed when the observation timestamp is missing (transport unknown)', () => {
+    const d = mk().evaluate(
+      ctx('BUY', { marketDataObservedAtMs: null }),
+    );
+    expect(d.approved).toBe(false);
+    if (!d.approved) {
+      expect(d.reason).toBe('STALE_MARKET_DATA');
+      expect(d.detail).toContain('TRANSPORT_MISSING');
+    }
+  });
+
+  it('fails closed on a quote timestamp ahead of the local clock beyond the skew guard', () => {
+    const d = mk().evaluate(
+      ctx('SELL', {
+        currentPosition: Money.fromString('0.25'),
+        marketDataTimestampMs: NOW + 120_001,
+        marketDataObservedAtMs: NOW,
+      }),
+    );
+    expect(d.approved).toBe(false);
+    if (!d.approved) {
+      expect(d.reason).toBe('STALE_MARKET_DATA');
+      expect(d.detail).toContain('QUOTE_AHEAD_OF_CLOCK');
+    }
+  });
+
+  it('accepts a quote slightly ahead of local clock within the skew tolerance', () => {
+    const d = mk().evaluate(
+      ctx('SELL', {
+        currentPosition: Money.fromString('0.25'),
+        marketDataTimestampMs: NOW + 30_000,
+        marketDataObservedAtMs: NOW,
+      }),
+    );
+    expect(d.approved).toBe(true);
+  });
+});
+
+// --- Gate 5: ownership (managed vs external) ---
+
+const FEE_MARKET: MarketInfo = {
+  ...marketInfo,
+  feeInfo: { maker: 0.001, taker: 0.001, feeCurrency: 'quote' },
+};
+
+describe('RiskManager — SELL ownership (external is never tradable)', () => {
+  it('rejects a SELL when only EXTERNAL inventory exists (bot-managed = 0)', () => {
+    const d = mk().evaluate(
+      ctx('SELL', { currentPosition: Money.zero(), externalPosition: Money.fromString('0.00034411') }),
+    );
+    expect(d.approved).toBe(false);
+    if (!d.approved) expect(d.reason).toBe('SELL_EXCEEDS_MANAGED_POSITION');
+  });
+
+  it('rejects a SELL when there is neither managed nor external inventory', () => {
+    const d = mk().evaluate(ctx('SELL', { currentPosition: Money.zero(), externalPosition: Money.zero() }));
+    expect(d.approved).toBe(false);
+    if (!d.approved) expect(d.reason).toBe('NO_ACTION');
+  });
+
+  it('sells exactly the managed quantity even when external + managed coexist', () => {
+    const d = mk().evaluate(
+      ctx('SELL', {
+        currentPosition: Money.fromString('0.1'),
+        externalPosition: Money.fromString('1.0'),
+        sellTarget: { notional: Money.fromString('100000') }, // far beyond managed
+      }),
+    );
+    expect(d.approved).toBe(true);
+    if (d.approved) expect(d.quantity.toFixed(8)).toBe('0.10000000'); // never 1.1
+  });
+
+  it('bounded sellTarget is still capped by managed inventory', () => {
+    const d = mk().evaluate(
+      ctx('SELL', {
+        currentPosition: Money.fromString('0.1'),
+        externalPosition: Money.fromString('0.0'),
+        sellTarget: { notional: Money.fromString('9000') }, // 9000/40000=0.225 > 0.1
+      }),
+    );
+    expect(d.approved).toBe(true);
+    if (d.approved) expect(d.quantity.toFixed(8)).toBe('0.10000000');
+  });
+});
+
+describe('RiskManager — managed equity & external not counted in BUY cap', () => {
+  it('external holdings do not consume the managed position cap', () => {
+    // Managed position 0 (external BTC exists), small managed equity. The BUY is
+    // sized to the position cap over MANAGED equity; external is irrelevant.
+    const d = mk().evaluate(
+      ctx('BUY', {
+        currentPosition: Money.zero(),
+        externalPosition: Money.fromString('0.25'),
+        portfolioValue: Money.fromString('1000.00'),
+        peakPortfolioValue: Money.fromString('1000.00'),
+        unrealizedPnlToday: Money.zero(),
+      }),
+    );
+    expect(d.approved).toBe(true);
+    if (d.approved) {
+      // 10% of 1000 = 100 CAD / 40000 = 0.0025 BTC.
+      expect(d.quantity.toFixed(8)).toBe('0.00250000');
+    }
+  });
+
+  it('does not let a large external position inflate the position cap', () => {
+    const d = mk().evaluate(
+      ctx('BUY', {
+        currentPosition: Money.zero(),
+        externalPosition: Money.fromString('5'),
+        portfolioValue: Money.fromString('1000.00'),
+        peakPortfolioValue: Money.fromString('1000.00'),
+        unrealizedPnlToday: Money.zero(),
+      }),
+    );
+    expect(d.approved).toBe(true);
+    if (d.approved) expect(d.estimatedNotional.compareTo(Money.fromString('100.00'))).toBeLessThanOrEqual(0);
+  });
+});
+
+describe('RiskManager — deployable quote & fee reservation', () => {
+  it('rejects a BUY when notional + fee exceeds deployable quote (forgetting fee is unsafe)', () => {
+    // deployable == notional (10000) but fee is nonzero -> not affordable.
+    const d = mk().evaluate(
+      ctx('BUY', {
+        marketInfo: FEE_MARKET,
+        deployableQuote: Money.fromString('10000.00'),
+        portfolioValue: Money.fromString('100000.00'),
+        quoteBalance: balance('10000'),
+      }),
+    );
+    expect(d.approved).toBe(false);
+    if (!d.approved) expect(d.reason).toBe('INSUFFICIENT_BALANCE');
+  });
+
+  it('approves a BUY when deployable quote covers notional + fee', () => {
+    // 10% cap = 10000; fee @0.1% = 10 -> need >=10010.
+    const d = mk().evaluate(
+      ctx('BUY', {
+        marketInfo: FEE_MARKET,
+        deployableQuote: Money.fromString('10010.00'),
+        portfolioValue: Money.fromString('100000.00'),
+        quoteBalance: balance('10010'),
+      }),
+    );
+    expect(d.approved).toBe(true);
+  });
+});
+
+describe('RiskManager — maxOpenPositions', () => {
+  it('rejects a BUY when the managed portfolio is at max open positions', () => {
+    const d = mk().evaluate(ctx('BUY', { openManagedPositionCount: 1 }));
+    expect(d.approved).toBe(false);
+    if (!d.approved) expect(d.reason).toBe('MAX_OPEN_POSITIONS');
+  });
+
+  it('allows a BUY when there is room under maxOpenPositions', () => {
+    const d = mk().evaluate(ctx('BUY', { openManagedPositionCount: 0 }));
+    expect(d.approved).toBe(true);
+  });
+
+  it('allows a BUY when maxOpenPositions is 0 (no limit)', () => {
+    const d = mk({ maxOpenPositions: 0 }).evaluate(ctx('BUY', { openManagedPositionCount: 5 }));
+    expect(d.approved).toBe(true);
+  });
+
+  it('still permits a risk-reducing SELL at max open positions', () => {
+    const d = mk().evaluate(
+      ctx('SELL', { currentPosition: Money.fromString('0.25'), openManagedPositionCount: 1 }),
+    );
+    expect(d.approved).toBe(true);
   });
 });

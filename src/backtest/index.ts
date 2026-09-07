@@ -1,25 +1,37 @@
 /**
- * Backtest module.
+ * Backtest module (Backtesting V1).
  *
- * Replays historical candles through the strategy -> risk -> execution pipeline
- * with simulated execution and produces a performance report. Results are a
+ * Replays historical candles through the existing `Strategy` -> `RiskManager`
+ * -> `Portfolio` pipeline with a deterministic, conservative, next-open simulated
+ * execution, and produces an auditable performance result. Results are a
  * HISTORICAL SIMULATION, not a prediction of future performance.
  *
- * Also provides a small loader for reading candle history from a JSON file
- * (the format written by e.g. `scripts/` or a prior candle fetch) for use by
- * the `backtest` CLI command.
+ * The public boundary is `runBacktest(input)`, which takes FACTORIES for the
+ * strategy and risk manager so the two can never leak mutable state between
+ * runs.
  */
 
-export { BacktestRunner } from './BacktestRunner.js';
+export { runBacktest, buildMarketInfo } from './engine.js';
 export { computeMetrics } from './report.js';
-export type { MetricsInput } from './report.js';
+export {
+  validateCandles,
+  validateConfig,
+  BacktestValidationError,
+} from './validation.js';
+export { computeQuoteFee } from './fee.js';
+export { computeFillPrice } from './fill.js';
 export type {
   BacktestConfig,
-  BacktestMetrics,
-  BacktestRejection,
+  BacktestRunInput,
   BacktestResult,
   BacktestTrade,
+  BacktestRejection,
+  BacktestMetrics,
+  BacktestMarketConstraints,
+  BacktestFeeModel,
+  BacktestFeeModelRate,
 } from './types.js';
+export type { MetricsInput } from './report.js';
 
 import { readFileSync } from 'node:fs';
 import { Money } from '../money/Money.js';
@@ -29,22 +41,39 @@ import type { Candle, Timeframe } from '../types.js';
  * Load candles from a JSON file. Expected shape: an array of
  * `{ symbol, timeframe, timestampMs, open, high, low, close, baseVolume }`
  * where prices are numeric strings (decimal). Returns canonical Candle objects.
+ *
+ * This only parses; semantic validation (ordering, duplicates, OHLC, warmup) is
+ * performed fail-closed by `runBacktest` via `validateCandles`.
  */
 export function loadCandlesFromFile(path: string): Candle[] {
   const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>[];
+  if (!Array.isArray(raw)) {
+    throw new Error(`candle file ${path} must contain a JSON array`);
+  }
   const candles: Candle[] = [];
-  for (const row of raw) {
-    const symbol = (row as { symbol?: string }).symbol ?? '';
-    const timeframe = (row as { timeframe?: string }).timeframe ?? '1d';
+  for (let idx = 0; idx < raw.length; idx++) {
+    const row = raw[idx];
+    if (!row || typeof row !== 'object') {
+      throw new Error(`candle row ${idx} is not an object`);
+    }
+    const asMoney = (field: string): Money => {
+      const v = (row as Record<string, unknown>)[field];
+      if (v === undefined || v === null) {
+        throw new Error(`candle row ${idx} is missing "${field}"`);
+      }
+      return Money.fromString(String(v));
+    };
+    const symbol = (row as { symbol?: unknown }).symbol ?? '';
+    const timeframe = (row as { timeframe?: unknown }).timeframe ?? '1d';
     candles.push({
-      symbol,
+      symbol: String(symbol),
       timeframe: timeframe as Timeframe,
-      timestampMs: row.timestampMs as number,
-      open: Money.fromString((row.open as { toString(): string }).toString()),
-      high: Money.fromString((row.high as { toString(): string }).toString()),
-      low: Money.fromString((row.low as { toString(): string }).toString()),
-      close: Money.fromString((row.close as { toString(): string }).toString()),
-      baseVolume: Money.fromString((row.baseVolume as { toString(): string }).toString()),
+      timestampMs: Number((row as { timestampMs?: unknown }).timestampMs),
+      open: asMoney('open'),
+      high: asMoney('high'),
+      low: asMoney('low'),
+      close: asMoney('close'),
+      baseVolume: asMoney('baseVolume'),
     });
   }
   return candles;

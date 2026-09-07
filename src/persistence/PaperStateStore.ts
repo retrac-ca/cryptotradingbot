@@ -1,72 +1,75 @@
 /**
- * Minimal paper-state store — persists enough to make a restart safe.
+ * PaperStateStore — the durable store for the PAPER portfolio.
  *
- * Phase 9 will build a fuller persistence layer (SQLite, order/trade history,
- * reconciliations). For Phase 8 we only need what the continuously-running
- * paper bot requires to avoid incorrectly resetting its portfolio across a
- * restart:
- *   - the portfolio (cash, positions, P&L, fees, peak equity), and
- *   - the set of previously executed paper order client ids (for idempotency).
+ * This is the PAPER realm (realm=`paper`, domain=`portfolio`). It persists the
+ * simulated portfolio (cash, positions, ownership, reservations, applied
+ * executions, manual settlements, P&L, fees, peak equity) plus the paper
+ * executed order ids.
  *
- * The store is a single JSON file. Writes are atomic (write temp + rename).
+ * Fail-closed loading: `load()` returns a tri-state `LoadResult` so a CORRUPT
+ * file is NEVER treated as MISSING (which would silently reset the paper
+ * account). `save()` writes a versioned envelope atomically, inside the
+ * state-directory mutation lock.
  */
 
-import { mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
   serializePortfolio,
   deserializePortfolio,
-  type PortfolioJsonV1,
+  type PortfolioJson,
 } from '../portfolio/serialization.js';
 import type { PortfolioModel } from '../portfolio/types.js';
+import { readEnvelope, writeEnvelope } from './envelope.js';
+import { withStateDirLock } from './lock.js';
+import type { LoadResult } from './types.js';
 
-export interface PaperStateFileV1 extends PortfolioJsonV1 {
+/** The payload of a paper-state file: the portfolio JSON + paper-only ids. */
+export type PaperStatePayload = PortfolioJson & {
   executedOrderIds: string[];
-  savedAtMs: number;
-}
+};
 
 export class PaperStateStore {
   constructor(private readonly filePath: string) {}
 
-  /** Load state, or null if none exists yet / unreadable. */
-  load(): PaperStateFileV1 | null {
-    let raw: string;
-    try {
-      raw = readFileSync(this.filePath, 'utf8');
-    } catch {
-      return null;
+  /** Tri-state load (OK / MISSING / CORRUPT). CORRUPT is never MISSING. */
+  load(): LoadResult<PaperStatePayload> {
+    const r = readEnvelope(this.filePath, 'paper', 'portfolio');
+    if (r.status !== 'OK') return r;
+    const payload = r.data.payload as unknown;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return { status: 'CORRUPT', reason: 'paper state payload is not an object' };
     }
+    const p = payload as Record<string, unknown>;
+    if (!Array.isArray(p.executedOrderIds)) {
+      return { status: 'CORRUPT', reason: 'paper state is missing its executedOrderIds' };
+    }
+    // Validate the portfolio part (conservation, Money, source, reservations).
     try {
-      const json = JSON.parse(raw) as PaperStateFileV1;
-      if (json.version !== 1) return null;
-      return {
-        ...json,
-        executedOrderIds: Array.isArray(json.executedOrderIds) ? json.executedOrderIds : [],
-      };
+      deserializePortfolio(p as unknown as PortfolioJson, { realm: 'paper' });
+    } catch (err) {
+      return { status: 'CORRUPT', reason: `invalid paper portfolio: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    return { status: 'OK', data: payload as PaperStatePayload };
+  }
+
+  /** Recover a PortfolioModel from a validated payload, or null. */
+  toPortfolio(payload: PaperStatePayload | null): PortfolioModel | null {
+    if (!payload) return null;
+    try {
+      return deserializePortfolio(payload, { realm: 'paper' });
     } catch {
       return null;
     }
   }
 
+  /** Persist the paper portfolio + executed ids (atomic, inside the lock). */
   save(portfolio: PortfolioModel, executedOrderIds: string[]): void {
-    const json: PaperStateFileV1 = {
+    const payload: PaperStatePayload = {
       ...serializePortfolio(portfolio),
       executedOrderIds,
-      savedAtMs: Date.now(),
     };
-    const tmp = `${this.filePath}.tmp`;
-    mkdirSync(dirname(this.filePath), { recursive: true });
-    writeFileSync(tmp, JSON.stringify(json, null, 2));
-    renameSync(tmp, this.filePath);
-  }
-
-  /** Recover a PortfolioModel from a persisted state, or null. */
-  toPortfolio(file: PaperStateFileV1 | null): PortfolioModel | null {
-    if (!file) return null;
-    try {
-      return deserializePortfolio(file);
-    } catch {
-      return null;
-    }
+    withStateDirLock(dirname(this.filePath), () => {
+      writeEnvelope(this.filePath, 'paper', 'portfolio', payload);
+    });
   }
 }

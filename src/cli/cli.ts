@@ -9,6 +9,8 @@
 import { createLogger } from '../logging/logger.js';
 import { backtestCommand } from './backtest-cmd.js';
 import { configureCommand } from './config-cmd.js';
+import { liveTestCommand } from './live-test-cmd.js';
+import { manualCommand } from './manual-cmd.js';
 import { paperCommand } from './paper-cmd.js';
 import { reconcileCommand } from './reconcile-cmd.js';
 import { setupCommand } from './setup-cmd.js';
@@ -25,6 +27,8 @@ export const COMMANDS = {
   backtest: backtestCommand,
   trades: tradesCommand,
   reconcile: reconcileCommand,
+  'live-test': liveTestCommand,
+  manual: manualCommand,
 } as const;
 
 export type CommandName = keyof typeof COMMANDS;
@@ -42,6 +46,8 @@ Commands:
   backtest  Run a historical backtest from a candles JSON file
   trades    Show the durable order ledger
   reconcile Reconcile the order ledger against the exchange (read-only)
+  live-test One-shot, operator-gated LIVE SELL (e.g. first-risk-validated live order)
+  manual    Constrained MANUAL EXECUTION BRIDGE (operator interface; never places/cancels an exchange order)
   help      Show this help
 
 Run "bot <command> --help" for command-specific options.

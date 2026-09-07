@@ -19,6 +19,7 @@
 
 import type { Money } from '../money/Money.js';
 import { Money as MoneyValue } from '../money/Money.js';
+import { evaluateFreshness } from '../marketdata/freshness.js';
 import { OrderSide } from '../order.js';
 import { signalToOrderSide } from '../strategy/Signal.js';
 import type { RiskConfig } from './RiskConfig.js';
@@ -77,6 +78,7 @@ export class RiskManager {
       maxDailyLossFraction: this.cfg.maxDailyLossFraction,
       maxDrawdownFraction: this.cfg.maxDrawdownFraction,
       cooldownAfterLossMs: this.cfg.cooldownAfterLossMs,
+      maxOpenPositions: this.cfg.maxOpenPositions,
       killSwitchActive: this.killSwitchActive,
     };
   }
@@ -134,11 +136,28 @@ export class RiskManager {
     if (ctx.currentPosition === null) {
       return this.reject(ctx.symbol, side, 'UNKNOWN_POSITION');
     }
-    if (
-      ctx.marketDataTimestampMs === null ||
-      ctx.nowMs - ctx.marketDataTimestampMs > this.cfg.marketDataMaxAgeMs
-    ) {
-      return this.reject(ctx.symbol, side, 'STALE_MARKET_DATA');
+
+    // Hybrid market-data freshness (Gate 4): both the exchange-reported quote
+    // time and the local observation (transport) time must be fresh, and the
+    // quote must not be ahead of the local clock. Any failure fails closed as
+    // STALE_MARKET_DATA so no decision is made on unreliable data.
+    const freshness = evaluateFreshness({
+      nowMs: ctx.nowMs,
+      quoteTimestampMs: ctx.marketDataTimestampMs,
+      observedAtMs: ctx.marketDataObservedAtMs,
+      policy: {
+        maxQuoteAgeMs: this.cfg.marketDataMaxAgeMs,
+        maxTransportAgeMs: this.cfg.marketDataTransportMaxAgeMs,
+        maxAcceptableFutureSkewMs: this.cfg.maxClockSkewMs,
+      },
+    });
+    if (!freshness.fresh) {
+      return this.reject(
+        ctx.symbol,
+        side,
+        'STALE_MARKET_DATA',
+        `market data freshness: ${freshness.reason} (${freshness.detail})`,
+      );
     }
 
     // Branch by intent: SELL that reduces exposure is treated more permissively.
@@ -150,38 +169,117 @@ export class RiskManager {
 
   // --- SELL (risk-reducing) ---
 
+  /**
+   * SELL is special: it is risk-reducing, so it is permitted even when new
+   * exposure is blocked (daily loss / drawdown / cooldown). By default it
+   * closes the FULL held position. An optional bounded `sellTarget` (a fraction
+   * of the position and/or a notional cap) makes it a PARTIAL exit — but the
+   * approved quantity is always min(held position, target), floored to the
+   * quantity tick, so a caller can never inflate the fill past the position nor
+   * inject an arbitrary raw quantity. A malformed target fails closed.
+   */
   private evaluateSell(ctx: RiskContext, side: OrderSide, limits: AppliedRiskLimits): RiskDecision {
     const position = ctx.currentPosition!;
+    const market = ctx.marketInfo!;
+    const price = ctx.price!;
+    const external = ctx.externalPosition ?? MoneyValue.zero();
 
     if (position.isZero()) {
-      return this.reject(ctx.symbol, side, 'NO_ACTION', 'no position to sell');
+      // No bot-managed inventory. If the exchange holds ONLY external (non-bot)
+      // inventory for this symbol, a SELL here would liquidate the user's asset —
+      // that is forbidden. Fail closed with a distinct reason so the owner is
+      // never auto-sold.
+      if (external.isPositive()) {
+        return this.reject(
+          ctx.symbol,
+          side,
+          'SELL_EXCEEDS_MANAGED_POSITION',
+          'only external (non-bot-managed) inventory exists; cannot sell the user asset',
+        );
+      }
+      return this.reject(ctx.symbol, side, 'NO_ACTION', 'no managed position to sell');
     }
     if (position.isNegative()) {
       return this.reject(ctx.symbol, side, 'SELL_EXCEEDS_POSITION', 'cannot sell a short/negative position');
     }
 
-    // Risk-reducing: closing a long. We size to the full held position (the
-    // cross-over strategy's SELL means "exit the long"), never shrinking it by
-    // accident or selling more than we hold.
-    const quantity = position.floorToIncrement(ctx.marketInfo!.quantityTick);
-    if (quantity.isZero()) {
+    // Absolute ceiling: we can never sell more than we hold (no shorting).
+    const capBase = position.floorToIncrement(market.quantityTick);
+    if (capBase.isZero()) {
       return this.reject(ctx.symbol, side, 'BELOW_MIN_QUANTITY', 'position smaller than one quantity tick');
     }
 
-    const marketCheck = this.validateMarketQuantity(ctx, side, quantity);
+    // Default: full exit. With a bounded sellTarget, size to the smaller target.
+    let targetBase = capBase;
+    const sellTarget = ctx.sellTarget == null ? null : ctx.sellTarget;
+    if (sellTarget !== null) {
+      const target = this.resolveSellTarget(ctx, capBase, sellTarget);
+      if (target.approved === false) {
+        return this.reject(ctx.symbol, side, target.reason, target.detail);
+      }
+      targetBase = target.quantity!;
+    }
+
+    if (targetBase.isZero()) {
+      return this.reject(ctx.symbol, side, 'BELOW_MIN_QUANTITY', 'sell target rounds to zero quantity');
+    }
+
+    const marketCheck = this.validateMarketQuantity(ctx, side, targetBase);
     if (marketCheck !== null) return marketCheck;
 
-    const notional = quantity.mul(ctx.price!).floorToIncrement(ctx.marketInfo!.priceTick);
+    const notional = targetBase.mul(price).floorToIncrement(market.priceTick);
     return {
       approved: true,
       symbol: ctx.symbol,
       side,
-      quantity,
+      quantity: targetBase,
       estimatedNotional: notional,
-      price: ctx.price!,
+      price,
       reason: 'APPROVED',
       appliedLimits: limits,
     };
+  }
+
+  /**
+   * Resolve a bounded sell target to a concrete quantity at the price tick,
+   * never exceeding the held position. Returns a rejection for malformed input
+   * (empty target, out-of-range fraction, non-positive notional).
+   */
+  private resolveSellTarget(
+    ctx: RiskContext,
+    capBase: Money,
+    target: { fraction?: number; notional?: Money },
+  ): { approved: false; reason: (typeof RISK_REASON)[number]; detail: string } | { approved: true; quantity: Money } {
+    const price = ctx.price!;
+    const tick = ctx.marketInfo!.quantityTick;
+
+    const hasFraction = target.fraction !== undefined;
+    const hasNotional = target.notional !== undefined;
+    if (!hasFraction && !hasNotional) {
+      return { approved: false, reason: 'INVALID_SELL_TARGET', detail: 'sell target must set fraction and/or notional' };
+    }
+
+    const admitted: Money[] = [capBase];
+    if (hasNotional) {
+      const n = target.notional!;
+      if (!n.isPositive()) {
+        return { approved: false, reason: 'INVALID_SELL_TARGET', detail: 'sell target notional must be positive' };
+      }
+      // size = notional / price, floored to the tick (conservative: never over).
+      admitted.push(n.div(price).floorToIncrement(tick));
+    }
+    if (hasFraction) {
+      const f = target.fraction!;
+      if (!Number.isFinite(f) || f <= 0 || f > 1) {
+        return { approved: false, reason: 'INVALID_SELL_TARGET', detail: 'sell target fraction must be in (0, 1]' };
+      }
+      admitted.push(RiskManager.fractionOf(capBase, f).floorToIncrement(tick));
+    }
+
+    // Binding bound is the smallest (never sell more than the position/target).
+    let binding = admitted[0]!;
+    for (const q of admitted) if (q.compareTo(binding) < 0) binding = q;
+    return { approved: true, quantity: binding };
   }
 
   // --- BUY (opens/increases exposure) ---
@@ -197,7 +295,7 @@ export class RiskManager {
     if (ctx.portfolioExposure === null) {
       return this.reject(ctx.symbol, side, 'UNKNOWN_EXPOSURE');
     }
-    if (ctx.quoteBalance === null) {
+    if (ctx.quoteBalance === null && ctx.deployableQuote === null) {
       return this.reject(ctx.symbol, side, 'UNKNOWN_BALANCE');
     }
 
@@ -208,6 +306,8 @@ export class RiskManager {
     if (drawdownGate !== null) return drawdownGate;
     const cooldownGate = this.checkCooldown(ctx, side, limits);
     if (cooldownGate !== null) return cooldownGate;
+    const openPositionsGate = this.checkMaxOpenPositions(ctx, side);
+    if (openPositionsGate !== null) return openPositionsGate;
 
     // --- Sizing: compute the permitted notional. ---
     const caps = this.computeBuyCaps(ctx, limits);
@@ -229,8 +329,15 @@ export class RiskManager {
 
     const notional = quantity.mul(price).floorToIncrement(market.priceTick);
 
-    // Funding check (fail closed on insufficient available balance).
-    if (ctx.quoteBalance.available.compareTo(notional) < 0) {
+    // Funding check (fail closed on insufficient deployable quote, and reserve
+    // for estimated taker fee — the bot must be able to afford notional + fee).
+    const fee = this.estimatedFee(notional, market);
+    const required = notional.add(fee);
+    const funding = ctx.deployableQuote ?? ctx.quoteBalance?.available ?? null;
+    if (funding === null) {
+      return this.reject(ctx.symbol, side, 'UNKNOWN_BALANCE');
+    }
+    if (funding.compareTo(required) < 0) {
       return this.reject(ctx.symbol, side, 'INSUFFICIENT_BALANCE');
     }
 
@@ -244,6 +351,34 @@ export class RiskManager {
       reason: 'APPROVED',
       appliedLimits: limits,
     };
+  }
+
+  /**
+   * Estimated taker fee in quote currency for a BUY notional. Uses the market's
+   * reported taker fee when present; exact via fixed-point fraction (never
+   * floating-point money). A missing fee model means zero — but a real adapters
+   * report `feeInfo`, and the live engine's balance validation is re-checked
+   * against the exchange as defense-in-depth.
+   */
+  private estimatedFee(notional: Money, market: NonNullable<RiskContext['marketInfo']>): Money {
+    const taker = market.feeInfo?.taker ?? 0;
+    if (taker <= 0) return MoneyValue.zero();
+    return RiskManager.fractionOf(notional, taker);
+  }
+
+  /**
+   * Max-open-positions gate (BUY only). External holdings are NOT open bot
+   * positions; this bounds only bot-managed entries. `0` in config means no
+   * limit. Returns a rejection or null.
+   */
+  private checkMaxOpenPositions(ctx: RiskContext, side: OrderSide): RiskDecision | null {
+    const limit = this.cfg.maxOpenPositions;
+    if (limit <= 0) return null;
+    const count = ctx.openManagedPositionCount ?? 0;
+    if (count >= limit) {
+      return this.reject(ctx.symbol, side, 'MAX_OPEN_POSITIONS');
+    }
+    return null;
   }
 
   /**

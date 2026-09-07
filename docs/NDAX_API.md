@@ -263,6 +263,17 @@ All ✅ from apidoc.ndax.io.
 - **GetOrderStatus** `{ omsId, AccountId, OrderId }` → order object array.
 - **GetAccountTrades** (fills) `{ OMSId, AccountId, StartIndex, Count }` → up to
   200 trades with `price, quantity, value, fee, feeProductId, side, tradeTime…`.
+  ✅ **GET, private, paginated by `StartIndex`/`Count` (max 200), and NOT
+  filterable by `OrderId`** (you must page and match). **Live-verified 2026-09-03**
+  (read-only, `ENABLE_AUTHENTICATED_READS=true`): the adapter's
+  `getAccountTrades()` returned 33 executions; **`executionId`, `tradeId`,
+  `feeProductId`, `orderId`, and the resolved `symbol` were populated on 100% of
+  them, and `executionId` was STABLE across consecutive reads.** In that sample
+  each of the 33 rows mapped to a *distinct* `orderId` (max executions-per-order =
+  1), so **whether one order can produce multiple `executionId` rows is NOT yet
+  confirmed** (no counter-example observed). `GetAccountTrades` exposes only a
+  recent window (Count=200), so a reliable per-`orderId` execution lookup is NOT
+  available from this endpoint alone.
 - **GetOrderFee** `{ omsId, accountId, instrumentId, productId, amount, price,
   orderType, makerTaker, side }` → `{ OrderFee, ProductId }` (fee ≥ 0.01).
 
@@ -390,6 +401,178 @@ endpoint supports a `makerTaker` parameter, so the platform supports the concept
 but the retail published fee is flat 0.20%. Withdrawal/deposit fees are separate
 and not part of trading.
 
+## 7b. Execution identity, fee currency, and OrderId→intent provenance (Gate 9.2, 2026-09-03)
+
+These are the **authored decisions** from the Gate 9.2 verification gate. They are
+documentation-and-live-observation based where noted; they are NOT guarantees.
+
+### executionId / tradeId (RETRAC execution identity candidates)
+
+Observation (live, 33 executions):
+- `executionId` and `tradeId` are BOTH present on every row, are numeric/dense,
+  are unique within the returned window, and `executionId` is **stable across
+  consecutive read-only reads**.
+- They are associated 1:1 with an `orderId` in the sample (each row → one unique
+  `orderId`; max executions-per-order = 1).
+
+What this does and does NOT establish:
+- 🔎 **CORROBORATED but NOT PROVEN**: `executionId` behaves like a persistent,
+  per-execution server id (present, stable, distinct). This is *suitable as the
+  key for the idempotent `applyLiveFill` dedup* in practice.
+- ❌ It does NOT prove universal uniqueness across all orders/time/accounts (only
+  a 33-row sample; no counter-example of an order with multiple executions was
+  observed, so "one order → many executions" is not yet confirmed).
+- ❌ `GetAccountTrades` is paginated (max 200) and NOT filterable by `orderId`, so
+  it is NOT a reliable, indexed way to enumerate ALL executions of a specific
+  order (needed for Model B). **No exactly-once per-fill accounting is claimed.**
+- `tradeId` appears redundant with `executionId` in the sample (both populated,
+  both distinct). It is treated as a secondary/redundant identifier, not the
+  primary execution identity.
+- ⚠️ Both come from `GetAccountTrades` (a full-account, recent-window read), not
+  from `GetOrderStatus`, so they are NOT available "for free" for an arbitrary
+  order without paging the account.
+
+### feeProductId → fee currency
+
+- ✅ `feeProductId` is populated on every executed trade (live-verified).
+- 🔎 `feeProductId` identifies a **product** (asset) via NDAX `GetProducts`
+  (`productId` ↔ `product`/`productFullName`). To resolve whether the fee is
+  charged in the instrument's **base** or **quote**, you must also know the
+  instrument's `product1Id`/`product2Id` (or `product1Symbol`/`product2Symbol`)
+  from `GetInstruments`.
+- ❌ The adapter's `MarketInfo` currently surfaces only `symbol` + `exchangeId`
+  (instrument id) — it does **NOT** expose `product1`/`product2` ids or their
+  symbols, and the adapter does not call `GetProducts`. **Therefore fee currency
+  CANNOT yet be safely derived from `feeProductId` in code.** The manual bridge
+  keeps its fail-closed rule: only an exchange-confirmed quote fee is accounted;
+  base/missing/negative fees fail closed. The `mapOrder` `feeCurrency:'quote'`
+  hardcode remains an UNVERIFIED assumption and MUST be removed before any
+  execution-level fee accounting is trusted.
+- ⚠️ A fee can potentially be charged in an asset OTHER than base/quote
+  (`feeProductId` is an arbitrary product). The adapter must never coerce it.
+
+### OrderId → RETRAC intent provenance
+
+- ❌ **No authoritative NDAX field can prove an order belongs to a RETRAC intent.**
+  `ClientOrderId` may be non-unique; `OrigClOrdId`/`OrigOrderId`/`accountId`/
+  `subAccountId`/`orderOriginator` are not surfaced by the adapter and are not
+  documented to carry a RETRAC-specific value; and there is no field that stores
+  a deterministic RETRAC identifier. Therefore `bindOrderToIntent` is
+  **CONSISTENCY validation, NOT provenance proof** (`provenanceProof` is always
+  `false`). Manual attribution ultimately relies on the operator's explicit
+  acknowledgement, not on a field match.
+
+## 7c. Gate 9.3 — fee currency resolution + per-order enumeration (RESOLUTION, 2026-09-03)
+
+### feeProductId → fee currency: LIVE-VERIFIED WORKING, and the `'quote'` assumption is FALSE
+
+Live-verified read-only (`ENABLE_AUTHENTICATED_READS=true`):
+- `GetProducts` returns **89 products / 89 distinct asset symbols**.
+- The instrument model (`GetInstruments`) exposes explicit **`product1`/`product2`**
+  (base/quote product ids) and **`product1Symbol`/`product2Symbol`**. The adapter
+  now surfaces these on `MarketInfo` (`baseProductId`/`quoteProductId`/
+  `baseProductSymbol`/`quoteProductSymbol`).
+- **Fee currency resolution on 33 real executions: `base=19`, `quote=14`,
+  `other=0`, `unknown=0`, and every `feeProductId` resolved to a named asset**
+  (`BTC`, `DOT`, `ADA`, `XRP`, `SOL`, `ATOM`, … as base; `CAD` as quote).
+
+**Conclusion: NDAX genuinely charges fees in BOTH the base and the quote asset.**
+The previous `feeCurrency = 'quote'` assumption was **unsafe** (58% of this
+account's trades would have been mis-accounted as quote if applied). This is now
+removed: `mapOrder` (order level) and its fills expose `feeCurrency: 'unknown'`
+plus the raw `feeProductId`, and the authoritative currency is resolved via
+`resolveFeeCurrency(feeProductId, symbol)` using `GetProducts` +
+`GetInstruments` product metadata. Only `'base'`/`'quote'` are ever accepted;
+`'other'` / `'unknown'` / missing product fail closed (never converted, never
+assumed quote, and an operator/modelled fee is never authoritative). A zero fee
+is distinguishable from a missing fee by the presence of `feeProductId`.
+
+### GetAccountTrades pagination + per-OrderId enumeration (unverified completeness)
+
+- `GetAccountTrades { OMSId, AccountId, StartIndex, Count }`, `Count` max 200,
+   NO `orderId` filter, NO documented time-range filter, ordering and retention
+   NOT documented.
+- The adapter now pages `StartIndex` by `Count` until a short page (cap 10_000).
+- ⚠️ Because there is no `orderId`/time filter and ordering/retention are
+  undocumented, paging is **best-effort**; if executions arrive between pages the
+  window can shift and a specific order's FULL execution set is **NOT guaranteed**
+  to be enumerated. → **Per-OrderId execution enumeration is NOT a proven,
+  correctness-guaranteed operation.** Live sample (33 executions, executions-per-
+  order max = 1) did **NOT** observe an order with multiple executions, so
+  one-order→many-executions is still unconfirmed.
+
+## 7d. Gate 9.4 — order-level fee currency boundary + executionId usage + manual-CLI safety (2026-09-03)
+
+This is the **architecture freeze + security boundary** for the operator-executed
+manual bridge. It documents what MAY and MAY NOT be claimed. No order placement,
+no CLI, no autonomous loop.
+
+### Order-level NDAX fee currency is `'unknown'` and is NOT resolvable at the order level
+
+`GetOrderStatus` (via `mapOrder`) exposes `Order.feeCurrency = 'unknown'` plus the
+raw `fee` amount. The currency is ONLY authoritatively resolvable at the
+**execution** level: `AccountTrade.feeProductId` → `GetProducts` product → the
+instrument's `product1`/`product2` (base/quote) via `GetInstruments`
+(`resolveFeeProduct`). Because a `GetOrderStatus` read carries no `feeProductId`,
+the order-level fee currency **cannot** be derived and MUST NOT be assumed to be
+`'quote'`. The manual settlement path therefore fails closed
+(`ManualTradeBridge.resolveAuthoritativeFee`) — a base, unknown-, missing, or
+third-asset fee is never converted and never silently treated as quote.
+
+### `executionId` usage classification (verified vs allowed)
+
+- **Verified in live read-only data** (33 executions, read-only): `executionId`
+  and `tradeId` are populated on 100% of rows, distinct within the window,
+  `executionId` **stable across repeated reads**, and each row mapped to a
+  distinct `orderId` in the sample (max executions-per-order = 1 → one-order→many-
+  executions not yet observed). `GetAccountTrades` is paged (Count=200), has **no
+  `orderId`/time filter**, and its ordering/retention are **undocumented**.
+- **Allowed:** display only; evidence correlation; best-effort deduplication.
+- **NOT allowed:** authoritative accounting; exactly-once accounting. Universal
+  uniqueness is unproven (small sample) and per-order enumeration is not
+  correctness-guaranteed, so `executionId` can never be the accounting key.
+  It remains an audit reference only; the manual order-level accounting key is
+  the local `intentId`.
+
+### Identity separation (never conflated)
+
+Order identity (NDAX `OrderId`) ≠ intent identity (local `intentId`) ≠ execution
+identity (`executionId`/`tradeId`) ≠ provenance proof. RETRAC never treats an
+`OrderId` as an execution id, never fabricates an execution id, and never treats
+a consistent `OrderId` as proof that the order belongs to a RETRAC intent.
+
+### Manual CLI safety ("safe with explicit limitations" only)
+
+A future operator CLI is NOT autonomous trading and MUST NOT claim exchange-proven
+provenance or exactly-once live execution. Every operation is classified in
+`docs/DECISIONS.md` §35.8. The dominant NDAX outcome for an order-level manual
+settlement is: evidence is consistent and the order is terminal, BUT the fee
+cannot be proven complete/quote → **no automatic accounting; the intent goes to
+`RECONCILIATION_REQUIRED`, never to an ACCOUNTED/SETTLED state.** The
+state-machine split (`SETTLED` → `ACCOUNTED_WITH_EXCHANGE_VALIDATION` /
+`ACCOUNTED_WITH_OPERATOR_ATTESTATION`, plus a distinct `RECONCILIATION_REQUIRED`)
+is implemented in Gate 9.5 and is the a prerequisite for a truthful CLI. Both
+ACCOUNTED states carry `provenanceProof: false`; neither implies exchange-proven
+provenance, and `RECONCILIATION_REQUIRED` is NOT a synonym for `AMBIGUOUS`.
+
+`supportsOrderPlacement` remains `false`; no SendOrder/CancelOrder; no `.env`
+change.
+
+### Manual CLI (Gate 9.6)
+
+The operator interface is `bot manual` (`src/cli/manual-cmd.ts`), a constrained
+MANUAL EXECUTION BRIDGE. It is NOT a trading terminal: it never places, cancels,
+or modifies an exchange order. The adapter it uses is wrapped in a read-only
+proxy that throws on `placeOrder`/`cancelOrder`, and all reads are limited to the
+read-only surface (`getTicker`, `getOrderBook`, `getMarketInfo`, `getBalances`,
+`getOrderStatus`, `getAccountTrades`, `getMarkets`, and the optional
+`resolveFeeCurrency`). It reports `provenanceProof: false`, distinguishes
+consistency-validation from provenance proof, labels retrieved trade evidence as
+"Observed exchange trade evidence" (not a complete execution record), and fails
+closed on any unaccountable/unknown fee (→ RECONCILIATION_REQUIRED). Exit codes:
+0 = completed safely, 2 = blocked/fail-closed, 1 = error. See
+`docs/DECISIONS.md` §37.
+
 ## 8. Rate limits ⚠️ AMBIGUOUS
 
 Sources disagree (likely different API surfaces):
@@ -496,6 +679,16 @@ Still flagged (not yet exercised against a live account):
 1. **WS `AuthenticateUser` + REST header signing** against a **live account**
    (no official testnet). The read-only verifier `npm run verify:ndax` exercises
    this non-destructively with `ENABLE_AUTHENTICATED_READS=true`.
+   ✅ **2026-09-03**: the header-signing read path is now **live-verified**
+   (GetUserAccounts/GetAccountPositions/GetOpenOrders/GetOrderHistory/
+   GetAccountTrades all returned real data).
+   ⚠️ Still unverified: **`executionId` uniqueness across all executions/time**
+   (only a 33-row sample; an order with multiple executions was not observed), and
+   **whether `GetAccountTrades` can reliably enumerate ALL of one order's
+   executions** (it is paginated, max 200, and not filterable by `orderId`).
+   ⚠️ **`feeProductId`→currency resolution** is NOT implemented: `GetProducts`
+   and the instrument's `product1`/`product2` ids/symbols are not surfaced by the
+   adapter, so fee currency cannot be safely derived yet.
 2. **Testnet availability** — `https://ndaxmarginstaging.cdnhop.net:8443/AP` is
    third-party; no official public testnet documented. No safe non-production
    order-placement path exists.
