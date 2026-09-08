@@ -27,6 +27,7 @@ import type {
   Trade,
 } from '../../src/types.js';
 import type { NewOrder, Order, OrderStatus } from '../../src/order.js';
+import type { ControlledLiveAuthorization } from '../../src/execution/ControlledLiveAuthorization.js';
 import type { ExchangeAdapter, ExchangeHealth, PlaceOrderResult, CancelResult } from '../../src/exchanges/ExchangeAdapter.js';
 import { ExchangeCapabilities, NO_CAPABILITIES } from '../../src/exchanges/types.js';
 import {
@@ -264,7 +265,7 @@ export class FakeExchange implements ExchangeAdapter {
     return [...this.markets.values()];
   }
 
-  async placeOrder(order: NewOrder): Promise<PlaceOrderResult> {
+  async placeOrder(order: NewOrder, _authorization?: ControlledLiveAuthorization): Promise<PlaceOrderResult> {
     this.maybeFail('placeOrder');
     this.submittedOrders.push(order);
 

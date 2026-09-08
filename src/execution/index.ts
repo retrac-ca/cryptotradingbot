@@ -19,6 +19,17 @@ export type {
 } from './PaperExecutionTypes.js';
 export { LiveOrderEngine, LiveGateError } from './LiveExecutionEngine.js';
 export type { LiveGate, LiveExecutionConfig, LiveOrderResult, RecoveryResult } from './LiveExecutionEngine.js';
+export { LiveOrderMonitor } from './LiveOrderMonitor.js';
+export type { LiveOrderMonitorDeps, LiveMonitorReport, LiveMonitorTransition } from './LiveOrderMonitor.js';
+export {
+  createControlledLiveAuthorization,
+  isControlledLiveAuthorization,
+  isControlledLiveOrder,
+} from './ControlledLiveAuthorization.js';
+export type {
+  ControlledLiveAuthorization,
+  ControlledLiveScope,
+} from './ControlledLiveAuthorization.js';
 export { classifyReattachment, isProvableReattachmentMatch } from './recovery.js';
 export type {
   ReattachmentOutcome,

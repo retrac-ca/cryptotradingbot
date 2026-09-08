@@ -237,6 +237,39 @@ tested, but the NDAX adapter refuses real order placement
 (`supportsOrderPlacement=false`) until its order semantics and private-header
 signing are verified against a live account. Live mode fails closed.
 
+**Controlled LIVE scope (readiness only).** The software now enforces a tightly
+bounded controlled LIVE workflow as groundwork, but this does **not** authorize
+live trading. PAPER remains the default and safe mode; autonomous NDAX LIVE
+order placement is still disabled (`supportsOrderPlacement=false`). Within that
+bounded scope: LIVE **market orders remain disabled** (worst-case execution
+price is not currently bounded); only **LIMIT orders** with an explicit price are
+permitted, capped by `LIVE_MAX_BASE_QUANTITY` and `LIVE_MAX_QUOTE_NOTIONAL`;
+**at most one unresolved live order** may exist at a time; **UNKNOWN** orders
+always require reconciliation and are never auto-retried; **automatic
+cancellation is disabled**. This is not authorization for unrestricted LIVE
+trading.
+
+**Controlled-test mutation arming (readiness only).** The only way the software
+can reach `SendOrder` today is via the explicit `bot live-test sell` path, which
+creates a narrowly-scoped **controlled-test authorization** (SELL + LIMIT only,
+bounded by `LIVE_MAX_BASE_QUANTITY` / `LIVE_MAX_QUOTE_NOTIONAL`) after the
+operator interactively confirms the displayed order by typing `EXECUTE`. This
+authorization is **not** autonomous live trading, is **not** a generic "live
+enabled" flag, and is required at both the engine and the adapter layer; it can
+never produce a BUY or MARKET order. `NdaxAdapter.supportsOrderPlacement` remains
+`false`. The first real order, if ever performed, is simultaneously the NDAX
+production-mutation proof; execution completeness remains a permanent limitation
+and reconciliation remains mandatory when evidence is insufficient.
+
+**Bounded LIVE lifecycle monitor (readiness only).** A read-only
+`bot live-monitor` command observes unresolved LIVE orders and advances their
+local state only on verified exchange evidence. It **never submits or cancels**
+an order, never retries an ambiguous submission, never fabricates a fill, and
+never enables live trading; UNKNOWN orders without an exchange OrderId remain
+fail-closed and require operator reconciliation. Execution completeness remains
+unresolved. This is infrastructure for future controlled LIVE validation, not
+authorization for unrestricted trading.
+
 ## Known Limitations
 
 These are documented limitations that do **not** invalidate the PAPER-first V1,

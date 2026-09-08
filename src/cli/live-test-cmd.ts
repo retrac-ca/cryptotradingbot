@@ -36,6 +36,7 @@ import { loadConfig } from '../config/load.js';
 import { createExchange } from '../exchanges/index.js';
 import type { ExchangeAdapter } from '../exchanges/ExchangeAdapter.js';
 import { LiveOrderEngine } from '../execution/LiveExecutionEngine.js';
+import { createControlledLiveAuthorization } from '../execution/ControlledLiveAuthorization.js';
 import type { Logger } from '../logging/logger.js';
 import { evaluateFreshness, isValidEpochMs } from '../marketdata/index.js';
 import type { FreshnessPolicy } from '../marketdata/index.js';
@@ -143,9 +144,10 @@ function evaluateGates(cfg: BotConfig, opts: LiveTestOptions, adapter: ExchangeA
     { label: 'authenticated reads enabled', passed: cfg.enableAuthenticatedReads, detail: 'must be true' },
     { label: 'exactly one trading pair', passed: cfg.tradingPairs.length === 1, detail: `pairs=${cfg.tradingPairs.length}` },
     {
-      label: 'adapter supports order placement',
-      passed: adapter.capabilities.supportsOrderPlacement,
-      detail: `supportsOrderPlacement=${adapter.capabilities.supportsOrderPlacement}`,
+      label: 'controlled-test mutation authorization available (supportsOrderPlacement stays false)',
+      passed: cfg.liveMaxBaseQuantity > 0 && cfg.liveMaxQuoteNotional > 0,
+      detail: `maxBase=${cfg.liveMaxBaseQuantity}, maxQuote=${cfg.liveMaxQuoteNotional}; ` +
+        `the adapter still reports supportsOrderPlacement=${adapter.capabilities.supportsOrderPlacement}`,
     },
   ];
 }
@@ -257,6 +259,7 @@ export interface LiveSnapshot {
   market: MarketInfo;
   balances: Balance[];
   observedAtMs: number;
+  /** Chosen exchange quote timestamp for freshness: L2 ActionDateTime when valid, else L1 TimeStamp, else null. */
   quoteTs: number | null;
   freshness: ReturnType<typeof evaluateFreshness>;
 }
@@ -270,10 +273,13 @@ interface FetchSnapshotDeps {
 /**
  * Fetch a fresh market/account snapshot and compute freshness.
  *
- * F-3/F-8: the freshness basis is the L1 ticker timestamp — the source of the
- * actual execution price (bid/ask). We NEVER let an unrelated L2 timestamp
- * rescue a missing or stale L1 price, and a missing exchange timestamp is `null`
- * (freshness fails closed as QUOTE_MISSING), never a fabricated local time.
+ * F-3/F-8: the quote-freshness basis is the L2 order-book `ActionDateTime`
+ * (`bookQuoteTs`) when available — it advances with actual book/quote updates.
+ * The NDAX L1 `TimeStamp` is a last-trade/session timestamp that can lag the
+ * quote, so it is used ONLY as a fallback when no valid L2 book timestamp is
+ * available. Missing/invalid both is `null` (freshness fails closed as
+ * QUOTE_MISSING), never a fabricated local time. The local observation time is
+ * tracked independently for the transport-age check.
  */
 export async function fetchLiveSnapshot(deps: FetchSnapshotDeps, symbol: string): Promise<LiveSnapshot> {
   const { adapter, nowMs, policy } = deps;
@@ -295,7 +301,12 @@ export async function fetchLiveSnapshot(deps: FetchSnapshotDeps, symbol: string)
     throw new Error('failed to fetch market/account data before any order: ' + (e instanceof Error ? e.message : String(e)));
   }
   const observedAtMs = nowMs();
-  const quoteTs = isValidEpochMs(ticker.timestampMs) ? ticker.timestampMs : null;
+  // F-3/F-8: prefer the L2 order-book ActionDateTime (real book/quote freshness);
+  // fall back to the L1 ticker TimeStamp only when the L2 book timestamp is
+  // missing/invalid. Never fabricate a local time.
+  const bookTs = isValidEpochMs(bookQuoteTs) ? bookQuoteTs : null;
+  const l1Ts = isValidEpochMs(ticker.timestampMs) ? ticker.timestampMs : null;
+  const quoteTs = bookTs ?? l1Ts;
   const freshness = evaluateFreshness({ nowMs: observedAtMs, quoteTimestampMs: quoteTs, observedAtMs, policy });
   return { symbol, ticker, bookQuoteTs, market, balances, observedAtMs, quoteTs, freshness };
 }
@@ -551,11 +562,28 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
     freshnessPolicy: policy,
   });
 
+  // Only AFTER operator confirmation and a fresh snapshot do we arm the
+  // controlled-test mutation authorization. This is the explicit, narrowly-scoped
+  // gate that lets the controlled SELL/LIMIT path reach the adapter's placeOrder.
+  const controlledAuth = createControlledLiveAuthorization({
+    side: 'SELL',
+    type: 'limit',
+    maxBaseQuantity: Money.fromNumber(cfg.liveMaxBaseQuantity),
+    maxQuoteNotional: Money.fromNumber(cfg.liveMaxQuoteNotional),
+  });
+
   const engine = new LiveOrderEngine(adapter, deps.store, deps.reconcile, deps.riskManager, {
     gate: { tradingMode: 'live', realFundsAtRisk: cfg.realFundsAtRisk },
     killSwitch: cfg.killSwitch,
+    // Controlled LIVE scope: only LIMIT orders are permitted. These caps are
+    // enforced before submission. LIVE market orders remain disabled.
+    maxLiveQuoteNotional: Money.fromNumber(cfg.liveMaxQuoteNotional),
+    maxLiveBaseQuantity: Money.fromNumber(cfg.liveMaxBaseQuantity),
+    controlledLiveAuthorization: controlledAuth,
   });
-  const result = await engine.place(freshCtx, { reason });
+  // Explicit LIMIT order: the reference price (bid for a SELL) is the hard
+  // exchange-side bound — the order can never execute worse than this price.
+  const result = await engine.place(freshCtx, { reason, type: 'limit', price: freshCtx.price ?? undefined });
 
   if (result.order.status === 'REJECTED') {
     err('\nlive-test: order rejected by the exchange/live engine: ' + result.message + '\n  No retry. Run `bot reconcile` / `bot trades` if needed.');

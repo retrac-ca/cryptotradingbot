@@ -75,6 +75,11 @@ function riskContext(overrides: Partial<RiskContext> = {}, price = '40000'): Ris
   };
 }
 
+const LIMIT_PRICE = Money.fromString('40000');
+function limitIntent(reason: string, extra: Partial<import('../../../src/execution/LiveExecutionEngine.js').LiveOrderIntent> = {}): import('../../../src/execution/LiveExecutionEngine.js').LiveOrderIntent {
+  return { reason, type: 'limit', price: LIMIT_PRICE, ...extra };
+}
+
 function buildEngine(
   exchange: FakeExchange,
   cfg: { killSwitch?: boolean; ackTimeoutMs?: number } = {},
@@ -90,6 +95,8 @@ function buildEngine(
     gate,
     killSwitch: cfg.killSwitch ?? false,
     ackTimeoutMs: cfg.ackTimeoutMs,
+    maxLiveQuoteNotional: Money.fromString('1000000'),
+    maxLiveBaseQuantity: Money.fromString('100'),
   });
 }
 
@@ -97,7 +104,8 @@ function newOrder(partial: Partial<NewOrder> = {}): NewOrder {
   return {
     symbol: 'BTC/CAD',
     side: 'BUY',
-    type: 'market',
+    type: 'limit',
+    price: Money.fromString('40000'),
     quantity: Money.fromString('0.1'),
     clientOrderId: 'c1',
     reason: 'test',
@@ -114,6 +122,8 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     expect(() => new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), {
       gate: { tradingMode: 'live', realFundsAtRisk: false },
       killSwitch: false,
+      maxLiveQuoteNotional: Money.fromString('1000000'),
+      maxLiveBaseQuantity: Money.fromString('100'),
     })).toThrow(LiveGateError);
   });
 
@@ -123,7 +133,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     (exchange.capabilities as { supportsOrderPlacement: boolean }).supportsOrderPlacement = false;
     const store = new OrderStore(LEDGER);
     const service = new ReconcileService(exchange, store);
-    expect(() => new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), { gate, killSwitch: false })).toThrow(LiveGateError);
+    expect(() => new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), { gate, killSwitch: false, maxLiveQuoteNotional: Money.fromString('1000000'), maxLiveBaseQuantity: Money.fromString('100') })).toThrow(LiveGateError);
   });
 
   it('applies the kill switch and refuses to construct when active', () => {
@@ -136,7 +146,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
   it('routes every placement through RiskManager and submits the risk-approved order', async () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     const engine = buildEngine(exchange);
-    const result = await engine.place(riskContext(), { reason: 'test' });
+    const result = await engine.place(riskContext(), limitIntent('test'));
     expect(result.order.status).toBe('SUBMITTED');
     expect(result.order.quantity.isPositive()).toBe(true);
     expect(result.unknownOutcome).toBe(false);
@@ -155,7 +165,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
         currentPosition: Money.fromString('0.25'),
         sellTarget: { notional: Money.fromString('1000') },
       }),
-      { reason: 'test-partial-sell' },
+      limitIntent('test-partial-sell'),
     );
     expect(result.order.status).toBe('SUBMITTED');
     expect(result.unknownOutcome).toBe(false);
@@ -171,7 +181,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     const risk = new RiskManager(riskConfig());
     risk.setKillSwitch(true); // definite rejection path
     const engine = buildEngine(exchange, {}, risk);
-    const result = await engine.place(riskContext(), { reason: 'test' });
+    const result = await engine.place(riskContext(), limitIntent('test'));
     expect(result.order.status).toBe('REJECTED');
     expect(result.unknownOutcome).toBe(false);
     expect(exchange.submittedOrders).toHaveLength(0);
@@ -180,7 +190,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
   it('rejects when RiskManager fails closed on stale market data (no exchange contact)', async () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     const engine = buildEngine(exchange);
-    const result = await engine.place(riskContext({ marketDataTimestampMs: 0 }), { reason: 'test' });
+    const result = await engine.place(riskContext({ marketDataTimestampMs: 0 }), limitIntent('test'));
     expect(result.order.status).toBe('REJECTED');
     expect(result.unknownOutcome).toBe(false);
     expect(exchange.submittedOrders).toHaveLength(0);
@@ -192,7 +202,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     const engine = buildEngine(exchange);
     const before = new OrderStore(LEDGER).allOrders().size;
-    const result = await engine.place(riskContext(), { reason: 'test' });
+    const result = await engine.place(riskContext(), limitIntent('test'));
     expect(result.order.status).toBe('SUBMITTED');
     expect(new OrderStore(LEDGER).allOrders().size).toBe(before + 1);
     expect(exchange.submittedOrders).toHaveLength(1);
@@ -273,7 +283,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     exchange.setFailures({ placeOrder: { kind: 'timeout' } });
     const engine = buildEngine(exchange);
-    const result = await engine.place(riskContext(), { reason: 'test' });
+    const result = await engine.place(riskContext(), limitIntent('test'));
     expect(result.unknownOutcome).toBe(true);
     expect(result.order.status).toBe('UNKNOWN');
     // A timeout occurred at the ack boundary; there is no auto-retry, so the
@@ -288,7 +298,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
       unknownOrderSubmissions: true,
     });
     const engine = buildEngine(exchange);
-    const result = await engine.place(riskContext(), { reason: 'test' });
+    const result = await engine.place(riskContext(), limitIntent('test'));
     expect(result.unknownOutcome).toBe(true);
     expect(result.order.status).toBe('UNKNOWN');
     expect(new OrderStore(LEDGER).allOrders().size).toBeGreaterThan(0);
@@ -298,7 +308,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     exchange.setFailures({ placeOrder: { kind: 'rejected' } });
     const engine = buildEngine(exchange);
-    const result = await engine.place(riskContext(), { reason: 'test' });
+    const result = await engine.place(riskContext(), limitIntent('test'));
     expect(result.unknownOutcome).toBe(false);
     expect(result.order.status).toBe('REJECTED');
     expect(exchange.submittedOrders).toHaveLength(0);
@@ -309,7 +319,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
   it('treats an exchange ack as SUBMITTED (not on-book) until reconciliation confirms it', async () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     const engine = buildEngine(exchange);
-    const result = await engine.place(riskContext(), { reason: 'test' });
+    const result = await engine.place(riskContext(), limitIntent('test'));
     // SendOrder's async ack only proves receipt; the engine stores SUBMITTED.
     expect(result.order.status).toBe('SUBMITTED');
     expect(result.order.exchangeOrderId).not.toBeNull();
@@ -327,7 +337,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
       unknownOrderSubmissions: true,
     });
     const engine = buildEngine(exchange);
-    const result = await engine.place(riskContext(), { reason: 'test' });
+    const result = await engine.place(riskContext(), limitIntent('test'));
     expect(result.unknownOutcome).toBe(true);
     expect(result.order.status).toBe('UNKNOWN');
     expect(result.order.exchangeOrderId).toBeNull();
@@ -342,22 +352,24 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     expect(exchange.submittedOrders).toHaveLength(0);
   });
 
-  it('rejects an unsupported (non-market) live order type rather than silently converting it', async () => {
+  it('rejects a LIVE market order type (never silently converts MARKET → LIMIT)', async () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     const engine = buildEngine(exchange);
-    await expect(engine.place(riskContext(), { reason: 'test', type: 'limit' })).rejects.toThrow(
-      /unsupported live order type "limit"/,
+    await expect(engine.place(riskContext(), limitIntent('test', { type: 'market' }))).rejects.toThrow(
+      /NDAX LIVE market orders are disabled/,
     );
-    // No order was submitted and nothing was persisted for a non-existent order.
+    // No order was submitted and nothing was persisted for a rejected type.
     expect(exchange.submittedOrders).toHaveLength(0);
     expect(new OrderStore(LEDGER).allOrders().size).toBe(0);
   });
 
-  it('explicitly declares a market order type and submits it (no silent default ambiguity)', async () => {
+  it('explicitly declares a LIMIT order type and submits it (no silent default ambiguity)', async () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     const engine = buildEngine(exchange);
-    const result = await engine.place(riskContext(), { reason: 'test', type: 'market' });
-    expect(result.order.type).toBe('market');
+    const result = await engine.place(riskContext(), limitIntent('test'));
+    expect(result.order.type).toBe('limit');
     expect(result.order.status).toBe('SUBMITTED');
+    // The limit price is carried through to the submitted order (hard bound).
+    expect(exchange.submittedOrders[0]!.price?.toString()).toBe('40000.00000000');
   });
 });

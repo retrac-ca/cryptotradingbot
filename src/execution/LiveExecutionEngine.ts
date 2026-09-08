@@ -45,6 +45,7 @@ import { randomUUID } from 'node:crypto';
 import { Money } from '../money/Money.js';
 import type { NewOrder, Order, OrderStatus, OrderType } from '../order.js';
 import type { ExchangeAdapter } from '../exchanges/ExchangeAdapter.js';
+import type { MarketInfo } from '../types.js';
 import {
   NetworkError,
   TimeoutError,
@@ -59,6 +60,10 @@ import type { RiskApproval, RiskRejection } from '../risk/Reason.js';
 import type { RiskContext } from '../risk/RiskContext.js';
 import { classifyReattachment } from './recovery.js';
 import type { ReattachmentPolicy } from './recovery.js';
+import {
+  isControlledLiveAuthorization,
+  type ControlledLiveAuthorization,
+} from './ControlledLiveAuthorization.js';
 
 export interface LiveGate {
   tradingMode: 'live';
@@ -80,18 +85,44 @@ export interface LiveExecutionConfig {
    * Exchange-agnostic: a future exchange declaring uniqueness may set it.
    */
   reattachmentClientOrderIdIsUnique?: boolean;
+  /**
+   * Hard upper bound on the total quote notional a single controlled LIVE order
+   * may expose (for a LIMIT BUY: quantity × limitPrice + a conservative quote
+   * fee). Evaluated BEFORE submission. LIVE market orders are disabled, so this
+   * is always the LIMIT-order worst-case. Must be a positive, fixed-point value.
+   */
+  maxLiveQuoteNotional: Money;
+  /**
+   * Hard upper bound on the base quantity of a single controlled LIVE order
+   * (defense-in-depth on top of risk sizing). Positive, fixed-point.
+   */
+  maxLiveBaseQuantity: Money;
+  /**
+   * An explicit, narrowly-scoped controlled-test authorization. When present and
+   * valid, it permits the engine to operate for the controlled SELL/LIMIT test
+   * even though the adapter reports `supportsOrderPlacement=false`. It is NOT a
+   * generic live-enable flag; it is created only by the controlled live-test
+   * path and is passed to the adapter's `placeOrder`.
+   */
+  controlledLiveAuthorization?: ControlledLiveAuthorization;
 }
 
 export interface LiveOrderIntent {
   /** Human reason this order is being placed, for auditability. */
   reason: string;
   /**
-   * The order type to submit. The live path only safely supports `'market'`
-   * (no limit price flows from the risk approval), so any other type is
-   * REJECTED rather than silently converted. Defaults to `'market'` for
-   * backward compatibility with existing callers.
+   * The explicit order type. For the controlled LIVE scope only `'limit'` is
+   * permitted; a LIVE `'market'` order (or an omitted type) is REJECTED rather
+   * than silently defaulted or converted. There is NO default-to-market path
+   * that can reach live submission.
    */
-  type?: OrderType;
+  type: OrderType;
+  /**
+   * Required for a LIMIT order: the hard exchange-side price bound (the maximum
+   * price for a BUY, the minimum price for a SELL). Never rounded to be more
+   * aggressive. Ignored for non-limit types.
+   */
+  price?: Money;
 }
 
 export interface LiveOrderResult {
@@ -123,7 +154,10 @@ export class LiveOrderEngine {
   private readonly store: OrderStore;
   private readonly reconcileService: ReconcileService;
   private readonly riskManager: RiskManager;
-  private readonly cfg: Required<LiveExecutionConfig>;
+  private readonly cfg: LiveExecutionConfig & {
+    ackTimeoutMs: number;
+    reattachmentClientOrderIdIsUnique: boolean;
+  };
 
   constructor(
     adapter: ExchangeAdapter,
@@ -157,7 +191,14 @@ export class LiveOrderEngine {
     if (this.cfg.killSwitch) {
       throw new LiveGateError('kill switch is active; live order placement is disabled');
     }
-    if (!this.adapter.capabilities.supportsOrderPlacement) {
+    if (this.cfg.controlledLiveAuthorization) {
+      // Controlled-LIVE test: an explicit, narrowly-scoped authorization permits
+      // the controlled SELL/LIMIT path even though the adapter reports
+      // `supportsOrderPlacement=false`. Validate it is genuine.
+      if (!isControlledLiveAuthorization(this.cfg.controlledLiveAuthorization)) {
+        throw new LiveGateError('invalid controlled-live authorization');
+      }
+    } else if (!this.adapter.capabilities.supportsOrderPlacement) {
       throw new LiveGateError(
         `exchange adapter ${this.adapter.id} does not support order placement; live trading is unavailable`,
       );
@@ -229,14 +270,25 @@ export class LiveOrderEngine {
     approval: RiskApproval,
     intent: LiveOrderIntent,
   ): NewOrder {
-    // The order type is explicit on the intent. The live path only safely
-    // supports 'market' (there is no limit price flowing from the risk approval),
-    // so an unsupported type is REJECTED rather than silently converted to a
-    // market order.
-    const type = intent.type ?? 'market';
-    if (type !== 'market') {
+    // Controlled LIVE scope: only LIMIT is permitted. There is NO default-to-
+    // market path; an omitted type or a market order is rejected, never silently
+    // converted or defaulted.
+    const type = intent.type;
+    if (type === undefined) {
       throw new LiveGateError(
-        `unsupported live order type "${type}"; only "market" is supported — refusing to silently convert an order type`,
+        'live order type is required; only LIMIT is supported for controlled LIVE orders',
+      );
+    }
+    if (type !== 'limit') {
+      throw new LiveGateError(
+        'NDAX LIVE market orders are disabled because worst-case execution price is not ' +
+          'currently bounded; only LIMIT orders are permitted',
+      );
+    }
+    const price = intent.price;
+    if (!price || !price.isPositive()) {
+      throw new LiveGateError(
+        'a LIVE LIMIT order requires an explicit positive limit price',
       );
     }
     return {
@@ -245,6 +297,7 @@ export class LiveOrderEngine {
       side: approval.side,
       type,
       quantity: approval.quantity,
+      price,
       reason: intent.reason,
     };
   }
@@ -254,6 +307,10 @@ export class LiveOrderEngine {
    * the adapter (via placeOrder). Never retries ambiguous outcomes.
    */
   private async submit(order: NewOrder): Promise<LiveOrderResult> {
+    // One-in-flight LIVE guard: the controlled scope allows at most one
+    // unresolved live order. This is evaluated before submission and reads the
+    // durable order ledger, so it survives restart.
+    this.assertNoUnresolvedLiveOrder();
     await this.validateOrder(order);
 
     // Persist-before-submit: claim the internally-generated clientOrderId.
@@ -268,7 +325,7 @@ export class LiveOrderEngine {
     this.store.save(created);
 
     try {
-      const result = await this.withAckTimeout(order, this.adapter.placeOrder(order));
+      const result = await this.withAckTimeout(order, this.adapter.placeOrder(order, this.cfg.controlledLiveAuthorization));
       if (result.unknownOutcome) {
         const unknown = this.buildRecorded(order, 'UNKNOWN', result.exchangeOrderId ?? null);
         this.store.save(unknown);
@@ -427,14 +484,29 @@ export class LiveOrderEngine {
   // ---- internals ----
 
   /**
-   * Validate an order against market constraints before submission. Public only
-   * as a test seam; the engine always validates internally before placing.
+   * Validate an order against market + controlled-scope constraints before
+   * submission. Public only as a test seam; the engine always validates
+   * internally before placing.
    */
   async validateOrder(order: NewOrder): Promise<void> {
+    // Controlled LIVE scope: only LIMIT is permitted. LIVE market orders are
+    // disabled because the worst-case execution price is not currently bounded.
+    if (order.type !== 'limit') {
+      throw new LiveGateError(
+        'NDAX LIVE market orders are disabled because worst-case execution price is not ' +
+          'currently bounded; only LIMIT orders are permitted',
+      );
+    }
     if (!order.quantity.isPositive()) {
       throw new LiveGateError('order quantity must be positive');
     }
     const market = await this.adapter.getMarketInfo(order.symbol);
+    // Max base quantity (defense-in-depth cap for the controlled scope).
+    if (order.quantity.compareTo(this.cfg.maxLiveBaseQuantity) > 0) {
+      throw new LiveGateError(
+        `live order quantity ${order.quantity} exceeds maximum live base quantity ${this.cfg.maxLiveBaseQuantity}`,
+      );
+    }
     // Quantity on the tick grid.
     const qty = order.quantity;
     if (!market.quantityTick.isZero() && !qty.isMultipleOf(market.quantityTick)) {
@@ -446,18 +518,31 @@ export class LiveOrderEngine {
     if (market.minOrderBase && qty.compareTo(market.minOrderBase) < 0) {
       throw new LiveGateError(`quantity below minimum order size ${market.minOrderBase.toString()}`);
     }
-    // Limit price on the tick grid.
-    if (order.type === 'limit') {
-      if (!order.price || !order.price.isPositive()) {
-        throw new LiveGateError('limit order requires a positive price');
-      }
-      if (!market.priceTick.isZero() && !order.price.isMultipleOf(market.priceTick)) {
+    // LIMIT price: explicit, positive, on the tick grid. This is the hard
+    // exchange-side bound (max for BUY, min for SELL) — it is never rounded to be
+    // more aggressive.
+    if (!order.price || !order.price.isPositive()) {
+      throw new LiveGateError('limit order requires a positive price');
+    }
+    if (!market.priceTick.isZero() && !order.price.isMultipleOf(market.priceTick)) {
+      throw new LiveGateError(
+        `limit price ${order.price.toString()} is not a multiple of price tick ${market.priceTick.toString()}`,
+      );
+    }
+    if (market.minOrderQuote && order.price.mul(qty).compareTo(market.minOrderQuote) < 0) {
+      throw new LiveGateError(`order notional below minimum order size`);
+    }
+    // Max quote notional (BUY): quantity × limitPrice + conservative quote fee,
+    // evaluated BEFORE submission using the explicit limit price (never an
+    // estimated market price).
+    if (order.side === 'BUY') {
+      const notional = order.quantity.mul(order.price);
+      const fee = this.estimateQuoteFee(notional, market);
+      const exposure = notional.add(fee);
+      if (exposure.compareTo(this.cfg.maxLiveQuoteNotional) > 0) {
         throw new LiveGateError(
-          `limit price ${order.price.toString()} is not a multiple of price tick ${market.priceTick.toString()}`,
+          `live BUY exposure ${exposure} exceeds maximum live quote notional ${this.cfg.maxLiveQuoteNotional}`,
         );
-      }
-      if (market.minOrderQuote && order.price.mul(qty).compareTo(market.minOrderQuote) < 0) {
-        throw new LiveGateError(`order notional below minimum order size`);
       }
     }
     // Balance availability for BUY (quote) / SELL (base).
@@ -490,8 +575,33 @@ export class LiveOrderEngine {
     }
   }
 
-  /** Run placeOrder but fail closed on timeout at the ack boundary. */
-  private async withAckTimeout<T>(order: NewOrder, p: Promise<T>): Promise<T> {
+  /** Conservative worst-case quote fee using the market's declared taker rate. */
+  private estimateQuoteFee(notional: Money, market: MarketInfo): Money {
+    const taker = market.feeInfo?.taker ?? 0;
+    if (taker <= 0) return Money.zero();
+    return notional.mulFraction(BigInt(Math.round(taker * 1_000_000_000)), 1_000_000_000n);
+  }
+
+  /**
+   * One-in-flight LIVE guard (controlled scope): reject a new LIVE order while an
+   * unresolved live order exists in the durable ledger. "Unresolved" includes
+   * SUBMITTED / OPEN / PARTIALLY_FILLED / UNKNOWN (an UNKNOWN order is what a
+   * reconciliation-required order is recorded as). Only live-prefixed orders are
+   * considered, so unrelated ledger entries (e.g. seeded fixtures) never block.
+   */
+  private assertNoUnresolvedLiveOrder(): void {
+    const unresolved: ReadonlySet<OrderStatus> = new Set(['SUBMITTED', 'OPEN', 'PARTIALLY_FILLED', 'UNKNOWN']);
+    for (const o of this.store.allOrders().values()) {
+      if (o.clientOrderId.startsWith('live-') && unresolved.has(o.status)) {
+        throw new LiveGateError(
+          `refusing to place a new LIVE order: unresolved LIVE order ${o.clientOrderId} (${o.status}) exists; ` +
+            'the controlled LIVE scope allows at most one in-flight live order',
+        );
+      }
+    }
+  }
+
+  /** Run placeOrder but fail closed on timeout at the ack boundary. */  private async withAckTimeout<T>(order: NewOrder, p: Promise<T>): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
       timer = setTimeout(

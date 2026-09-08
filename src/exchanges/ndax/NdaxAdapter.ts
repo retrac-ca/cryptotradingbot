@@ -51,13 +51,14 @@ import {
 import { mapAccountTrades } from './tradeMappings.js';
 import { resolveFeeProduct, type FeeAssetResolution } from './feeResolver.js';
 import type { AccountTrade, AssetProduct } from '../../types.js';
-import {
-  mapCancelOrderResponse,
+import { mapCancelOrderResponse,
   mapSendOrderResponse,
   toNdaxCancelOrderRequest,
   toNdaxSendOrderRequest,
 } from './orderMappings.js';
 import { ndaxSignature } from './signing.js';
+import { isControlledLiveOrder } from '../../execution/ControlledLiveAuthorization.js';
+import type { ControlledLiveAuthorization } from '../../execution/ControlledLiveAuthorization.js';
 
 export interface NdaxCredentials {
   apiKey: string;
@@ -408,8 +409,8 @@ export class NdaxAdapter implements ExchangeAdapter {
    * authenticated reads are enabled. `capabilities.supportsOrderPlacement`
    * stays false, so the live engine never reaches this path.
    */
-  async placeOrder(order: NewOrder): Promise<PlaceOrderResult> {
-    this.assertOrderPlacementEnabled();
+  async placeOrder(order: NewOrder, authorization?: ControlledLiveAuthorization): Promise<PlaceOrderResult> {
+    this.assertOrderPlacementEnabled(authorization, order);
     const auth = await this.requireAuth();
     const market = await this.getMarketInfo(order.symbol);
     const body = toNdaxSendOrderRequest(order, market, auth.accountId);
@@ -462,15 +463,21 @@ export class NdaxAdapter implements ExchangeAdapter {
     return String(nonce);
   }
 
-  /** Refuse order placement unless the internal test-only switch is armed. */
-  private assertOrderPlacementEnabled(): void {
-    if (!this.enableOrderPlacement) {
-      throw new OrderRejectedError(
-        'NDAX order placement is disabled. The SendOrder/CancelOrder network ' +
-          'paths are implemented but not enabled: supportsOrderPlacement remains ' +
-          'false and live trading fails closed.',
-      );
-    }
+  /** Refuse order placement unless armed, or an explicit controlled-test authorization is present. */
+  private assertOrderPlacementEnabled(
+    authorization?: ControlledLiveAuthorization,
+    order?: NewOrder,
+  ): void {
+    // Existing fully-armed path (internal test switch only — never set via config).
+    if (this.enableOrderPlacement) return;
+    // Explicit, narrowly-scoped controlled-test authorization: SELL + LIMIT only.
+    if (authorization && order && isControlledLiveOrder(order, authorization)) return;
+    throw new OrderRejectedError(
+      'NDAX order placement is disabled. The SendOrder/CancelOrder network ' +
+        'paths are implemented but not enabled: supportsOrderPlacement remains ' +
+        'false and live trading fails closed. Only the explicitly-authorized ' +
+        'controlled LIMIT-only SELL test may reach SendOrder.',
+    );
   }
 
   private async requireAuth(): Promise<{ accountId: number }> {

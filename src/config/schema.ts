@@ -118,6 +118,17 @@ export const botConfigSchema = z.object({
   maxClockSkewMs: z.coerce.number().int().min(0).default(120000),
   paperStartingBalance: z.coerce.number().positive().default(10000),
 
+  // --- Controlled LIVE scope (NDAX LIVE-readiness) ---
+  // Bounds for the initial operator-confirmed LIVE workflow. LIVE MARKET orders
+  // are disabled (only LIMIT is permitted); these caps are enforced before any
+  // LIVE submission. They do NOT enable autonomous live trading.
+  // Max base quantity for a single controlled LIVE order.
+  liveMaxBaseQuantity: z.coerce.number().positive().default(0.01),
+  // Max quote notional for a single controlled LIVE LIMIT BUY (qty × limitPrice + fee).
+  liveMaxQuoteNotional: z.coerce.number().positive().default(100),
+  // Read-only LIVE lifecycle-monitor polling interval (seconds). Conservative floor.
+  liveMonitorIntervalSeconds: z.coerce.number().int().min(5).default(30),
+
   // --- Paper execution / engine (Phase 8) ---
   // Paper fill/fee/slippage realism knobs. 0 disables the respective effect.
   paperFeeFraction: fractionZeroToOne.default(0.0005),

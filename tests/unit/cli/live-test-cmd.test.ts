@@ -10,11 +10,13 @@ import type { BotConfig } from '../../../src/config/schema.js';
 import { FakeExchange } from '../../fakes/FakeExchange.js';
 import {
   executeLiveTest,
+  fetchLiveSnapshot,
   loadLiveManagedPortfolio,
   LIVE_TEST_DEFAULT_TARGET_CAD,
   LIVE_TEST_MAX_TARGET_CAD,
   parseLiveTestArgs,
 } from '../../../src/cli/live-test-cmd.js';
+import { evaluateFreshness } from '../../../src/marketdata/index.js';
 import type { MarketInfo, Ticker } from '../../../src/types.js';
 import { statePath } from '../../helpers/state.js';
 
@@ -63,6 +65,8 @@ function cfg(over: Partial<BotConfig> = {}): BotConfig {
     marketDataTransportMaxAgeMs: 60000,
     maxClockSkewMs: 120000,
     paperStartingBalance: 10000,
+    liveMaxBaseQuantity: 0.01,
+    liveMaxQuoteNotional: 100,
     logLevel: 'info',
     reconcileIntervalSeconds: 60,
     killSwitch: false,
@@ -203,14 +207,19 @@ describe('executeLiveTest — gates (fail closed, no exchange contact)', () => {
     expect(deps.adapter.submittedOrders).toHaveLength(0);
   });
 
-  it('refuses when the adapter does not support order placement', async () => {
+  it('proceeds via the controlled-test authorization even when the adapter reports supportsOrderPlacement=false', async () => {
     const deps = buildDeps({
       adapter: (e) => {
         (e.capabilities as { supportsOrderPlacement: boolean }).supportsOrderPlacement = false;
       },
     });
-    expect(await harness(deps)).toBe(1);
-    expect(deps.adapter.submittedOrders).toHaveLength(0);
+    // The controlled-test path uses an explicit, narrowly-scoped authorization
+    // (SELL + LIMIT) instead of the general `supportsOrderPlacement` capability.
+    const led = await executeLiveTest(deps, { confirmLive: true, targetCad: 12 });
+    expect(led).toBe(0);
+    expect(deps.adapter.submittedOrders).toHaveLength(1);
+    expect(deps.adapter.submittedOrders[0]!.side).toBe('SELL');
+    expect(deps.adapter.submittedOrders[0]!.type).toBe('limit');
   });
 
   it('refuses when more than one trading pair is configured', async () => {
@@ -430,5 +439,121 @@ describe('live-test — F-4 execution-time freshness', () => {
     const led = await executeLiveTest(deps, opts);
     expect(led).toBe(1);
     expect(deps.adapter.submittedOrders).toHaveLength(0);
+  });
+});
+
+// NDAX quote-freshness basis (F-3/F-8): the L2 order-book `ActionDateTime`
+// is the authoritative quote freshness timestamp. The L1 `TimeStamp` is a
+// last-trade/session timestamp that can lag the quote, so it must NOT be used
+// as the primary freshness basis. These tests exercise `fetchLiveSnapshot`.
+describe('live snapshot — NDAX quote-freshness basis (L2 ActionDateTime)', () => {
+  const T0 = Date.now();
+  const policy = { maxQuoteAgeMs: 60_000, maxTransportAgeMs: 60_000, maxAcceptableFutureSkewMs: 120_000 };
+
+  function exchangeWith(opts: { l1Ts: number; bookTs: number | null; bookPresent: boolean }) {
+    const ex = new FakeExchange({
+      balances: { BTC: '0.25', CAD: '100000' },
+      markets: { [SYMBOL]: market },
+      tickers: { [SYMBOL]: ticker({ timestampMs: opts.l1Ts }) },
+    });
+    if (opts.bookPresent) {
+      ex.setOrderBook(SYMBOL, {
+        symbol: SYMBOL,
+        timestampMs: opts.bookTs ?? 0,
+        quoteTimestampMs: opts.bookTs ?? undefined,
+        bids: [],
+        asks: [],
+      });
+    }
+    return ex;
+  }
+
+  it('a fresh L2 ActionDateTime prevents a false STALE_MARKET_DATA rejection even when the L1 TimeStamp is old', async () => {
+    const oldL1 = T0 - 130_000; // beyond the 60s quote-age limit
+    const freshL2 = T0 - 2_000; // within the 60s quote-age limit
+    const snap = await fetchLiveSnapshot(
+      { adapter: exchangeWith({ l1Ts: oldL1, bookTs: freshL2, bookPresent: true }), nowMs: () => T0, policy },
+      SYMBOL,
+    );
+    // The L2 book timestamp is the freshness basis, so the stale L1 is ignored.
+    expect(snap.quoteTs).toBe(freshL2);
+    expect(snap.freshness).toEqual({ fresh: true });
+  });
+
+  it('a stale L2 timestamp still causes STALE_MARKET_DATA', async () => {
+    const staleL2 = T0 - 70_000; // beyond the 60s quote-age limit
+    const snap = await fetchLiveSnapshot(
+      { adapter: exchangeWith({ l1Ts: T0 - 2_000, bookTs: staleL2, bookPresent: true }), nowMs: () => T0, policy },
+      SYMBOL,
+    );
+    expect(snap.quoteTs).toBe(staleL2);
+    expect(snap.freshness.fresh).toBe(false);
+    if (!snap.freshness.fresh) expect(snap.freshness.reason).toBe('QUOTE_STALE');
+  });
+
+  it('a missing L2 timestamp does NOT fabricate local time (falls back to the L1 TimeStamp)', async () => {
+    const l1 = T0 - 2_000;
+    // No order book => getOrderBook throws => bookQuoteTs null => use L1.
+    const snap = await fetchLiveSnapshot(
+      { adapter: exchangeWith({ l1Ts: l1, bookTs: null, bookPresent: false }), nowMs: () => T0, policy },
+      SYMBOL,
+    );
+    expect(snap.quoteTs).toBe(l1);
+    expect(snap.quoteTs).not.toBe(T0);
+    expect(snap.freshness.fresh).toBe(true);
+  });
+
+  it('a present book with no valid quoteTimestampMs also falls back to the L1 TimeStamp', async () => {
+    const l1 = T0 - 2_000;
+    // Book present but quoteTimestampMs undefined => bookQuoteTs null.
+    const snap = await fetchLiveSnapshot(
+      { adapter: exchangeWith({ l1Ts: l1, bookTs: 0, bookPresent: true }), nowMs: () => T0, policy },
+      SYMBOL,
+    );
+    expect(snap.quoteTs).toBe(l1);
+    expect(snap.freshness.fresh).toBe(true);
+  });
+
+  it('missing L1 and L2 fails closed as QUOTE_MISSING (no fabricated exchange time)', async () => {
+    // l1Ts = 0 is not a valid epoch-ms => l1 null; no book => book null.
+    const snap = await fetchLiveSnapshot(
+      { adapter: exchangeWith({ l1Ts: 0, bookTs: null, bookPresent: false }), nowMs: () => T0, policy },
+      SYMBOL,
+    );
+    expect(snap.quoteTs).toBeNull();
+    expect(snap.freshness.fresh).toBe(false);
+    if (!snap.freshness.fresh) expect(snap.freshness.reason).toBe('QUOTE_MISSING');
+  });
+
+  it('the future-skew guard still fires for an L2 timestamp ahead of the clock', async () => {
+    const ahead = T0 + 130_000; // beyond the 120s maxAcceptableFutureSkewMs
+    const snap = await fetchLiveSnapshot(
+      { adapter: exchangeWith({ l1Ts: T0 - 2_000, bookTs: ahead, bookPresent: true }), nowMs: () => T0, policy },
+      SYMBOL,
+    );
+    expect(snap.freshness.fresh).toBe(false);
+    if (!snap.freshness.fresh) expect(snap.freshness.reason).toBe('QUOTE_AHEAD_OF_CLOCK');
+  });
+
+  it('the transport-age check remains enforced', () => {
+    const check = evaluateFreshness({
+      nowMs: T0,
+      quoteTimestampMs: T0 - 1_000, // fresh quote
+      observedAtMs: T0 - 70_000, // old local observation
+      policy,
+    });
+    expect(check.fresh).toBe(false);
+    if (!check.fresh) expect(check.reason).toBe('TRANSPORT_STALE');
+  });
+
+  it('the 60-second quote-age threshold is unchanged', () => {
+    expect(policy.maxQuoteAgeMs).toBe(60_000);
+    // 59s old L2 quote is fresh.
+    const fresh = evaluateFreshness({ nowMs: T0, quoteTimestampMs: T0 - 59_000, observedAtMs: T0, policy });
+    expect(fresh.fresh).toBe(true);
+    // 61s old L2 quote is stale.
+    const stale = evaluateFreshness({ nowMs: T0, quoteTimestampMs: T0 - 61_000, observedAtMs: T0, policy });
+    expect(stale.fresh).toBe(false);
+    if (!stale.fresh) expect(stale.reason).toBe('QUOTE_STALE');
   });
 });

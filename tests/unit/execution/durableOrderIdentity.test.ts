@@ -92,14 +92,21 @@ function buildEngine(exchange: FakeExchange): LiveOrderEngine {
   return new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), {
     gate,
     killSwitch: false,
+    maxLiveQuoteNotional: Money.fromString('1000000'),
+    maxLiveBaseQuantity: Money.fromString('100'),
   });
+}
+
+const LIMIT_PRICE = Money.fromString('40000');
+function limitIntent(reason: string): { reason: string; type: 'limit'; price: Money } {
+  return { reason, type: 'limit', price: LIMIT_PRICE };
 }
 
 describe('Gate 7.1 — durable order identity', () => {
   it('new orders receive a durable, prefixed, non-empty UUID identity', async () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     const engine = buildEngine(exchange);
-    const result = await engine.place(riskContext(), { reason: 'test' });
+    const result = await engine.place(riskContext(), limitIntent('test'));
     const id = result.order.clientOrderId;
     expect(id).toMatch(/^live-BTCCAD-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
     // Not the legacy restart-unsafe `live-BTCCAD-<ms>-<n>` form.
@@ -109,7 +116,7 @@ describe('Gate 7.1 — durable order identity', () => {
   it('the identity is persisted in the OrderStore and reloaded identically (restart-safe)', async () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     const engine = buildEngine(exchange);
-    const result = await engine.place(riskContext(), { reason: 'test' });
+    const result = await engine.place(riskContext(), limitIntent('test'));
     const id = result.order.clientOrderId;
     // A FRESH OrderStore reading the same file simulates a restart.
     const reloaded = new OrderStore(LEDGER).get(id);
@@ -120,8 +127,9 @@ describe('Gate 7.1 — durable order identity', () => {
   it('reloading preserves every non-terminal and terminal order identity', async () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     const engine = buildEngine(exchange);
-    const r1 = await engine.place(riskContext(), { reason: 'first' });
-    const r2 = await engine.place(riskContext(), { reason: 'second' });
+    const r1 = await engine.place(riskContext(), limitIntent('first'));
+    await engine.refreshOrder(r1.order); // resolve to terminal so the next order passes the one-in-flight guard
+    const r2 = await engine.place(riskContext(), limitIntent('second'));
     const ids = new OrderStore(LEDGER).allOrders();
     expect(ids.has(r1.order.clientOrderId)).toBe(true);
     expect(ids.has(r2.order.clientOrderId)).toBe(true);
@@ -131,8 +139,10 @@ describe('Gate 7.1 — durable order identity', () => {
   it('two concurrently created logical orders cannot collide', async () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     const engine = buildEngine(exchange);
-    const a = await engine.place(riskContext(), { reason: 'a' });
-    const b = await engine.place(riskContext(), { reason: 'b' });
+    const a = await engine.place(riskContext(), limitIntent('a'));
+    await engine.refreshOrder(a.order); // resolve to terminal so b passes the one-in-flight guard
+    const b = await engine.place(riskContext(), limitIntent('b'));
+    await engine.refreshOrder(b.order); // resolve to terminal so c passes the one-in-flight guard
     expect(a.order.clientOrderId).not.toBe(b.order.clientOrderId);
     // Distinct across restarts too.
     const third = new LiveOrderEngine(
@@ -140,9 +150,9 @@ describe('Gate 7.1 — durable order identity', () => {
       new OrderStore(LEDGER),
       new ReconcileService(exchange, new OrderStore(LEDGER)),
       new RiskManager(riskConfig()),
-      { gate, killSwitch: false },
+      { gate, killSwitch: false, maxLiveQuoteNotional: Money.fromString('1000000'), maxLiveBaseQuantity: Money.fromString('100') },
     );
-    const c = await third.place(riskContext(), { reason: 'c' });
+    const c = await third.place(riskContext(), limitIntent('c'));
     expect(c.order.clientOrderId).not.toBe(a.order.clientOrderId);
     expect(c.order.clientOrderId).not.toBe(b.order.clientOrderId);
   });
@@ -150,7 +160,7 @@ describe('Gate 7.1 — durable order identity', () => {
   it('refreshOrder does not change the logical identity', async () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     const engine = buildEngine(exchange);
-    const result = await engine.place(riskContext(), { reason: 'test' });
+    const result = await engine.place(riskContext(), limitIntent('test'));
     const id = result.order.clientOrderId;
     const authoritative = await engine.refreshOrder(result.order);
     expect(authoritative.clientOrderId).toBe(id);
@@ -163,7 +173,7 @@ describe('Gate 7.1 — durable order identity', () => {
       unknownOrderSubmissions: true,
     });
     const engine = buildEngine(exchange);
-    const result = await engine.place(riskContext(), { reason: 'test' });
+    const result = await engine.place(riskContext(), limitIntent('test'));
     expect(result.order.status).toBe('UNKNOWN');
     const id = result.order.clientOrderId;
     expect(result.order.exchangeOrderId).toBeNull();

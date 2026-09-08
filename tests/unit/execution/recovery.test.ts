@@ -72,6 +72,8 @@ function buildEngine(exchange: FakeExchange, extraCfg: Partial<LiveExecutionConf
   return new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), {
     gate,
     killSwitch: false,
+    maxLiveQuoteNotional: Money.fromString('1000000'),
+    maxLiveBaseQuantity: Money.fromString('100'),
     ...extraCfg,
   });
 }
@@ -275,7 +277,7 @@ describe('Gate 7.3 — durable UNKNOWN + reservation interplay', () => {
         realizedPnlToday: Money.fromString('0'),
         unrealizedPnlToday: Money.fromString('0'),
       } as never,
-      { reason: 'test' },
+      { reason: 'test', type: 'limit', price: Money.fromString('40000') },
     );
     expect(result.order.status).toBe('UNKNOWN');
     const id = result.order.clientOrderId;

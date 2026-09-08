@@ -9,6 +9,8 @@
 import { createLogger } from '../logging/logger.js';
 import { backtestCommand } from './backtest-cmd.js';
 import { configureCommand } from './config-cmd.js';
+import { liveMonitorCommand } from './live-monitor-cmd.js';
+import { liveOnboardExternalCommand } from './live-onboard-external-cmd.js';
 import { liveTestCommand } from './live-test-cmd.js';
 import { manualCommand } from './manual-cmd.js';
 import { paperCommand } from './paper-cmd.js';
@@ -28,6 +30,8 @@ export const COMMANDS = {
   trades: tradesCommand,
   reconcile: reconcileCommand,
   'live-test': liveTestCommand,
+  'live-monitor': liveMonitorCommand,
+  'live-onboard-external': liveOnboardExternalCommand,
   manual: manualCommand,
 } as const;
 
@@ -47,6 +51,8 @@ Commands:
   trades    Show the durable order ledger
   reconcile Reconcile the order ledger against the exchange (read-only)
   live-test One-shot, operator-gated LIVE SELL (e.g. first-risk-validated live order)
+  live-monitor READ-ONLY lifecycle observer for unresolved LIVE orders (never submits/cancels)
+  live-onboard-external Authorize existing EXTERNAL exchange inventory as bot-managed (local ownership only; NOT trading)
   manual    Constrained MANUAL EXECUTION BRIDGE (operator interface; never places/cancels an exchange order)
   help      Show this help
 

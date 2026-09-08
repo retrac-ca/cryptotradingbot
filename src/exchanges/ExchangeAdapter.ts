@@ -22,6 +22,7 @@ import type {
 } from '../types.js';
 import type { NewOrder, Order, OrderStatus } from '../order.js';
 import type { ExchangeCapabilities } from './types.js';
+import type { ControlledLiveAuthorization } from '../execution/ControlledLiveAuthorization.js';
 
 /** Connectivity/health of an exchange. */
 export interface ExchangeHealth {
@@ -93,8 +94,13 @@ export interface ExchangeAdapter {
    * explicitly configured and the caller has passed all safety checks.
    * Returns a minimal result; the actual order must be reconciled by the
    * execution engine.
+   *
+   * `authorization` is an optional, explicitly-scoped controlled-test
+   * authorization. When present and valid, it may permit a narrowly-scoped
+   * SELL/LIMIT mutation on an adapter that otherwise reports
+   * `supportsOrderPlacement=false`. It is NOT a generic "live enabled" flag.
    */
-  placeOrder(order: NewOrder): Promise<PlaceOrderResult>;
+  placeOrder(order: NewOrder, authorization?: ControlledLiveAuthorization): Promise<PlaceOrderResult>;
 
   cancelOrder(symbol: string, exchangeOrderId: string): Promise<CancelResult>;
 }
