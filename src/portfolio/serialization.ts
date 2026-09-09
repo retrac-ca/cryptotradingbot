@@ -25,6 +25,7 @@
  */
 
 import { Money } from '../money/Money.js';
+import type { FeeCurrency } from '../order.js';
 import type {
   PortfolioModel,
   PaperPosition,
@@ -34,6 +35,10 @@ import type {
   ReservationStatus,
   AppliedExecution,
   ManualSettlement,
+  LiveOrderAttestation,
+  ExchangeEvidenceSnapshot,
+  AccountTradeEvidence,
+  BalanceEvidence,
 } from './types.js';
 
 /** Current explicit portfolio state format version. */
@@ -122,6 +127,14 @@ interface PortfolioJsonBase {
    * reconciliation signal, never silently dropped).
    */
   manualSettlements?: Record<string, ManualSettlementJson>;
+  /**
+   * Optional (live-order attestation): operator-attested resolutions keyed by the
+   * live order's `clientOrderId`. Absent in legacy files (before this capability)
+   * => safely loaded as empty (nothing is invented or assumed "already
+   * attested"). When present, each entry is validated and fails closed if
+   * malformed (a conflict is a reconciliation signal, never silently dropped).
+   */
+  liveOrderAttestations?: Record<string, LiveOrderAttestationJson>;
 }
 
 /** JSON-safe form of an OrderReservation (Money fields as decimal strings). */
@@ -161,6 +174,69 @@ interface ManualSettlementJson {
   operatorConfirmedBy: string | null;
   executedAtMs: number | null;
   createdAtMs: number;
+}
+
+/** JSON-safe form of a single observed account-trade evidence record. */
+interface AccountTradeEvidenceJson {
+  executionId: string | null;
+  tradeId: string | null;
+  orderId: string | null;
+  symbol: string | null;
+  side: 'BUY' | 'SELL';
+  quantity: string;
+  price: string;
+  fee: string;
+  feeProductId: string | null;
+  tradeTimeMs: number | null;
+}
+
+/** JSON-safe form of a single observed balance evidence record. */
+interface BalanceEvidenceJson {
+  currency: string;
+  total: string;
+  available: string;
+  held: string;
+}
+
+/** JSON-safe form of the exchange-evidence snapshot (Money fields as strings). */
+interface ExchangeEvidenceSnapshotJson {
+  orderId: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  type: string;
+  status: string;
+  quantity: string;
+  filledQuantity: string;
+  averagePrice: string | null;
+  limitPrice: string | null;
+  fee: string;
+  feeCurrency: FeeCurrency;
+  reason: string;
+  createdAtMs: number | null;
+  updatedAtMs: number | null;
+  orderEvidenceSource: 'status' | 'history';
+  observedAccountTrades: AccountTradeEvidenceJson[];
+  observedBalances: BalanceEvidenceJson[];
+  readAtMs: number;
+}
+
+/** JSON-safe form of a LiveOrderAttestation (Money fields as decimal strings). */
+interface LiveOrderAttestationJson {
+  attestationId: string;
+  clientOrderId: string;
+  exchangeOrderId: string;
+  exchangeStatus: string;
+  attestedFilledQuantity: string;
+  attestedAveragePrice: string;
+  fee: string;
+  feeCurrency: FeeCurrency;
+  evidenceSource: string;
+  accountingAuthority: string;
+  provenanceProof?: false;
+  operatorConfirmedBy: string;
+  attestedAtMs: number;
+  exchangeReadAtMs: number;
+  exchangeEvidence: ExchangeEvidenceSnapshotJson;
 }
 
 export interface PortfolioJsonV1 extends PortfolioJsonBase {
@@ -239,8 +315,43 @@ function assertManualSettlementConservation(intentId: string, s: Pick<ManualSett
   }
 }
 
-function assertReservationConservation(orderId: string, r: Pick<OrderReservation, 'amount' | 'remaining' | 'status'>): void {
-  if (r.amount.isNegativeOrZero()) {
+/**
+ * Assert a live-order attestation is internally consistent (live-order
+ * attestation):
+ *   - the client order id key is non-empty;
+ *   - the attestation id is the namespaced `op-attest:<clientOrderId>` form;
+ *   - attested filled quantity is positive;
+ *   - attested average price and fee are non-negative;
+ *   - the settlement fee currency is quote (only a zero or quote fee is ever
+ *     accounted, never silently assumed);
+ *   - provenanceProof is always `false` (literal type).
+ * Any violation is corrupt state and fails closed (an attestation is never
+ * malformed or reconstructed with an invented value).
+ */
+function assertLiveOrderAttestationConservation(clientOrderId: string, a: Pick<LiveOrderAttestation, 'attestationId' | 'attestedFilledQuantity' | 'attestedAveragePrice' | 'fee' | 'feeCurrency' | 'provenanceProof'>): void {
+  if (!clientOrderId) {
+    throw new Error('Portfolio state: live-order attestation with empty client order id');
+  }
+  if (a.attestationId !== `op-attest:${clientOrderId}`) {
+    throw new Error(`Portfolio state: live-order attestation for ${clientOrderId} has unexpected attestationId "${a.attestationId}"`);
+  }
+  if (a.attestedFilledQuantity.isNegativeOrZero()) {
+    throw new Error(`Portfolio state: live-order attestation ${clientOrderId} has non-positive filled quantity`);
+  }
+  if (a.attestedAveragePrice.isNegative() || a.fee.isNegative()) {
+    throw new Error(`Portfolio state: live-order attestation ${clientOrderId} has a negative price/fee`);
+  }
+  // A non-zero fee is only ever accounted when its currency is authoritatively
+  // quote (or the fee is zero, currency-agnostic). Never silently assumed.
+  if (!a.fee.isZero() && a.feeCurrency !== 'quote') {
+    throw new Error(`Portfolio state: live-order attestation ${clientOrderId} has a non-zero fee in a non-quote currency`);
+  }
+  if (a.provenanceProof !== false) {
+    throw new Error(`Portfolio state: live-order attestation ${clientOrderId} has provenanceProof !== false`);
+  }
+}
+
+function assertReservationConservation(orderId: string, r: Pick<OrderReservation, 'amount' | 'remaining' | 'status'>): void {  if (r.amount.isNegativeOrZero()) {
     throw new Error(`Portfolio state: order reservation for ${orderId} has non-positive amount (${r.amount})`);
   }
   if (r.remaining.isNegative()) {
@@ -335,6 +446,30 @@ export function serializePortfolio(state: PortfolioModel): PortfolioJsonV2 {
       createdAtMs: s.createdAtMs,
     };
   }
+  // Never write a corrupt live-order attestation to disk. Only include the key
+  // when there is at least one attestation, so legacy/empty portfolios serialize
+  // byte-identically to before the field existed.
+  const liveOrderAttestations: Record<string, LiveOrderAttestationJson> = {};
+  for (const [clientOrderId, a] of state.liveOrderAttestations ?? []) {
+    assertLiveOrderAttestationConservation(clientOrderId, a);
+    liveOrderAttestations[clientOrderId] = {
+      attestationId: a.attestationId,
+      clientOrderId: a.clientOrderId,
+      exchangeOrderId: a.exchangeOrderId,
+      exchangeStatus: a.exchangeStatus,
+      attestedFilledQuantity: a.attestedFilledQuantity.toString(),
+      attestedAveragePrice: a.attestedAveragePrice.toString(),
+      fee: a.fee.toString(),
+      feeCurrency: a.feeCurrency,
+      evidenceSource: a.evidenceSource,
+      accountingAuthority: a.accountingAuthority,
+      provenanceProof: a.provenanceProof,
+      operatorConfirmedBy: a.operatorConfirmedBy,
+      attestedAtMs: a.attestedAtMs,
+      exchangeReadAtMs: a.exchangeReadAtMs,
+      exchangeEvidence: exchangeEvidenceToJson(a.exchangeEvidence),
+    };
+  }
   return {
     version: PORTFOLIO_STATE_VERSION,
     cash,
@@ -348,6 +483,46 @@ export function serializePortfolio(state: PortfolioModel): PortfolioJsonV2 {
     orderReservations,
     appliedExecutions,
     ...(Object.keys(manualSettlements).length > 0 ? { manualSettlements } : {}),
+    ...(Object.keys(liveOrderAttestations).length > 0 ? { liveOrderAttestations } : {}),
+  };
+}
+
+function exchangeEvidenceToJson(e: ExchangeEvidenceSnapshot): ExchangeEvidenceSnapshotJson {
+  return {
+    orderId: e.orderId,
+    symbol: e.symbol,
+    side: e.side,
+    type: e.type,
+    status: e.status,
+    quantity: e.quantity.toString(),
+    filledQuantity: e.filledQuantity.toString(),
+    averagePrice: e.averagePrice ? e.averagePrice.toString() : null,
+    limitPrice: e.limitPrice ? e.limitPrice.toString() : null,
+    fee: e.fee.toString(),
+    feeCurrency: e.feeCurrency,
+    reason: e.reason,
+    createdAtMs: e.createdAtMs,
+    updatedAtMs: e.updatedAtMs,
+    orderEvidenceSource: e.orderEvidenceSource,
+    observedAccountTrades: e.observedAccountTrades.map((t) => ({
+      executionId: t.executionId,
+      tradeId: t.tradeId,
+      orderId: t.orderId,
+      symbol: t.symbol,
+      side: t.side,
+      quantity: t.quantity.toString(),
+      price: t.price.toString(),
+      fee: t.fee.toString(),
+      feeProductId: t.feeProductId,
+      tradeTimeMs: t.tradeTimeMs,
+    })),
+    observedBalances: e.observedBalances.map((b) => ({
+      currency: b.currency,
+      total: b.total.toString(),
+      available: b.available.toString(),
+      held: b.held.toString(),
+    })),
+    readAtMs: e.readAtMs,
   };
 }
 
@@ -532,6 +707,34 @@ export function deserializePortfolio(json: PortfolioJson, options: DeserializeOp
     manualSettlements.set(intentId, s);
   }
 
+  // Live-order attestation ledger. Legacy documents (before this capability)
+  // load empty: a previously-observed attestation is either re-applied once (if
+  // it was never applied) or left unresolved (fail closed) — never assumed.
+  const liveOrderAttestations = new Map<string, LiveOrderAttestation>();
+  for (const [clientOrderId, ja] of Object.entries(json.liveOrderAttestations ?? {})) {
+    const a: LiveOrderAttestation = {
+      attestationId: ja.attestationId,
+      clientOrderId: ja.clientOrderId,
+      exchangeOrderId: ja.exchangeOrderId,
+      exchangeStatus: ja.exchangeStatus,
+      attestedFilledQuantity: Money.fromString(ja.attestedFilledQuantity),
+      attestedAveragePrice: Money.fromString(ja.attestedAveragePrice),
+      fee: Money.fromString(ja.fee),
+      feeCurrency: ja.feeCurrency,
+      evidenceSource: ja.evidenceSource,
+      accountingAuthority: ja.accountingAuthority,
+      // HARD-CODE provenanceProof to `false` — the literal type; operator
+      // attestation is never exchange provenance proof.
+      provenanceProof: false,
+      operatorConfirmedBy: ja.operatorConfirmedBy,
+      attestedAtMs: ja.attestedAtMs,
+      exchangeReadAtMs: ja.exchangeReadAtMs,
+      exchangeEvidence: exchangeEvidenceFromJson(ja.exchangeEvidence),
+    };
+    assertLiveOrderAttestationConservation(clientOrderId, a);
+    liveOrderAttestations.set(clientOrderId, a);
+  }
+
   return {
     cash,
     positions,
@@ -544,5 +747,45 @@ export function deserializePortfolio(json: PortfolioJson, options: DeserializeOp
     orderReservations,
     appliedExecutions,
     manualSettlements,
+    liveOrderAttestations,
+  };
+}
+
+function exchangeEvidenceFromJson(j: ExchangeEvidenceSnapshotJson): ExchangeEvidenceSnapshot {
+  return {
+    orderId: j.orderId,
+    symbol: j.symbol,
+    side: j.side,
+    type: j.type,
+    status: j.status,
+    quantity: Money.fromString(j.quantity),
+    filledQuantity: Money.fromString(j.filledQuantity),
+    averagePrice: j.averagePrice ? Money.fromString(j.averagePrice) : null,
+    limitPrice: j.limitPrice ? Money.fromString(j.limitPrice) : null,
+    fee: Money.fromString(j.fee),
+    feeCurrency: j.feeCurrency,
+    reason: j.reason,
+    createdAtMs: j.createdAtMs,
+    updatedAtMs: j.updatedAtMs,
+    orderEvidenceSource: j.orderEvidenceSource,
+    observedAccountTrades: j.observedAccountTrades.map<AccountTradeEvidence>((t) => ({
+      executionId: t.executionId,
+      tradeId: t.tradeId,
+      orderId: t.orderId,
+      symbol: t.symbol,
+      side: t.side,
+      quantity: Money.fromString(t.quantity),
+      price: Money.fromString(t.price),
+      fee: Money.fromString(t.fee),
+      feeProductId: t.feeProductId,
+      tradeTimeMs: t.tradeTimeMs,
+    })),
+    observedBalances: j.observedBalances.map<BalanceEvidence>((b) => ({
+      currency: b.currency,
+      total: Money.fromString(b.total),
+      available: Money.fromString(b.available),
+      held: Money.fromString(b.held),
+    })),
+    readAtMs: j.readAtMs,
   };
 }

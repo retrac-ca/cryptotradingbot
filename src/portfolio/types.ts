@@ -8,6 +8,7 @@
  */
 
 import type { Money } from '../money/Money.js';
+import type { FeeCurrency } from '../order.js';
 
 /**
  * Where a managed position came from.
@@ -159,6 +160,107 @@ export interface ManualSettlement {
   createdAtMs: number;
 }
 
+/**
+ * A single exchange trade/fill observation captured for the audit trail of a
+ * live-order attestation. It records what the READ-ONLY exchange evidence showed
+ * at attestation time; it is NEVER used as an accounting identity and is never
+ * written into `appliedExecutions`.
+ */
+export interface AccountTradeEvidence {
+  executionId: string | null;
+  tradeId: string | null;
+  orderId: string | null;
+  symbol: string | null;
+  side: 'BUY' | 'SELL';
+  quantity: Money;
+  price: Money;
+  fee: Money;
+  feeProductId: string | null;
+  tradeTimeMs: number | null;
+}
+
+/** A single balance observation captured for the audit trail of a live-order attestation. */
+export interface BalanceEvidence {
+  currency: string;
+  total: Money;
+  available: Money;
+  held: Money;
+}
+
+/**
+ * The read-only exchange evidence snapshot that governed a live-order
+ * attestation. This is the `GetOrderStatus` / `GetAccountTrades` / `GetBalances`
+ * evidence the operator used, captured verbatim so the decision can be audited
+ * independently of later state changes.
+ */
+export interface ExchangeEvidenceSnapshot {
+  orderId: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  type: string;
+  status: string;
+  quantity: Money;
+  filledQuantity: Money;
+  averagePrice: Money | null;
+  limitPrice: Money | null;
+  fee: Money;
+  feeCurrency: FeeCurrency;
+  reason: string;
+  createdAtMs: number | null;
+  updatedAtMs: number | null;
+  /**
+   * Where the terminal order evidence was obtained:
+   *  - `'status'`  : from `GetOrderStatus` (per-order endpoint).
+   *  - `'history'` : from `GetOrderHistory`, used only when `GetOrderStatus`
+   *    returns the order not-found condition (a fallback, never a silent
+   *    downgrade for arbitrary errors).
+   */
+  orderEvidenceSource: 'status' | 'history';
+  observedAccountTrades: AccountTradeEvidence[];
+  observedBalances: BalanceEvidence[];
+  readAtMs: number;
+}
+
+/**
+ * A live-order operator attestation (the operator-attested resolution of an
+ * ambiguous controlled-live order).
+ *
+ * This is deliberately DISTINCT from `ManualSettlement` (an operator-executed
+ * external order) and from `AppliedExecution` (an exchange execution identity).
+ * It resolves a RETRAC-SUBMITTED live order that is exchange-FILLED but whose
+ * execution set cannot be proven complete. It is keyed by the live order's
+ * `clientOrderId` and is tied to the EXACT persisted exchange OrderId.
+ *
+ * Hard safety semantics:
+ *  - `accountingAuthority === 'operator_attestation'`: the numbers are
+ *    attributed via an explicit human operator attestation. They are NOT
+ *    exchange-proven provenance.
+ *  - `provenanceProof === false` (literal type): operator attestation is NEVER
+ *    exchange/cryptographic proof that the order was fully enumerated.
+ *  - `evidenceSource === 'exchange_read'`: the attested numbers came from a fresh
+ *    read-only exchange read, not from operator-typed values.
+ *  - `attestationId` uses a namespaced local id (`op-attest:<clientOrderId>`) so
+ *    it can NEVER be mistaken for an NDAX execution id and is NEVER inserted into
+ *    `appliedExecutions`.
+ */
+export interface LiveOrderAttestation {
+  attestationId: string;
+  clientOrderId: string;
+  exchangeOrderId: string;
+  exchangeStatus: string;
+  attestedFilledQuantity: Money;
+  attestedAveragePrice: Money;
+  fee: Money;
+  feeCurrency: FeeCurrency;
+  evidenceSource: string;
+  accountingAuthority: string;
+  provenanceProof: false;
+  operatorConfirmedBy: string;
+  attestedAtMs: number;
+  exchangeReadAtMs: number;
+  exchangeEvidence: ExchangeEvidenceSnapshot;
+}
+
 /** A single open (long) position in the bot-MANAGED portfolio. V1 is long-only. */
 export interface PaperPosition {
   symbol: string;
@@ -246,6 +348,18 @@ export interface PortfolioModel {
    * deliberately separate accounting path keyed by intent, not by execution id.
    */
   manualSettlements: Map<string, ManualSettlement>;
+  /**
+   * LIVE-order operator attestations keyed by the live order's `clientOrderId`
+   * (the operator-attested resolution of an ambiguous controlled-live order).
+   *
+   * This is a distinct, separate accounting path from `appliedExecutions` (per-
+   * execution, exchange-proven) and from `manualSettlements` (operator-executed
+   * external orders). A live-order attestation resolves a RETRAC-SUBMITTED order
+   * that is exchange-FILLED but whose execution set cannot be proven complete.
+   * It is idempotent by `clientOrderId` and its `provenanceProof` is always
+   * `false` — operator attestation is never exchange provenance proof.
+   */
+  liveOrderAttestations: Map<string, LiveOrderAttestation>;
 }
 
 /** A currency amount produced by an execution fill (cash delta). */

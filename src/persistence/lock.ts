@@ -14,7 +14,7 @@
  */
 
 import { closeSync, mkdirSync, openSync, readFileSync, rmSync, writeSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, resolve as pathResolve } from 'node:path';
 import { StateLockedError } from './types.js';
 
 export interface LockMetadata {
@@ -25,9 +25,26 @@ export interface LockMetadata {
 /** Lock paths held by THIS process (reentrancy guard). Cross-process remains exclusive. */
 const heldByProcess = new Set<string>();
 
-/** Derive the lock path from a state file path: its parent directory. */
+/**
+ * Canonicalize a state-directory path so ALL equivalent textual forms collapse to
+ * a single lock identity. This is essential: `withStateDirLock(cfg.stateDir)`
+ * (e.g. `".state/"`) and a store's `withStateDirLock(dirname(filePath))` (e.g.
+ * `".state"`) both refer to the SAME directory but, if keyed by raw strings,
+ * would produce different lock paths (`".state//.mutation.lock"` vs
+ * `".state/.mutation.lock"`) that point at the same physical file. That breaks
+ * the process-local `heldByProcess` reentrancy guard, causing a nested call to
+ * see `EEXIST` on its own lock (a self-deadlock).
+ *
+ * We normalize to an ABSOLUTE path so relative/absolute and trailing-slash
+ * forms are identical, and two genuinely distinct directories never collide.
+ */
+function canonicalLockDir(dir: string): string {
+  return pathResolve(dir);
+}
+
+/** Derive the lock path from a state file path: its parent directory's canonical lock. */
 export function lockPathFor(filePath: string): string {
-  return `${dirname(filePath)}/.mutation.lock`;
+  return `${canonicalLockDir(dirname(filePath))}/.mutation.lock`;
 }
 
 /**
@@ -35,19 +52,20 @@ export function lockPathFor(filePath: string): string {
  * The lock is always released (on success OR failure).
  *
  * Reentrant within this process: a nested `withStateDirLock` for the same
- * directory (e.g. a store's `save()` called inside a `commitProven` transaction)
- * is allowed and does not re-acquire the lock. Cross-process, the lock remains
- * mutually exclusive via the lock file.
+ * canonical directory (e.g. a store's `save()` called inside a `commitProven`
+ * transaction) is allowed and does not re-acquire the lock. Cross-process, the
+ * lock remains mutually exclusive via the lock file.
  *
  * @throws StateLockedError if the lock is held (by another process) / malformed.
  */
 export function withStateDirLock<T>(dir: string, fn: () => T): T {
-  const lockPath = `${dir}/.mutation.lock`;
+  const lockDir = canonicalLockDir(dir);
+  const lockPath = `${lockDir}/.mutation.lock`;
   if (heldByProcess.has(lockPath)) {
     // Already held by this process: run reentrantly without re-acquiring.
     return fn();
   }
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(lockDir, { recursive: true });
 
   let fd: number;
   try {
@@ -91,7 +109,7 @@ export function withStateDirLock<T>(dir: string, fn: () => T): T {
 /** True if a lock file exists for the directory (used to classify a HALT). */
 export function isLockHeld(dir: string): boolean {
   try {
-    readFileSync(`${dir}/.mutation.lock`, 'utf8');
+    readFileSync(`${canonicalLockDir(dir)}/.mutation.lock`, 'utf8');
     return true;
   } catch {
     return false;

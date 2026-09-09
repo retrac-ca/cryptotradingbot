@@ -336,4 +336,76 @@ describe('Reconciliation V1 — reconcile() read-only + commitProven()', () => {
       expect(pf.cash('CAD').toFixed(2)).toBe('10.00'); // cash untouched
     }
   });
+
+  it('commitProven refuses a proven execution for an order that already has an operator attestation', async () => {
+    const stateDir = statePath('recv1', 'dir4');
+    const { deps, orders, live, exchange } = makeDeps(stateDir);
+    // A SELL live order (attested resolution, no BUY reservation needed).
+    const sellOrder: Order = {
+      clientOrderId: 'local-1',
+      exchangeOrderId: '999001',
+      symbol: SYMBOL,
+      side: 'SELL',
+      type: 'limit',
+      status: 'FILLED',
+      quantity: QTY,
+      filledQuantity: QTY,
+      averagePrice: PRICE,
+      price: PRICE,
+      fills: [],
+      fee: Money.zero(),
+      feeCurrency: 'unknown',
+      reason: 'test',
+      createdAtMs: 1,
+      updatedAtMs: 1,
+    };
+    orders.save(sellOrder);
+    // Portfolio: external BTC position + an operator attestation for the order.
+    let pf = Portfolio.empty(new Map([['CAD', Money.zero()]]))
+      .withExternalSnapshot(new Map([[SYMBOL, Money.fromString('0.2')]]))
+      .authorizeExternal(SYMBOL);
+    pf = pf.settleLiveOrderAttested({
+      clientOrderId: 'local-1',
+      symbol: SYMBOL,
+      side: 'SELL',
+      orderQuantity: QTY,
+      exchangeOrderId: '999001',
+      exchangeStatus: 'FILLED',
+      attestedFilledQuantity: QTY,
+      attestedAveragePrice: PRICE,
+      fee: Money.zero(),
+      feeCurrency: 'quote',
+      evidenceSource: 'exchange_read',
+      accountingAuthority: 'operator_attestation',
+      provenanceProof: false,
+      operatorConfirmedBy: 'op',
+      attestedAtMs: 1,
+      exchangeReadAtMs: 1,
+      exchangeEvidence: {
+        orderId: '999001', symbol: SYMBOL, side: 'SELL', type: 'limit', status: 'FILLED',
+        quantity: QTY, filledQuantity: QTY, averagePrice: PRICE, limitPrice: PRICE,
+        fee: Money.zero(), feeCurrency: 'unknown', reason: 'test', createdAtMs: 1, updatedAtMs: 1,
+        orderEvidenceSource: 'status' as const,
+        observedAccountTrades: [], observedBalances: [], readAtMs: 1,
+      },
+    });
+    live.save(pf.stateModel);
+    // Exchange now exposes a PROVEN execution for the same order (would otherwise
+    // be committed). The attestation guard must refuse it.
+    exchange.seedOrders([{ ...sellOrder, status: 'FILLED' }]);
+    exchange.seedAccountTrades([trade('e1', '999001', QTY, FEE, 'quote-id', 'SELL')]);
+    exchange.setMarkets([market]);
+    exchange.setBalance('BTC', '0.1');
+    exchange.setBalance('CAD', '12.00');
+    const result = await reconcile(deps);
+    expect(result.commitCandidates).toHaveLength(1);
+    const committed = commitProven(deps, result);
+    expect(committed.status).toBe('HALTED');
+    expect(committed.reasons.some((r) => /operator attestation/.test(r))).toBe(true);
+    const after = live.load();
+    if (after.status === 'OK') {
+      const afterPf = live.toPortfolio(after.data)!;
+      expect(afterPf.appliedCount()).toBe(0); // no double accounting
+    }
+  });
 });

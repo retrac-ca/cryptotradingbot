@@ -15,6 +15,11 @@ export type {
   OrderReservation,
   ReservationStatus,
   AppliedExecution,
+  ManualSettlement,
+  LiveOrderAttestation,
+  ExchangeEvidenceSnapshot,
+  AccountTradeEvidence,
+  BalanceEvidence,
 } from './types.js';
 export { serializePortfolio, deserializePortfolio, PORTFOLIO_STATE_VERSION } from './serialization.js';
 export type {

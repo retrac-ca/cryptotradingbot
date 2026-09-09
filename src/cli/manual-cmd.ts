@@ -65,7 +65,7 @@ export interface ResolvedFee {
 }
 
 /** An adapter that MAY additionally expose a read-only fee-currency resolver. */
-type FeeCtx = ExchangeAdapter & { resolveFeeCurrency?: (feeProductId: string | null | undefined, symbol: string) => Promise<ResolvedFee> };
+export type FeeCtx = ExchangeAdapter & { resolveFeeCurrency?: (feeProductId: string | null | undefined, symbol: string) => Promise<ResolvedFee> };
 
 /**
  * Wrap a write-capable adapter in a read-only proxy (runtime structural guard).

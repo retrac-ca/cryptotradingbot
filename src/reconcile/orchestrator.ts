@@ -233,12 +233,29 @@ function computeFindings(snapshot: ReconciliationSnapshot, exchange: ExchangeRea
     const exchangeExecuted = exchangeOrder?.filledQuantity ?? null;
     const provenExecuted = provenByOrder.get(clientOrderId) ?? Money.zero();
 
-    const completeness = analyzeCompleteness(exchangeExecuted, provenExecuted);
+    // A valid live-order operator attestation resolves THIS specific order's
+    // accounting (operator-attested, provenanceProof=false). It is NEVER globally
+    // equivalent to proven execution: it only affects the order for which the
+    // attestation exists and matches the persisted exchangeOrderId.
+    const attestation = snapshot.livePortfolio?.liveOrderAttestationsView().get(clientOrderId) ?? null;
+    const hasValidAttestation =
+      attestation != null &&
+      attestation.attestedFilledQuantity.isPositive() &&
+      order.exchangeOrderId != null &&
+      attestation.exchangeOrderId != null &&
+      Portfolio.sameExternalOrderId(attestation.exchangeOrderId, order.exchangeOrderId);
+    const resolvedProvenExecuted = hasValidAttestation
+      ? attestation!.attestedFilledQuantity
+      : provenExecuted;
+
+    const completeness = hasValidAttestation
+      ? 'COMPLETE'
+      : analyzeCompleteness(exchangeExecuted, provenExecuted);
     const disposition = classifyOrder({
       localStatus: order.status,
       exchangeStatus,
       exchangeExecutedQuantity: exchangeExecuted,
-      provenExecuted,
+      provenExecuted: resolvedProvenExecuted,
       completeness,
     });
     orderFindings.push({
@@ -248,16 +265,18 @@ function computeFindings(snapshot: ReconciliationSnapshot, exchange: ExchangeRea
       exchangeStatus,
       disposition,
       executedQuantity: exchangeExecuted ?? order.filledQuantity,
-      provenExecutedQuantity: provenExecuted,
+      provenExecutedQuantity: resolvedProvenExecuted,
       completeness,
-      reason: `${order.status} -> exchange ${exchangeStatus ?? 'unknown'}; disposition ${disposition}; completeness ${completeness}`,
+      reason: hasValidAttestation
+        ? `operator-attested (provenanceProof=false): ${order.status} -> exchange ${exchangeStatus ?? 'unknown'}; disposition ${disposition}; completeness operator-attested`
+        : `${order.status} -> exchange ${exchangeStatus ?? 'unknown'}; disposition ${disposition}; completeness ${completeness}`,
     });
 
     const hasReservation = snapshot.livePortfolio?.orderReservation(clientOrderId) != null;
     const resDisp = reservationDisposition({
       hasReservation,
       exchangeStatus,
-      provenExecuted,
+      provenExecuted: resolvedProvenExecuted,
       accountingComplete: completeness === 'COMPLETE',
     });
     reservationFindings.push({
@@ -369,6 +388,15 @@ export function commitProven(deps: ReconciliationDeps, result: ReconciliationRes
 
     // Apply proven executions (idempotent by executionId).
     for (const c of result.commitCandidates) {
+      // An order that already has an operator attestation must NOT also receive a
+      // proven-execution accounting: the two paths are mutually exclusive and
+      // applying both would double-count the same real order. Fail closed.
+      if (portfolio.liveOrderAttestation(c.clientOrderId)) {
+        return halted(
+          `order ${c.clientOrderId} already has an operator attestation; refusing to also commit a ` +
+            'proven execution for it (would double-account the same exchange order)',
+        );
+      }
       const existing = portfolio.appliedExecution(c.executionId);
       if (existing) {
         if (

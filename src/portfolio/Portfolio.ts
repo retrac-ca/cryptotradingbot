@@ -7,7 +7,7 @@
  */
 
 import { Money } from '../money/Money.js';
-import type { OrderSide, Fill } from '../order.js';
+import type { OrderSide, Fill, FeeCurrency } from '../order.js';
 import type { Balance } from '../types.js';
 import type {
   PortfolioModel,
@@ -16,6 +16,8 @@ import type {
   OrderReservation,
   AppliedExecution,
   ManualSettlement,
+  LiveOrderAttestation,
+  ExchangeEvidenceSnapshot,
 } from './types.js';
 
 /** Optional ownership seed for a fresh portfolio. */
@@ -50,6 +52,7 @@ export class Portfolio {
       orderReservations: new Map(),
       appliedExecutions: new Map(),
       manualSettlements: new Map(),
+      liveOrderAttestations: new Map(),
     });
   }
 
@@ -732,6 +735,16 @@ export class Portfolio {
     return this.state.manualSettlements ?? new Map();
   }
 
+  /** The live-order attestation for a live order, or null. */
+  liveOrderAttestation(clientOrderId: string): LiveOrderAttestation | null {
+    return (this.state.liveOrderAttestations ?? new Map()).get(clientOrderId) ?? null;
+  }
+
+  /** Read-only view of live-order attestations (keyed by live clientOrderId). */
+  liveOrderAttestationsView(): ReadonlyMap<string, LiveOrderAttestation> {
+    return this.state.liveOrderAttestations ?? new Map();
+  }
+
   /**
    * Apply ONE order-level manual settlement at most once.
    *
@@ -902,6 +915,218 @@ export class Portfolio {
   }
 
   /**
+   * Apply ONE operator-attested live-order resolution at most once.
+   *
+   * This is the operator-attested accounting path for an ambiguous controlled-
+   * LIVE order (a RETRAC-SUBMITTED order that is exchange-FILLED but whose
+   * execution set cannot be proven complete). It is FUNDAMENTALLY DIFFERENT from
+   * `applyLiveFill` (per-execution, exchange-proven) and from `settleManualOrder`
+   * (an operator-EXECUTED external order):
+   *  - It is keyed by the live order's durable local `clientOrderId`.
+   *  - It accounts the ORDER AGGREGATE (attested filled quantity x attested
+   *    average execution price + fee) once — it does NOT fabricate an execution
+   *    identity, and it is NEVER recorded in `appliedExecutions` as if it were an
+   *    NDAX execution id.
+   *  - `provenanceProof` is ALWAYS `false`: operator attestation is never
+   *    exchange-proven provenance, and execution completeness is NOT proven.
+   *  - The attested numbers must come from fresh READ-ONLY exchange evidence
+   *    (`evidenceSource = 'exchange_read'`); they are not operator-typed values.
+   *
+   * Fail-closed accounting invariants:
+   *  - attested filled quantity must be positive and never exceed the original
+   *    order quantity;
+   *  - attested average price must be positive;
+   *  - a fee must be zero (currency-agnostic) OR authoritatively quote; a non-zero
+   *    base/third/unknown fee is NEVER silently converted to quote;
+   *  - only the attributable proceeds (quantity x averagePrice - fee) are booked;
+   *    the residual exchange balance is NEVER adopted as order proceeds;
+   *  - the SELL consumes the position provenance via `applyFill` (BOT first), and
+   *    a BUY requires an ACTIVE order-linked reservation (never consumes
+   *    un-reserved cash).
+   *
+   * Idempotency & conflict handling (fail closed):
+   *  - A repeat of the SAME attestation (same clientOrderId + identical payload)
+   *    is a no-op (returns this) — exactly once, never double-accounted.
+   *  - A CONFLICTING repeat (same clientOrderId but a different
+   *    quantity/price/fee/symbol/side/exchangeOrderId) THROWS.
+   *  - A different live order already attesting the SAME exchange OrderId, or a
+   *    manual settlement for the same external OrderId, or an applied execution
+   *    already on this order => THROWS (duplicate-accounting guard).
+   *
+   * @throws on a missing/empty identity, a conflicting repeat, an invalid
+   *         quantity/price/fee, a duplicate exchange-order accounting, or an
+   *         invalid BUY (no active reservation / under-reserved / exceeds held).
+   */
+  settleLiveOrderAttested(op: {
+    clientOrderId: string;
+    symbol: string;
+    side: OrderSide;
+    /** The original order quantity (the attested fill must never exceed it). */
+    orderQuantity: Money;
+    exchangeOrderId: string;
+    exchangeStatus: string;
+    attestedFilledQuantity: Money;
+    attestedAveragePrice: Money;
+    fee: Money;
+    feeCurrency: FeeCurrency;
+    evidenceSource: string;
+    accountingAuthority: string;
+    provenanceProof: false;
+    operatorConfirmedBy: string;
+    attestedAtMs: number;
+    exchangeReadAtMs: number;
+    exchangeEvidence: ExchangeEvidenceSnapshot;
+  }): Portfolio {
+    const { clientOrderId, symbol, side, orderQuantity, exchangeOrderId, attestedFilledQuantity, attestedAveragePrice } = op;
+    if (!clientOrderId) {
+      throw new Error('Portfolio.settleLiveOrderAttested: clientOrderId is required (live-order attestation identity)');
+    }
+    if (!exchangeOrderId) {
+      throw new Error('Portfolio.settleLiveOrderAttested: exchangeOrderId is required (must match the persisted live order)');
+    }
+    if (!symbol || (side !== 'BUY' && side !== 'SELL')) {
+      throw new Error('Portfolio.settleLiveOrderAttested: symbol and a valid side are required');
+    }
+    if (!attestedFilledQuantity.isPositive()) {
+      throw new Error('Portfolio.settleLiveOrderAttested: attested filled quantity must be positive');
+    }
+    if (attestedFilledQuantity.compareTo(orderQuantity) > 0) {
+      throw new Error(
+        `Portfolio.settleLiveOrderAttested: attested filled quantity ${attestedFilledQuantity} exceeds the original order quantity ${orderQuantity}`,
+      );
+    }
+    if (!attestedAveragePrice.isPositive()) {
+      throw new Error('Portfolio.settleLiveOrderAttested: attested average price must be positive');
+    }
+    if (op.fee.isNegative()) {
+      throw new Error('Portfolio.settleLiveOrderAttested: fee must not be negative');
+    }
+    // A non-zero fee may ONLY be accounted when its currency is authoritatively
+    // quote (or zero, currency-agnostic). A base/third/unknown fee is NEVER
+    // silently converted to quote (that would corrupt proceeds).
+    if (!op.fee.isZero() && op.feeCurrency !== 'quote') {
+      throw new Error(
+        `Portfolio.settleLiveOrderAttested: live order ${clientOrderId} has a non-zero fee (${op.fee}) in a ` +
+          `non-quote currency (${op.feeCurrency}); refusing to account a fee whose currency is not ` +
+          'authoritatively quote (fail closed)',
+      );
+    }
+    if (op.provenanceProof !== false) {
+      throw new Error('Portfolio.settleLiveOrderAttested: provenanceProof must always be false (operator attestation is never exchange proof)');
+    }
+    // Defense-in-depth: the accounting authority is enforced HERE, not only by the
+    // CLI parser. Only operator attestation may drive this path; a mislabelled
+    // attestation is never allowed to settle an order.
+    if (op.accountingAuthority !== 'operator_attestation') {
+      throw new Error(
+        `Portfolio.settleLiveOrderAttested: accountingAuthority must be "operator_attestation" (got "${String(op.accountingAuthority)}"); fail closed`,
+      );
+    }
+
+    // Idempotency: a repeat of the identical attestation is a no-op; a conflicting
+    // repeat is a fail-closed reconciliation signal (never a second accounting).
+    const existing = (this.state.liveOrderAttestations ?? new Map()).get(clientOrderId);
+    if (existing) {
+      if (
+        existing.exchangeEvidence.symbol === symbol &&
+        existing.exchangeEvidence.side === side &&
+        existing.exchangeOrderId === exchangeOrderId &&
+        existing.attestedFilledQuantity.equals(attestedFilledQuantity) &&
+        existing.attestedAveragePrice.equals(attestedAveragePrice) &&
+        existing.fee.equals(op.fee)
+      ) {
+        return this; // identical repeat => exactly once, no mutation
+      }
+      throw new Error(
+        `Portfolio.settleLiveOrderAttested: live order ${clientOrderId} is already attested with a different payload; ` +
+          'flag for reconciliation, do not re-account',
+      );
+    }
+
+    // DUPLICATE-ACCOUNTING GUARD: the same real exchange order must never be
+    // accounted twice.
+    //  - A proven execution already applied to THIS order (appliedExecutions)
+    //    means the order's execution was already accounted on the per-execution
+    //    path; attesting the aggregate would double-count.
+    for (const [, a] of this.state.appliedExecutions ?? new Map()) {
+      if (a.orderId === clientOrderId) {
+        throw new Error(
+          `Portfolio.settleLiveOrderAttested: live order ${clientOrderId} already has an applied execution; ` +
+            'refusing to also attest the order aggregate (duplicate accounting)',
+        );
+      }
+    }
+    //  - A manual settlement already accounting this external OrderId.
+    for (const [otherIntentId, s] of this.state.manualSettlements ?? new Map()) {
+      if (Portfolio.sameExternalOrderId(s.orderId, exchangeOrderId)) {
+        throw new Error(
+          `Portfolio.settleLiveOrderAttested: exchange order ${exchangeOrderId} is already accounted by a manual ` +
+            `settlement ${otherIntentId}; refusing to account the same exchange order twice`,
+        );
+      }
+    }
+    //  - Another live order already attesting this external OrderId.
+    for (const [otherClientOrderId, other] of this.state.liveOrderAttestations ?? new Map()) {
+      if (otherClientOrderId !== clientOrderId && Portfolio.sameExternalOrderId(other.exchangeOrderId, exchangeOrderId)) {
+        throw new Error(
+          `Portfolio.settleLiveOrderAttested: exchange order ${exchangeOrderId} is already attested by a different ` +
+            `live order ${otherClientOrderId}; refusing to account the same exchange order twice`,
+        );
+      }
+    }
+
+    // BUY settlement MUST be matched to an ACTIVE order-linked reservation (a live
+    // BUY reserves quote at submission; an unreserved BUY would silently consume
+    // cash without bounding the deployable pool).
+    const cost = attestedFilledQuantity.mul(attestedAveragePrice).add(op.fee);
+    const reservation = (this.state.orderReservations ?? new Map()).get(clientOrderId);
+    if (side === 'BUY') {
+      if (!reservation || reservation.status !== 'ACTIVE') {
+        throw new Error(
+          `Portfolio.settleLiveOrderAttested: live BUY ${clientOrderId} has no active reservation; ` +
+            'failed closed (an unreserved BUY attestation is not permitted)',
+        );
+      }
+      if (cost.compareTo(reservation.remaining) > 0) {
+        throw new Error(
+          `Portfolio.settleLiveOrderAttested: live BUY ${clientOrderId} cost ${cost} exceeds reserved ` +
+            `remaining ${reservation.remaining} (under-reserved; fail closed, never over-consumed)`,
+        );
+      }
+    }
+
+    // Apply the order-aggregate fill via the shared accounting path (correct SELL
+    // provenance consumption, cash/proceeds, realized P&L and fees). Do NOT
+    // duplicate the SELL accounting math here.
+    let next = this.applyFill(symbol, side, attestedFilledQuantity, attestedAveragePrice, op.fee);
+    if (side === 'BUY') {
+      next = next.consumeOrderReservation(clientOrderId, cost);
+      next = next.releaseQuote(reservation!.currency, cost);
+      next = next.releaseOrderReservation(clientOrderId);
+    }
+
+    const state = next.cloneState();
+    state.liveOrderAttestations.set(clientOrderId, {
+      attestationId: `op-attest:${clientOrderId}`,
+      clientOrderId,
+      exchangeOrderId,
+      exchangeStatus: op.exchangeStatus,
+      attestedFilledQuantity,
+      attestedAveragePrice,
+      fee: op.fee,
+      feeCurrency: op.fee.isZero() ? 'quote' : op.feeCurrency,
+      evidenceSource: op.evidenceSource,
+      accountingAuthority: op.accountingAuthority,
+      provenanceProof: op.provenanceProof,
+      operatorConfirmedBy: op.operatorConfirmedBy,
+      attestedAtMs: op.attestedAtMs,
+      exchangeReadAtMs: op.exchangeReadAtMs,
+      exchangeEvidence: op.exchangeEvidence,
+    });
+    return new Portfolio(state);
+  }
+
+  /**
    * Recompute equity/unrealized P&L using a current market price per symbol.
    * Returns current equity and unrealized P&L (quote) for open positions.
    */
@@ -1015,6 +1240,12 @@ export class Portfolio {
         [...(this.state.manualSettlements ?? [])].map(([id, s]) => [
           id,
           { ...s },
+        ]),
+      ),
+      liveOrderAttestations: new Map(
+        [...(this.state.liveOrderAttestations ?? [])].map(([id, a]) => [
+          id,
+          { ...a, exchangeEvidence: { ...a.exchangeEvidence, observedAccountTrades: a.exchangeEvidence.observedAccountTrades.map((t) => ({ ...t })), observedBalances: a.exchangeEvidence.observedBalances.map((b) => ({ ...b })) } },
         ]),
       ),
     };
