@@ -55,6 +55,7 @@ function empty(): ReconciliationResult {
   return {
     status: 'READY',
     reasons: [],
+    readFailures: [],
     orderFindings: [],
     executionFindings: [],
     reservationFindings: [],
@@ -335,6 +336,7 @@ function computeFindings(snapshot: ReconciliationSnapshot, exchange: ExchangeRea
   result.commitCandidates = commitCandidates;
   result.reservationReleases = reservationReleases;
   result.canCommit = commitCandidates.length > 0;
+  result.readFailures = exchange.readFailures;
   result.status = blocked ? 'RECONCILIATION_REQUIRED' : 'READY';
   result.reasons = reasons;
   return result;

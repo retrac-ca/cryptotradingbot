@@ -35,6 +35,7 @@ export const ORDER_STATUS = [
   'REJECTED',
   'EXPIRED',
   'UNKNOWN', // exchange state could not be determined (ambiguous)
+  'ABANDONED', // local OPERATOR resolution of an ambiguous order; NOT an exchange outcome
 ] as const;
 export type OrderStatus = (typeof ORDER_STATUS)[number];
 
@@ -122,6 +123,39 @@ export interface Order {
   createdAtMs: number | null;
   /** Like `createdAtMs`, the exchange's last-update time, else unknown. */
   updatedAtMs: number | null;
+  /**
+   * Durable audit of an OPERATOR resolution applied to a fundamentally ambiguous
+   * order (currently a durable LIVE `CREATED` order). This is ALWAYS operator
+   * attestation — never exchange proof. Absent for ordinary orders.
+   */
+  resolution?: OrderResolution | null;
+}
+
+/** How an ambiguous order was resolved by an operator. */
+export type OrderResolutionKind = 'ATTACH' | 'ABANDON';
+
+/**
+ * Durable operator-attestation audit for resolving a fundamentally ambiguous
+ * order. `provenanceProof` is ALWAYS the literal `false`: the operator closed
+ * the local record; the exchange outcome is NOT proven. This never represents an
+ * exchange fill, cancellation, or rejection.
+ */
+export interface OrderResolution {
+  kind: OrderResolutionKind;
+  /** Operator identity for the audit trail. */
+  operator: string;
+  /** Explicit operator-supplied reason. */
+  reason: string;
+  /** When the resolution was applied (local time). */
+  resolvedAtMs: number;
+  /** Always operator attestation — never exchange-proven. */
+  accountingAuthority: 'operator_attestation';
+  /** Always `false` — this is an operator attestation, not exchange proof. */
+  provenanceProof: false;
+  /** Operator-asserted exchange OrderId (ATTACH only; `null` for ABANDON). */
+  exchangeOrderId: string | null;
+  /** Short description of the read-only evidence reviewed. */
+  evidence: string;
 }
 
 /** Signals produced by strategies. Never executed directly. */

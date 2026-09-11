@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { rmSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { Money } from '../../../src/money/Money.js';
 import { OrderStore } from '../../../src/persistence/OrderStore.js';
 import { PaperStateStore } from '../../../src/persistence/PaperStateStore.js';
+import { ManagedStateStore } from '../../../src/persistence/ManagedStateStore.js';
+import { ManualIntentStore } from '../../../src/manual/ManualIntentStore.js';
 import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import { Portfolio } from '../../../src/portfolio/Portfolio.js';
 import { buildRiskManager } from '../../../src/risk/index.js';
@@ -17,10 +20,13 @@ import {
   parseLiveTestArgs,
 } from '../../../src/cli/live-test-cmd.js';
 import { evaluateFreshness } from '../../../src/marketdata/index.js';
-import type { MarketInfo, Ticker } from '../../../src/types.js';
+import type { AccountTrade, MarketInfo, Ticker } from '../../../src/types.js';
 import { statePath } from '../../helpers/state.js';
 
 const LEDGER = statePath('livetest', 'ledger.json');
+const STATE_DIR = dirname(LEDGER);
+const LIVE_FILE = join(STATE_DIR, 'live.json');
+const INTENTS_FILE = join(STATE_DIR, 'intents.json');
 const SYMBOL = 'BTC/CAD';
 const T0 = Date.now();
 
@@ -71,6 +77,10 @@ function cfg(over: Partial<BotConfig> = {}): BotConfig {
     reconcileIntervalSeconds: 60,
     killSwitch: false,
     orderLedgerFile: LEDGER,
+    stateDir: STATE_DIR,
+    liveManagedStateFile: LIVE_FILE,
+    manualIntentFile: INTENTS_FILE,
+    paperStateFile: join(STATE_DIR, 'paper.json'),
     ...over,
   } as BotConfig;
 }
@@ -95,6 +105,8 @@ interface Deps {
   cfg: BotConfig;
   adapter: FakeExchange;
   store: OrderStore;
+  live: ManagedStateStore;
+  manualIntents: ManualIntentStore;
   reconcile: ReconcileService;
   riskManager: ReturnType<typeof buildRiskManager>;
   portfolio: Portfolio;
@@ -104,6 +116,8 @@ interface Deps {
 
 function buildDeps(over: { cfg?: Partial<BotConfig>; adapter?: (e: FakeExchange) => void; confirm?: (m: string) => Promise<boolean>; portfolio?: Portfolio; nowMs?: () => number } = {}): Deps {
   rmSync(LEDGER, { force: true });
+  rmSync(LIVE_FILE, { force: true });
+  rmSync(INTENTS_FILE, { force: true });
   const c = cfg(over.cfg);
   const adapter = new FakeExchange({
     balances: { BTC: '0.25', CAD: '100000' },
@@ -120,10 +134,17 @@ function buildDeps(over: { cfg?: Partial<BotConfig>; adapter?: (e: FakeExchange)
     over.portfolio ??
     Portfolio.empty(new Map([['CAD', Money.fromString('100000')]]))
       .applyFill(SYMBOL, 'BUY', Money.fromString('0.25'), ticker().bid!, Money.fromString('5'));
+  // V1 reconciliation reads the durable live-managed store, so keep it in sync
+  // with the in-memory portfolio the risk/engine layers use.
+  const live = new ManagedStateStore(LIVE_FILE);
+  live.save(portfolio.stateModel);
+  const manualIntents = new ManualIntentStore(INTENTS_FILE);
   return {
     cfg: c,
     adapter,
     store,
+    live,
+    manualIntents,
     reconcile,
     riskManager,
     portfolio,
@@ -251,6 +272,93 @@ describe('executeLiveTest — gates (fail closed, no exchange contact)', () => {
       updatedAtMs: now,
     });
     expect(await harness(deps)).toBe(1);
+    expect(deps.adapter.submittedOrders).toHaveLength(0);
+  });
+});
+
+// --- executeLiveTest: V1 action-aware pre-trade reconciliation (P2-1) ---
+
+describe('executeLiveTest — V1 action-aware pre-trade reconciliation (P2-1)', () => {
+  it('a bounded SELL passes despite the known external/unmanaged CAD mismatch', async () => {
+    // Managed: 0.00023352 BTC + 11.97501697 CAD. Exchange: same BTC, but
+    // 37.99775272 CAD (26.02273575 is external/unmanaged). A SELL does not
+    // consume CAD, so the quote mismatch must not block.
+    const managed = Portfolio.empty(new Map([['CAD', Money.fromString('11.97501697')]]))
+      .withExternalSnapshot(new Map([[SYMBOL, Money.fromString('0.00023352')]]))
+      .authorizeExternal(SYMBOL);
+    const deps = buildDeps({
+      portfolio: managed,
+      adapter: (e) => {
+        e.setBalance('BTC', '0.00023352');
+        e.setBalance('CAD', '37.99775272');
+      },
+    });
+    const led = await executeLiveTest(deps, opts);
+    expect(led).toBe(0);
+    expect(deps.adapter.submittedOrders).toHaveLength(1);
+    expect(deps.adapter.submittedOrders[0]!.side).toBe('SELL');
+  });
+
+  it('blocks on a V1 read failure (and places nothing)', async () => {
+    const deps = buildDeps({ adapter: (e) => e.setFailures({ getOpenOrders: { kind: 'network' } }) });
+    const led = await harness(deps);
+    expect(led).toBe(1);
+    expect(deps.adapter.submittedOrders).toHaveLength(0);
+  });
+
+  it('blocks on an uncorrelated execution (V1-only; the legacy gate did not catch this)', async () => {
+    const trade: AccountTrade = {
+      executionId: 'e-uncorrelated',
+      tradeId: 't1',
+      orderId: '999999',
+      clientOrderId: '0',
+      symbol: SYMBOL,
+      instrumentId: '1',
+      accountId: '1',
+      subAccountId: '0',
+      side: 'BUY',
+      quantity: Money.fromString('0.1'),
+      remainingQuantity: Money.zero(),
+      price: Money.fromString('40000'),
+      value: Money.fromString('4000'),
+      tradeTimeMs: T0,
+      fee: Money.zero(),
+      feeProductId: null,
+      orderOriginator: null,
+    };
+    const deps = buildDeps({ adapter: (e) => e.seedAccountTrades([trade]) });
+    const led = await harness(deps);
+    expect(led).toBe(1);
+    expect(deps.adapter.submittedOrders).toHaveLength(0);
+  });
+
+  it('blocks on a FILLED order whose execution evidence is not proven/attested', async () => {
+    const now = Date.now();
+    const deps = buildDeps();
+    const filled = {
+      clientOrderId: 'live-BTCCAD-filled',
+      exchangeOrderId: '999',
+      symbol: SYMBOL,
+      side: 'SELL' as const,
+      type: 'limit' as const,
+      status: 'FILLED' as const,
+      quantity: Money.fromString('0.0003'),
+      filledQuantity: Money.fromString('0.0003'),
+      averagePrice: Money.fromString('40000'),
+      price: Money.fromString('40000'),
+      fills: [],
+      fee: Money.zero(),
+      feeCurrency: 'unknown' as const,
+      reason: 'seed',
+      createdAtMs: now,
+      updatedAtMs: now,
+    };
+    deps.store.save(filled);
+    // Exchange reports FILLED but no executions are observable, so completeness
+    // stays UNKNOWN -> V1 disposition OPERATOR_REQUIRED -> block.
+    deps.adapter.seedOrders([{ ...filled, clientOrderId: '', reason: '' }]);
+    const led = await harness(deps);
+    expect(led).toBe(1);
     expect(deps.adapter.submittedOrders).toHaveLength(0);
   });
 });

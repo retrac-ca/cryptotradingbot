@@ -17,7 +17,7 @@
 
 import { dirname } from 'node:path';
 import { Money } from '../money/Money.js';
-import { ORDER_STATUS, type FeeCurrency, type Fill, type Order } from '../order.js';
+import { ORDER_STATUS, type FeeCurrency, type Fill, type Order, type OrderResolution } from '../order.js';
 import { readEnvelope, writeEnvelope } from './envelope.js';
 import { withStateDirLock } from './lock.js';
 import { CorruptStateError, type LoadResult } from './types.js';
@@ -48,12 +48,18 @@ interface JsonOrder {
   reason: string;
   createdAtMs: number | null;
   updatedAtMs: number | null;
+  resolution?: OrderResolution | null;
 }
 
 const VALID_ORDER_STATUS: ReadonlySet<string> = new Set(ORDER_STATUS);
 
 export class OrderStore {
   constructor(private readonly filePath: string) {}
+
+  /** The durable order-ledger file path (also identifies its mutation-lock directory). */
+  get path(): string {
+    return this.filePath;
+  }
 
   /** Tri-state load (OK / MISSING / CORRUPT). CORRUPT is never MISSING. */
   load(): LoadResult<OrderLedgerPayload> {
@@ -173,6 +179,7 @@ function orderToJson(o: Order): JsonOrder {
     reason: o.reason,
     createdAtMs: o.createdAtMs,
     updatedAtMs: o.updatedAtMs,
+    ...(o.resolution ? { resolution: o.resolution } : {}),
   };
 }
 
@@ -205,5 +212,48 @@ function orderFromJson(j: JsonOrder): Order {
     reason: j.reason,
     createdAtMs: j.createdAtMs,
     updatedAtMs: j.updatedAtMs,
+    resolution: resolutionFromJson(j.resolution),
+  };
+}
+
+/**
+ * Validate + reconstruct an operator-resolution audit record. Fails closed on
+ * any malformed/tampered record so a corrupt ledger is never silently accepted.
+ * `accountingAuthority` and `provenanceProof` are pinned: a resolution can NEVER
+ * claim exchange provenance.
+ */
+function resolutionFromJson(r: unknown): OrderResolution | null {
+  if (r === null || r === undefined) return null;
+  if (typeof r !== 'object' || Array.isArray(r)) {
+    throw new Error('invalid order resolution record');
+  }
+  const o = r as Record<string, unknown>;
+  if (o.kind !== 'ATTACH' && o.kind !== 'ABANDON') {
+    throw new Error(`invalid order resolution kind "${String(o.kind)}"`);
+  }
+  if (typeof o.operator !== 'string' || o.operator.trim() === '') {
+    throw new Error('order resolution is missing its operator');
+  }
+  if (typeof o.reason !== 'string') {
+    throw new Error('order resolution is missing its reason');
+  }
+  if (typeof o.resolvedAtMs !== 'number' || !Number.isFinite(o.resolvedAtMs)) {
+    throw new Error('order resolution is missing its resolvedAtMs');
+  }
+  if (o.accountingAuthority !== 'operator_attestation') {
+    throw new Error('order resolution accountingAuthority must be operator_attestation');
+  }
+  if (o.provenanceProof !== false) {
+    throw new Error('order resolution provenanceProof must be false');
+  }
+  return {
+    kind: o.kind,
+    operator: o.operator,
+    reason: o.reason,
+    resolvedAtMs: o.resolvedAtMs,
+    accountingAuthority: 'operator_attestation',
+    provenanceProof: false,
+    exchangeOrderId: o.exchangeOrderId == null ? null : String(o.exchangeOrderId),
+    evidence: typeof o.evidence === 'string' ? o.evidence : '',
   };
 }

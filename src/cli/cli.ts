@@ -15,6 +15,7 @@ import { liveTestCommand } from './live-test-cmd.js';
 import { manualCommand } from './manual-cmd.js';
 import { paperCommand } from './paper-cmd.js';
 import { reconcileCommand } from './reconcile-cmd.js';
+import { resolveCreatedOrderCommand } from './resolve-created-order-cmd.js';
 import { resolveLiveOrderCommand } from './resolve-live-order-cmd.js';
 import { setupCommand } from './setup-cmd.js';
 import { startCommand } from './start-cmd.js';
@@ -35,6 +36,7 @@ export const COMMANDS = {
   'live-onboard-external': liveOnboardExternalCommand,
   manual: manualCommand,
   'resolve-live-order': resolveLiveOrderCommand,
+  'resolve-created-order': resolveCreatedOrderCommand,
 } as const;
 
 export type CommandName = keyof typeof COMMANDS;
@@ -57,6 +59,7 @@ Commands:
   live-onboard-external Authorize existing EXTERNAL exchange inventory as bot-managed (local ownership only; NOT trading)
   manual    Constrained MANUAL EXECUTION BRIDGE (operator interface; never places/cancels an exchange order)
   resolve-live-order Operator-attested resolution of an ambiguous FILLED live order (never submits/cancels)
+  resolve-created-order Operator-only ATTACH/ABANDON resolution of an ambiguous CREATED live order (never submits/cancels)
   help      Show this help
 
 Run "bot <command> --help" for command-specific options.

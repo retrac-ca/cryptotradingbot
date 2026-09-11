@@ -23,6 +23,13 @@ export interface OrderClassifyInput {
 export function classifyOrder(input: OrderClassifyInput): OrderDisposition {
   const { localStatus, exchangeStatus, provenExecuted, completeness } = input;
 
+  // A locally ABANDONED order is an OPERATOR resolution of a fundamentally
+  // ambiguous order (see `bot resolve-created-order`). It is terminal locally and
+  // there is no exchange outcome to reconcile: it is NOT a claim that the
+  // exchange did or did not have the order. Treat it as resolved (no action),
+  // never as an unresolved discrepancy.
+  if (localStatus === 'ABANDONED') return 'CONFIRMED';
+
   if (exchangeStatus === null) {
     // No exchange read => cannot confirm anything.
     if (localStatus === 'UNKNOWN' || localStatus === 'CREATED' || localStatus === 'SUBMITTED') return 'AMBIGUOUS';

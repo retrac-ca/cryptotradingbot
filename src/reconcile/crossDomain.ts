@@ -66,5 +66,5 @@ export function crossDomainValidation(
 }
 
 function isTerminalOrder(status: string): boolean {
-  return status === 'FILLED' || status === 'CANCELED' || status === 'REJECTED' || status === 'EXPIRED';
+  return status === 'FILLED' || status === 'CANCELED' || status === 'REJECTED' || status === 'EXPIRED' || status === 'ABANDONED';
 }

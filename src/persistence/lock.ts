@@ -48,23 +48,15 @@ export function lockPathFor(filePath: string): string {
 }
 
 /**
- * Run `fn` while holding the state-directory mutation lock for `dir`.
- * The lock is always released (on success OR failure).
+ * Acquire the state-directory lock file for `lockPath` (atomic exclusive
+ * create). On success the canonical path is added to the process reentrancy set.
+ * Cross-process exclusion is provided by the filesystem `open('wx')`; no PID
+ * inspection, stale-lock stealing, or timeout takeover is ever performed.
  *
- * Reentrant within this process: a nested `withStateDirLock` for the same
- * canonical directory (e.g. a store's `save()` called inside a `commitProven`
- * transaction) is allowed and does not re-acquire the lock. Cross-process, the
- * lock remains mutually exclusive via the lock file.
- *
- * @throws StateLockedError if the lock is held (by another process) / malformed.
+ * @throws StateLockedError if the lock already exists (held by another process)
+ *         or its metadata cannot be written.
  */
-export function withStateDirLock<T>(dir: string, fn: () => T): T {
-  const lockDir = canonicalLockDir(dir);
-  const lockPath = `${lockDir}/.mutation.lock`;
-  if (heldByProcess.has(lockPath)) {
-    // Already held by this process: run reentrantly without re-acquiring.
-    return fn();
-  }
+function acquireStateDirLock(lockDir: string, lockPath: string): void {
   mkdirSync(lockDir, { recursive: true });
 
   let fd: number;
@@ -94,15 +86,74 @@ export function withStateDirLock<T>(dir: string, fn: () => T): T {
   }
 
   heldByProcess.add(lockPath);
+}
+
+/** Release the lock file and the process reentrancy entry (idempotent). */
+function releaseStateDirLock(lockPath: string): void {
+  heldByProcess.delete(lockPath);
+  try {
+    rmSync(lockPath, { force: true });
+  } catch {
+    /* ignore: lock already gone */
+  }
+}
+
+/**
+ * Run `fn` while holding the state-directory mutation lock for `dir`.
+ * The lock is always released (on success OR failure).
+ *
+ * Reentrant within this process: a nested `withStateDirLock` for the same
+ * canonical directory (e.g. a store's `save()` called inside a `commitProven`
+ * transaction) is allowed and does not re-acquire the lock. Cross-process, the
+ * lock remains mutually exclusive via the lock file.
+ *
+ * @throws StateLockedError if the lock is held (by another process) / malformed.
+ */
+export function withStateDirLock<T>(dir: string, fn: () => T): T {
+  const lockDir = canonicalLockDir(dir);
+  const lockPath = `${lockDir}/.mutation.lock`;
+  if (heldByProcess.has(lockPath)) {
+    // Already held by this process: run reentrantly without re-acquiring.
+    return fn();
+  }
+  acquireStateDirLock(lockDir, lockPath);
   try {
     return fn();
   } finally {
-    heldByProcess.delete(lockPath);
-    try {
-      rmSync(lockPath, { force: true });
-    } catch {
-      /* ignore: lock already gone */
-    }
+    releaseStateDirLock(lockPath);
+  }
+}
+
+/**
+ * ASYNC variant of {@link withStateDirLock}: it holds the SAME state-directory
+ * `.mutation.lock` across `await` points, so a critical section that must span
+ * asynchronous work (e.g. the LIVE guard → persist-CREATED → exchange
+ * submission sequence) stays atomic against OTHER PROCESSES for its whole
+ * duration. This is NOT a second lock: it shares the canonical lock path and the
+ * process reentrancy set with the synchronous variant, so a nested synchronous
+ * store `save()` inside the held async lock runs reentrantly (no self-deadlock),
+ * and a separate process attempting the same directory fails closed with
+ * `StateLockedError`.
+ *
+ * The lock is always released on success OR failure. A process that crashes
+ * while holding it leaves the lock file in place; by design every subsequent
+ * mutator fails closed until the documented manual lock removal — there is no
+ * stale-lock stealing or timeout takeover.
+ *
+ * @throws StateLockedError if the lock is held (by another process) / malformed.
+ */
+export async function withStateDirLockAsync<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  const lockDir = canonicalLockDir(dir);
+  const lockPath = `${lockDir}/.mutation.lock`;
+  if (heldByProcess.has(lockPath)) {
+    // Already held by this process: run reentrantly without re-acquiring.
+    return fn();
+  }
+  acquireStateDirLock(lockDir, lockPath);
+  try {
+    return await fn();
+  } finally {
+    releaseStateDirLock(lockPath);
   }
 }
 

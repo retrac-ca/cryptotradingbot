@@ -20,7 +20,7 @@ import type {
   ReconcileReport,
 } from './types.js';
 
-const TERMINAL: ReadonlySet<string> = new Set(['FILLED', 'CANCELED', 'REJECTED', 'EXPIRED']);
+const TERMINAL: ReadonlySet<string> = new Set(['FILLED', 'CANCELED', 'REJECTED', 'EXPIRED', 'ABANDONED']);
 
 /** Default tolerance for balance comparison: one smallest unit (exact by default). */
 const DEFAULT_BALANCE_TOLERANCE = Money.fromString('0.00000001');

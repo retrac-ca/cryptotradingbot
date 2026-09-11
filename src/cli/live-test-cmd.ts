@@ -52,8 +52,8 @@ import {
 } from '../persistence/index.js';
 import { ManualIntentStore } from '../manual/index.js';
 import { Portfolio } from '../portfolio/index.js';
-import { ReconcileService } from '../reconcile/index.js';
-import type { ReconcileReport } from '../reconcile/types.js';
+import { ReconcileService, reconcile, livePreTradeGate } from '../reconcile/index.js';
+import type { ReconciliationDeps, ReconciliationResult, LivePreTradeGateResult } from '../reconcile/index.js';
 import { buildRiskManager } from '../risk/index.js';
 import type { RiskContext } from '../risk/index.js';
 import type { RiskDecision } from '../risk/Reason.js';
@@ -81,6 +81,10 @@ export interface LiveTestDeps {
   cfg: BotConfig;
   adapter: ExchangeAdapter;
   store: OrderStore;
+  /** Durable live-managed store (V1 reconciliation + ownership). */
+  live: ManagedStateStore;
+  /** Durable manual-intent store (V1 cross-domain reconciliation). */
+  manualIntents: ManualIntentStore;
   reconcile: ReconcileService;
   riskManager: import('../risk/RiskManager.js').RiskManager;
   /** The bot-MANAGED portfolio. External holdings are never sold here. */
@@ -179,7 +183,8 @@ interface SummaryInputs {
   balances: Balance[];
   targetCad: number;
   decision: RiskDecision;
-  report: ReconcileReport;
+  reconciliation: ReconciliationResult;
+  gate: LivePreTradeGateResult;
   gates: RefreshGate[];
 }
 
@@ -246,7 +251,13 @@ function printSummary(i: SummaryInputs, riskCfg: SummaryRiskPolicy): void {
   out('    observed at ts:         ' + i.observedAtMs);
   out('    quote age:              ' + (i.quoteTs === null ? 'n/a' : String(Math.max(0, i.observedAtMs - i.quoteTs))) + 'ms (limit ' + riskCfg.marketDataMaxAgeMs + 'ms)');
   out('    transport age:          ' + '0ms (limit ' + riskCfg.marketDataTransportMaxAgeMs + 'ms)');
-  out('  Reconciliation:           ' + (i.report.safeToTrade ? 'safeToTrade' : 'NOT safeToTrade') + '  consistent=' + i.report.consistent + '  openOrders=' + i.report.openOrders.length + '  discrepancies=' + i.report.discrepancies.length);
+  out('  Reconciliation (V1):      ' + i.reconciliation.status + '  pre-trade(SELL): ' + (i.gate.allowed ? 'ALLOWED' : 'BLOCKED'));
+  const balanceMismatches = i.reconciliation.balanceFindings.filter((b) => b.mismatch);
+  if (balanceMismatches.length > 0) {
+    out('    balance findings:       ' + balanceMismatches.map((b) => b.currency).join(', ') +
+      ' (non-action-relevant drift does not block a SELL; run `bot reconcile` for the global view)');
+  }
+  for (const b of i.gate.blockers) out('    [block] ' + b);
   out('  Gates (pre-contact):');
   for (const g of i.gates) out('    [' + (g.passed ? 'PASS' : 'FAIL') + '] ' + g.label + ' (' + g.detail + ')');
 }
@@ -490,16 +501,28 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
   });
   const decision = deps.riskManager.evaluate(displayCtx);
 
-  // Reconciliation — the exchange must be in a clean, readable, consistent state.
-  // Ownership-aware: we assert the exchange shows the assets the bot accounts
-  // for (managed + external). An unexpected gain/loss is a discrepancy, fail-safe.
-  let report: ReconcileReport;
+  // Authoritative V1 reconciliation (READ-ONLY). ONE exchange-read pass. The
+  // global result is projected onto the intended SELL action below, so legitimate
+  // external/unmanaged quote cash (e.g. CAD) does not over-block a bounded SELL,
+  // while unresolved order/execution/reservation/cross-domain problems still do.
+  // The global `bot reconcile` status remains strict.
+  let reconciliation: ReconciliationResult;
   try {
-    report = await deps.reconcile.reconcile({ expectedBalances: deps.portfolio.expectedAssetBalances() });
+    const reconcileDeps: ReconciliationDeps = {
+      stateDir: cfg.stateDir ?? dirname(cfg.liveManagedStateFile),
+      orders: deps.store,
+      live: deps.live,
+      manualIntents: deps.manualIntents,
+      adapter,
+      nowMs: now,
+    };
+    reconciliation = await reconcile(reconcileDeps);
   } catch (e) {
     err('live-test aborted: reconciliation failed: ' + (e instanceof Error ? e.message : String(e)));
     return 1;
   }
+  const quoteCurrencies = new Set(cfg.tradingPairs.map((p) => p.split('/')[1] ?? ''));
+  const gate = livePreTradeGate(reconciliation, { side: 'SELL', symbol, quoteCurrencies });
 
   const summary: SummaryInputs = {
     symbol,
@@ -512,7 +535,8 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
     balances: initial.balances,
     targetCad: opts.targetCad,
     decision,
-    report,
+    reconciliation,
+    gate,
     gates,
   };
   printSummary(summary, cfg);
@@ -521,8 +545,12 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
     err('\nlive-test refused: risk decision not approved (' + decision.reason + '). No order placed.');
     return 1;
   }
-  if (!report.safeToTrade) {
-    err('\nlive-test refused: reconciliation is not safe to trade. Run `bot reconcile` and resolve discrepancies before any order.');
+  if (!gate.allowed) {
+    err(
+      '\nlive-test refused: action-aware pre-trade reconciliation blocked this SELL.\n  ' +
+        gate.blockers.join('\n  ') +
+        '\n  Run `bot reconcile` and resolve the blocking findings before any order.',
+    );
     return 1;
   }
 
@@ -728,6 +756,8 @@ export const liveTestCommand: CommandHandler = async (args): Promise<number> => 
 
   const store = new OrderStore(cfg.orderLedgerFile);
   const service = new ReconcileService(adapter, store);
+  const liveStore = new ManagedStateStore(cfg.liveManagedStateFile);
+  const manualIntents = new ManualIntentStore(cfg.manualIntentFile);
 
   const livePortfolio = loadLiveManagedPortfolio(cfg);
 
@@ -736,6 +766,8 @@ export const liveTestCommand: CommandHandler = async (args): Promise<number> => 
       cfg,
       adapter,
       store,
+      live: liveStore,
+      manualIntents,
       reconcile: service,
       riskManager: buildRiskManager(cfg),
       portfolio: livePortfolio,

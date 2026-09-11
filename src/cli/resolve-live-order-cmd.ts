@@ -450,14 +450,31 @@ export async function runResolveLiveOrder(deps: ResolveLiveOrderDeps, argv: stri
   if (!fresh.averagePrice || !fresh.averagePrice.isPositive()) {
     return blocked([`exchange evidence mismatch: order ${o.orderId} has no positive average execution price`], { error: 'no_avg_price', clientOrderId: o.clientOrderId });
   }
-  const feeRes2 = await resolveAttestationFee(deps.adapter, fresh, accountTrades, fresh.filledQuantity);
+  // 5. Re-read AccountTrades and balances AFTER confirmation so the final
+  //    attestation and the persisted evidence snapshot use genuinely fresh
+  //    post-confirmation exchange data (AccountTrades can be eventually
+  //    consistent). Fail closed on either read; never fall back to the
+  //    pre-confirmation values.
+  let freshAccountTrades: AccountTrade[] = [];
+  let freshBalances: Balance[] = [];
+  try {
+    freshAccountTrades = await deps.adapter.getAccountTrades(order.symbol);
+    freshBalances = await deps.adapter.getBalances();
+  } catch (err) {
+    return blocked(
+      [`fresh exchange read failed (${err instanceof Error ? err.message : String(err)}); fail closed, no accounting applied`],
+      { error: 'exchange_read_failed', clientOrderId: o.clientOrderId },
+    );
+  }
+  const feeRes2 = await resolveAttestationFee(deps.adapter, fresh, freshAccountTrades, fresh.filledQuantity);
   if (!feeRes2.ok) {
     return blocked([feeRes2.reason], { error: 'fee_unresolved', clientOrderId: o.clientOrderId });
   }
   const exchangeReadAtMs = now();
-  const evidence = buildEvidenceSnapshot(fresh, freshSource, accountTrades, balances, exchangeReadAtMs);
+  const evidence = buildEvidenceSnapshot(fresh, freshSource, freshAccountTrades, freshBalances, exchangeReadAtMs);
+  const freshLines = renderEvidence(order, fresh, freshSource, freshAccountTrades, feeRes2, freshBalances);
 
-  // 5. Acquire the state mutation lock, reload + revalidate (TOCTOU), then apply
+  // 6. Acquire the state mutation lock, reload + revalidate (TOCTOU), then apply
   //    exactly once and atomically persist. SYNCHRONOUS ONLY: all exchange reads
   //    happen outside the lock (the mutation lock is never held across I/O).
   try {
@@ -569,7 +586,7 @@ export async function runResolveLiveOrder(deps: ResolveLiveOrderDeps, argv: stri
     };
     return ok(
       [
-        ...lines,
+        ...freshLines,
         '',
         'ATTESTATION APPLIED (operator attestation, provenanceProof=false).',
         `  order status:            ${applied.order.status}`,

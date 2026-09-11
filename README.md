@@ -173,6 +173,9 @@ following files are created there and are git-ignored — do not commit them:
 - `.mutation.lock` — the state-directory mutation lock (fail-closed; removed on
   a clean release)
 
+See `docs/CREATED_ORDER_RECOVERY.md` for the operator procedure to resolve an
+ambiguous `CREATED` live order and to remove a stale `.mutation.lock`.
+
 The configuration refuses to start if `PAPER_STATE_FILE` and
 `LIVE_MANAGED_STATE_FILE` are the same, or if any state file is outside
 `STATE_DIR`.

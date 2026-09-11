@@ -15,6 +15,8 @@ export { Reconciler, TERMINAL } from './Reconciler.js';
 export { ReconcileService } from './ReconcileService.js';
 export { reconcile, commitProven } from './orchestrator.js';
 export type { ReconciliationDeps } from './orchestrator.js';
+export { livePreTradeGate } from './preTradeGate.js';
+export type { LivePreTradeAction, LivePreTradeGateResult } from './preTradeGate.js';
 export { correlateExecution } from './executionCorrelation.js';
 export type { CorrelationResult } from './executionCorrelation.js';
 export { analyzeCompleteness } from './completeness.js';

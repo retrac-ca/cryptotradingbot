@@ -15,7 +15,7 @@ export { OrderStore } from './OrderStore.js';
 export type { OrderLedgerPayload, OrderLedgerV1 } from './OrderStore.js';
 export { readEnvelope, writeEnvelope, STATE_FORMAT, STATE_VERSION } from './envelope.js';
 export type { StateEnvelope } from './envelope.js';
-export { withStateDirLock, lockPathFor, isLockHeld } from './lock.js';
+export { withStateDirLock, withStateDirLockAsync, lockPathFor, isLockHeld } from './lock.js';
 export type { LockMetadata } from './lock.js';
 export { StateInitMarker } from './init.js';
 export type { StateInitPayload } from './init.js';

@@ -42,6 +42,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { dirname } from 'node:path';
 import { Money } from '../money/Money.js';
 import type { NewOrder, Order, OrderStatus, OrderType } from '../order.js';
 import type { ExchangeAdapter } from '../exchanges/ExchangeAdapter.js';
@@ -54,6 +55,7 @@ import {
   OrderRejectedError,
 } from '../exchanges/errors.js';
 import { OrderStore } from '../persistence/OrderStore.js';
+import { withStateDirLockAsync } from '../persistence/index.js';
 import { ReconcileService } from '../reconcile/ReconcileService.js';
 import { RiskManager } from '../risk/RiskManager.js';
 import type { RiskApproval, RiskRejection } from '../risk/Reason.js';
@@ -158,6 +160,13 @@ export class LiveOrderEngine {
     ackTimeoutMs: number;
     reattachmentClientOrderIdIsUnique: boolean;
   };
+  /**
+   * State directory whose cross-process mutation lock guards the LIVE
+   * submission critical section (guard → validate → persist CREATED →
+   * exchange submission). Derived from the durable order ledger so it is the
+   * SAME canonical lock the ledger's own writes use.
+   */
+  private readonly stateDir: string;
 
   constructor(
     adapter: ExchangeAdapter,
@@ -170,6 +179,7 @@ export class LiveOrderEngine {
     this.store = store;
     this.reconcileService = reconcile;
     this.riskManager = riskManager;
+    this.stateDir = dirname(store.path);
     this.cfg = {
       ackTimeoutMs: cfg.ackTimeoutMs ?? 15_000,
       reattachmentClientOrderIdIsUnique: cfg.reattachmentClientOrderIdIsUnique ?? false,
@@ -307,44 +317,55 @@ export class LiveOrderEngine {
    * the adapter (via placeOrder). Never retries ambiguous outcomes.
    */
   private async submit(order: NewOrder): Promise<LiveOrderResult> {
-    // One-in-flight LIVE guard: the controlled scope allows at most one
-    // unresolved live order. This is evaluated before submission and reads the
-    // durable order ledger, so it survives restart.
-    this.assertNoUnresolvedLiveOrder();
-    await this.validateOrder(order);
+    // Cross-process atomicity (P2-3): hold the state-directory mutation lock for
+    // the WHOLE critical section — unresolved-order guard, validation, durable
+    // CREATED persistence, and the exchange submission — so two concurrent LIVE
+    // processes cannot both observe "no unresolved LIVE order" and both reach
+    // SendOrder. The lock is the SAME canonical `.mutation.lock` the ledger's own
+    // writes use, so nested `store.save()` calls run reentrantly. It is acquired
+    // BEFORE the guard and released only after the resulting submission state is
+    // persisted (or the attempt fails closed).
+    return withStateDirLockAsync(this.stateDir, async () => {
+      // One-in-flight LIVE guard: the controlled scope allows at most one
+      // unresolved live order. It runs AFTER lock acquisition and reads the
+      // durable order ledger fresh, so it observes authoritative state (TOCTOU
+      // safe) and survives restart.
+      this.assertNoUnresolvedLiveOrder();
+      await this.validateOrder(order);
 
-    // Persist-before-submit: claim the internally-generated clientOrderId.
-    if (this.store.get(order.clientOrderId)) {
-      return {
-        order: this.buildRejected(order, 'DUPLICATE_CLIENT_ORDER_ID: an order with this id already exists; reconcile instead of re-submitting'),
-        unknownOutcome: false,
-        message: 'refused: duplicate clientOrderId',
-      };
-    }
-    const created = this.buildRecorded(order, 'CREATED');
-    this.store.save(created);
-
-    try {
-      const result = await this.withAckTimeout(order, this.adapter.placeOrder(order, this.cfg.controlledLiveAuthorization));
-      if (result.unknownOutcome) {
-        const unknown = this.buildRecorded(order, 'UNKNOWN', result.exchangeOrderId ?? null);
-        this.store.save(unknown);
+      // Persist-before-submit: claim the internally-generated clientOrderId.
+      if (this.store.get(order.clientOrderId)) {
         return {
-          order: unknown,
-          unknownOutcome: true,
-          message: 'submission outcome unknown; reconcile with the exchange before any action',
+          order: this.buildRejected(order, 'DUPLICATE_CLIENT_ORDER_ID: an order with this id already exists; reconcile instead of re-submitting'),
+          unknownOutcome: false,
+          message: 'refused: duplicate clientOrderId',
         };
       }
-      const acked = this.buildRecorded(
-        order,
-        'SUBMITTED',
-        result.exchangeOrderId ?? null,
-      );
-      this.store.save(acked);
-      return { order: acked, unknownOutcome: false, message: 'order acknowledged by exchange' };
-    } catch (err) {
-      return this.handleSubmissionError(order, err);
-    }
+      const created = this.buildRecorded(order, 'CREATED');
+      this.store.save(created);
+
+      try {
+        const result = await this.withAckTimeout(order, this.adapter.placeOrder(order, this.cfg.controlledLiveAuthorization));
+        if (result.unknownOutcome) {
+          const unknown = this.buildRecorded(order, 'UNKNOWN', result.exchangeOrderId ?? null);
+          this.store.save(unknown);
+          return {
+            order: unknown,
+            unknownOutcome: true,
+            message: 'submission outcome unknown; reconcile with the exchange before any action',
+          };
+        }
+        const acked = this.buildRecorded(
+          order,
+          'SUBMITTED',
+          result.exchangeOrderId ?? null,
+        );
+        this.store.save(acked);
+        return { order: acked, unknownOutcome: false, message: 'order acknowledged by exchange' };
+      } catch (err) {
+        return this.handleSubmissionError(order, err);
+      }
+    });
   }
 
   /**
@@ -585,12 +606,15 @@ export class LiveOrderEngine {
   /**
    * One-in-flight LIVE guard (controlled scope): reject a new LIVE order while an
    * unresolved live order exists in the durable ledger. "Unresolved" includes
-   * SUBMITTED / OPEN / PARTIALLY_FILLED / UNKNOWN (an UNKNOWN order is what a
-   * reconciliation-required order is recorded as). Only live-prefixed orders are
+   * CREATED / SUBMITTED / OPEN / PARTIALLY_FILLED / UNKNOWN. CREATED is included
+   * because a durable CREATED order (crash after persist-before-submit but
+   * before/around SendOrder) may or may not have reached the exchange — it is
+   * fundamentally ambiguous and must block new placement until an operator
+   * resolves it (`bot resolve-created-order`). Only live-prefixed orders are
    * considered, so unrelated ledger entries (e.g. seeded fixtures) never block.
    */
   private assertNoUnresolvedLiveOrder(): void {
-    const unresolved: ReadonlySet<OrderStatus> = new Set(['SUBMITTED', 'OPEN', 'PARTIALLY_FILLED', 'UNKNOWN']);
+    const unresolved: ReadonlySet<OrderStatus> = new Set(['CREATED', 'SUBMITTED', 'OPEN', 'PARTIALLY_FILLED', 'UNKNOWN']);
     for (const o of this.store.allOrders().values()) {
       if (o.clientOrderId.startsWith('live-') && unresolved.has(o.status)) {
         throw new LiveGateError(

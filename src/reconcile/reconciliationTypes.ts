@@ -105,6 +105,13 @@ export interface ReservationRelease {
 export interface ReconciliationResult {
   status: 'READY' | 'RECONCILIATION_REQUIRED' | 'HALTED';
   reasons: string[];
+  /**
+   * Structured exchange-read failures (one entry per failed read). A non-empty
+   * list means reconciliation could not establish the full exchange picture and
+   * any pre-trade gate MUST fail closed. Kept separate from `reasons` so gates
+   * never parse human-readable strings.
+   */
+  readFailures: string[];
   orderFindings: OrderFinding[];
   executionFindings: ExecutionFinding[];
   reservationFindings: ReservationFinding[];

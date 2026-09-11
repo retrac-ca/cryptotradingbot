@@ -163,6 +163,7 @@ function makeDeps(overrides?: {
   fake?: FakeExchange;
   confirm?: (m: string) => Promise<boolean>;
   liveOrder?: Order;
+  nowMs?: () => number;
 }): Deps {
   const stateDir = statePath('rlo', 'dir');
   const orders = new OrderStore(`${stateDir}/ledger.json`);
@@ -184,7 +185,7 @@ function makeDeps(overrides?: {
     adapter: readOnly,
     orders,
     live,
-    nowMs: () => NOW,
+    nowMs: overrides?.nowMs ?? (() => NOW),
     confirm: overrides?.confirm,
   };
   return { deps, fake, orders, live, stateDir, dispose: () => undefined };
@@ -648,6 +649,137 @@ describe('bot resolve-live-order — operator-attested resolution CLI', () => {
     expect(pf.cash('CAD').toString()).not.toBe('37.99775272');
     expect(pf.position(SYMBOL)!.sourceQuantities.EXTERNAL_AUTHORIZED.toString()).toBe(POSITION_AFTER.toString());
     expect(pf.position(SYMBOL)!.sourceQuantities.BOT.toString()).toBe('0.00000000');
+    dispose();
+  });
+
+  it('P2-4: a correlated trade appearing after confirmation is used for the final attestation', async () => {
+    // Pre-confirmation there is NO correlated execution (eventually-consistent
+    // AccountTrades); the exact trade only appears after confirmation.
+    const fake = makeFeeFake({ feeKind: 'quote', trades: [] });
+    const { deps, live, dispose } = makeDeps({
+      fake,
+      confirm: async () => {
+        fake.seedAccountTrades([correlatedTrade('0.02399803')]);
+        return true;
+      },
+    });
+    const res = await runResolveLiveOrder(deps, BASE_ARGS.filter((a) => a !== '--confirm'));
+    expect(res.code).toBe(0);
+    const a = live.toPortfolio(live.load().data!)!.liveOrderAttestation(CLIENT)!;
+    expect(a.fee.toString()).toBe('0.02399803');
+    expect(a.feeCurrency).toBe('quote');
+    const pf = live.toPortfolio(live.load().data!)!;
+    expect(pf.cash('CAD').toString()).toBe('11.97501697'); // 11.99901500 gross - 0.02399803 fee
+    dispose();
+  });
+
+  it('P2-4: balances read after confirmation are persisted in the evidence snapshot', async () => {
+    const fake = new FakeExchange();
+    fake.seedOrders([exchangeFilled()]);
+    fake.seedAccountTrades([]);
+    fake.setBalance('BTC', POSITION_AFTER.toString());
+    fake.setBalance('CAD', '10.00000000'); // pre-confirmation value
+    const { deps, live, dispose } = makeDeps({
+      fake,
+      confirm: async () => {
+        fake.setBalance('CAD', '99.00000000'); // fresh post-confirmation value
+        return true;
+      },
+    });
+    const res = await runResolveLiveOrder(deps, BASE_ARGS.filter((a) => a !== '--confirm'));
+    expect(res.code).toBe(0);
+    const a = live.toPortfolio(live.load().data!)!.liveOrderAttestation(CLIENT)!;
+    const cad = a.exchangeEvidence.observedBalances.find((b) => b.currency === 'CAD')!;
+    expect(cad.total.toString()).toBe('99.00000000');
+    dispose();
+  });
+
+  it('P2-4: a post-confirmation getAccountTrades failure fails closed before mutation', async () => {
+    const fake = new FakeExchange();
+    fake.seedOrders([exchangeFilled()]);
+    fake.seedAccountTrades([]);
+    fake.setBalance('BTC', POSITION_AFTER.toString());
+    fake.setBalance('CAD', '37.99775272');
+    const { deps, live, dispose } = makeDeps({
+      fake,
+      confirm: async () => {
+        fake.setFailures({ getAccountTrades: { kind: 'network' } });
+        return true;
+      },
+    });
+    const res = await runResolveLiveOrder(deps, BASE_ARGS.filter((a) => a !== '--confirm'));
+    expect(res.code).toBe(2);
+    expect(res.json.error).toBe('exchange_read_failed');
+    const pf = live.toPortfolio(live.load().data!)!;
+    expect(pf.liveOrderAttestation(CLIENT)).toBeNull();
+    expect(pf.position(SYMBOL)!.quantity.toString()).toBe(POSITION_BEFORE.toString());
+    dispose();
+  });
+
+  it('P2-4: a post-confirmation getBalances failure fails closed before mutation', async () => {
+    const fake = new FakeExchange();
+    fake.seedOrders([exchangeFilled()]);
+    fake.seedAccountTrades([]);
+    fake.setBalance('BTC', POSITION_AFTER.toString());
+    fake.setBalance('CAD', '37.99775272');
+    const { deps, live, dispose } = makeDeps({
+      fake,
+      confirm: async () => {
+        fake.setFailures({ getBalances: { kind: 'network' } });
+        return true;
+      },
+    });
+    const res = await runResolveLiveOrder(deps, BASE_ARGS.filter((a) => a !== '--confirm'));
+    expect(res.code).toBe(2);
+    expect(res.json.error).toBe('exchange_read_failed');
+    const pf = live.toPortfolio(live.load().data!)!;
+    expect(pf.liveOrderAttestation(CLIENT)).toBeNull();
+    expect(pf.position(SYMBOL)!.quantity.toString()).toBe(POSITION_BEFORE.toString());
+    dispose();
+  });
+
+  it('P2-4: exchangeEvidence.readAtMs is captured after the fresh post-confirmation reads', async () => {
+    let clock = 0;
+    let tradeReads = 0;
+    let balanceReads = 0;
+    let freshReadsDoneClock = 0;
+    const fake = new FakeExchange();
+    fake.seedOrders([exchangeFilled()]);
+    fake.seedAccountTrades([]);
+    fake.setBalance('BTC', POSITION_AFTER.toString());
+    fake.setBalance('CAD', '37.99775272');
+    const origTrades = fake.getAccountTrades.bind(fake);
+    const origBalances = fake.getBalances.bind(fake);
+    fake.getAccountTrades = async (symbol?: string) => {
+      clock += 10;
+      tradeReads += 1;
+      const result = await origTrades(symbol);
+      if (tradeReads >= 2) freshReadsDoneClock = Math.max(freshReadsDoneClock, clock);
+      return result;
+    };
+    fake.getBalances = async () => {
+      clock += 10;
+      balanceReads += 1;
+      const result = await origBalances();
+      if (balanceReads >= 2) freshReadsDoneClock = Math.max(freshReadsDoneClock, clock);
+      return result;
+    };
+    const { deps, live, dispose } = makeDeps({
+      fake,
+      nowMs: () => {
+        clock += 1;
+        return clock;
+      },
+    });
+    const res = await runResolveLiveOrder(deps, BASE_ARGS);
+    expect(res.code).toBe(0);
+    // Both the pre- and post-confirmation reads occurred...
+    expect(tradeReads).toBe(2);
+    expect(balanceReads).toBe(2);
+    const a = live.toPortfolio(live.load().data!)!.liveOrderAttestation(CLIENT)!;
+    // ...and the recorded read timestamp is strictly after the last fresh read.
+    expect(freshReadsDoneClock).toBeGreaterThan(0);
+    expect(a.exchangeEvidence.readAtMs).toBeGreaterThan(freshReadsDoneClock);
     dispose();
   });
 });
