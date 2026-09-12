@@ -17,8 +17,17 @@
  *   applies the ownership-aware findings to the ACTION:
  *
  *   - Global hard blocks (any action): HALTED, any exchange read failure, any
- *     unresolved order, any unresolved execution, any ambiguous reservation, and
- *     any operator/cross-domain finding.
+ *     unresolved order, any execution that is not attributable to managed
+ *     accounting (PROVEN with an unsafe/non-QUOTE fee, AMBIGUOUS, or
+ *     STRONG_BUT_NOT_PROVEN), any ambiguous reservation, and any
+ *     operator/cross-domain finding.
+ *   - Execution attribution scope:
+ *       For a SELL, UNCORRELATED executions (no local bot order attribution)
+ *       do NOT independently block; they are outside managed
+ *       execution-attribution scope. This is an ATTRIBUTION-SCOPING decision,
+ *       NOT a claim that those executions are proven external. BUY does NOT
+ *       apply this exception and remains conservative. See the execution loop
+ *       below for the precise rationale and backstops.
  *   - Balance rules:
  *       SELL: a mismatch on the BASE asset being sold blocks (its ownership is
  *             what the SELL consumes). A quote-currency mismatch (e.g.
@@ -92,9 +101,25 @@ export function livePreTradeGate(
     }
   }
 
-  // Executions must be PROVEN with a QUOTE fee disposition. Anything weaker
-  // (uncorrelated, ambiguous, base/unknown fee) cannot be safely accounted.
+  // Execution findings are gated by ATTRIBUTION to the bot's managed
+  // accounting — never by a claim about external ownership:
+  //   - PROVEN: correlated to a local bot order => in managed scope. It must be
+  //     accounted with a QUOTE fee; a BASE/UNKNOWN/MALFORMED fee blocks.
+  //   - AMBIGUOUS / STRONG_BUT_NOT_PROVEN: attribution is indeterminate (could be
+  //     the bot's) => block, fail closed.
+  //   - UNCORRELATED: no local bot order attribution exists. The bot does NOT
+  //     account uncorrelated executions, so for a SELL they are outside managed
+  //     execution-attribution scope and must not independently block. This is an
+  //     ATTRIBUTION-SCOPING decision, NOT a claim that the execution is "proven
+  //     external". The bot's OWN unresolved orders/reservations are separately
+  //     blocked above, and the sold-base balance rule below remains the SELL
+  //     backstop for external activity that changes the managed asset. BUY stays
+  //     conservative: it does NOT skip UNCORRELATED executions.
   for (const e of result.executionFindings) {
+    if (action.side === 'SELL' && e.correlation === 'UNCORRELATED') {
+      continue;
+    }
+
     if (e.correlation !== 'PROVEN' || e.feeDisposition !== 'QUOTE') {
       blockers.push(
         `execution ${e.executionId ?? 'no-id'} is not proven+quote (correlation ${e.correlation}, ` +

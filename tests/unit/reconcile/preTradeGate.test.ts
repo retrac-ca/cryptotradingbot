@@ -168,16 +168,20 @@ describe('P2-1 livePreTradeGate — global hard blocks', () => {
     expect(livePreTradeGate(result, SELL).allowed).toBe(true);
   });
 
-  it('8. SELL blocked on an uncorrelated execution', () => {
+  it('8. SELL is NOT blocked by an UNCORRELATED execution (attribution-scoping)', () => {
     const result = baseResult({ executionFindings: [execution({ correlation: 'UNCORRELATED' })] });
     const gate = livePreTradeGate(result, SELL);
-    expect(gate.allowed).toBe(false);
-    expect(gate.blockers.join(' ')).toMatch(/not proven\+quote/);
+    expect(gate.allowed).toBe(true);
+    expect(gate.blockers).toEqual([]);
   });
 
   it('SELL blocked on a PROVEN execution with a non-quote fee', () => {
-    const result = baseResult({ executionFindings: [execution({ correlation: 'PROVEN', feeDisposition: 'BASE' })] });
-    expect(livePreTradeGate(result, SELL).allowed).toBe(false);
+    for (const feeDisposition of ['BASE', 'UNKNOWN', 'MALFORMED'] as const) {
+      const result = baseResult({ executionFindings: [execution({ correlation: 'PROVEN', feeDisposition })] });
+      const gate = livePreTradeGate(result, SELL);
+      expect(gate.allowed).toBe(false);
+      expect(gate.blockers.join(' ')).toMatch(/not proven\+quote/);
+    }
   });
 
   it('9. SELL blocked on an ambiguous reservation', () => {
@@ -245,8 +249,129 @@ describe('P2-1 livePreTradeGate — BUY semantics (not reachable; must stay safe
 
   it('BUY with zero managed deployable blocks', () => {
     const result = baseResult();
-    const gate = livePreTradeGate(result, { ...BUY, managedQuoteDeployable: Money.zero() });
+    const gate = livePreTradeGate(result, BUY);
     expect(gate.allowed).toBe(false);
     expect(gate.blockers.join(' ')).toMatch(/MANAGED deployable quote/);
+  });
+});
+
+describe('P2-1 execution attribution scope — SELL vs BUY', () => {
+  /** One external/unmanaged historical execution (no local order attribution). */
+  function externalExecution(i: number, over: Partial<ExecutionFinding> = {}): ExecutionFinding {
+    const symbols = ['BTC/CAD', 'ETH/CAD', 'ADA/CAD', 'DOT/CAD', 'SHIB/CAD', 'ATOM/CAD'];
+    const fees: ExecutionFinding['feeDisposition'][] = ['QUOTE', 'BASE', 'UNKNOWN'];
+    return execution({
+      executionId: `ext-${i}`,
+      orderId: `9000000${i}`,
+      symbol: symbols[i % symbols.length]!,
+      side: i % 3 === 0 ? 'BUY' : 'SELL',
+      correlation: 'UNCORRELATED',
+      matchedClientOrderId: null,
+      feeDisposition: fees[i % fees.length]!,
+      ...over,
+    });
+  }
+
+  it('1. SELL with an UNCORRELATED execution is allowed when all else passes', () => {
+    const result = baseResult({ executionFindings: [execution({ correlation: 'UNCORRELATED' })] });
+    const gate = livePreTradeGate(result, SELL);
+    expect(gate.allowed).toBe(true);
+    expect(gate.blockers.join(' ')).not.toMatch(/not proven\+quote/);
+  });
+
+  it('2. realistic 33 UNCORRELATED + 1 PROVEN/QUOTE bot execution allows the SELL', () => {
+    const bot = execution({
+      executionId: '25437609',
+      orderId: '26177556994',
+      symbol: 'BTC/CAD',
+      side: 'SELL',
+      correlation: 'PROVEN',
+      feeDisposition: 'QUOTE',
+      matchedClientOrderId: 'live-BTCCAD-287fdb4f-c1cf-486c-a049-cac2dbd4da44',
+    });
+    const result = baseResult({
+      status: 'RECONCILIATION_REQUIRED',
+      executionFindings: [bot, ...Array.from({ length: 33 }, (_, i) => externalExecution(i))],
+    });
+    const gate = livePreTradeGate(result, SELL);
+    expect(gate.allowed).toBe(true);
+    expect(gate.blockers).toEqual([]);
+  });
+
+  it('3. SELL blocked on an AMBIGUOUS execution', () => {
+    const result = baseResult({ executionFindings: [execution({ correlation: 'AMBIGUOUS' })] });
+    const gate = livePreTradeGate(result, SELL);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blockers.join(' ')).toMatch(/AMBIGUOUS/);
+  });
+
+  it('4. SELL blocked on a STRONG_BUT_NOT_PROVEN execution (defensive)', () => {
+    const result = baseResult({ executionFindings: [execution({ correlation: 'STRONG_BUT_NOT_PROVEN' })] });
+    const gate = livePreTradeGate(result, SELL);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blockers.join(' ')).toMatch(/not proven\+quote/);
+  });
+
+  it('5/6. SELL blocked on a PROVEN execution with BASE or UNKNOWN fee', () => {
+    for (const feeDisposition of ['BASE', 'UNKNOWN'] as const) {
+      const result = baseResult({ executionFindings: [execution({ correlation: 'PROVEN', feeDisposition })] });
+      expect(livePreTradeGate(result, SELL).allowed).toBe(false);
+    }
+  });
+
+  it('7. UNCORRELATED executions do NOT bypass the sold-base balance protection', () => {
+    const result = baseResult({
+      status: 'RECONCILIATION_REQUIRED',
+      executionFindings: [externalExecution(0), externalExecution(1)],
+      balanceFindings: [balance('BTC')],
+    });
+    const gate = livePreTradeGate(result, SELL);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blockers.join(' ')).toMatch(/sold base BTC/);
+  });
+
+  it('8. UNCORRELATED + external CAD mismatch + unrelated assets allow the SELL', () => {
+    const result = baseResult({
+      status: 'RECONCILIATION_REQUIRED',
+      executionFindings: [externalExecution(0), externalExecution(1), externalExecution(2)],
+      balanceFindings: [balance('CAD'), balance('ETH'), balance('SHIB')],
+    });
+    const gate = livePreTradeGate(result, SELL);
+    expect(gate.allowed).toBe(true);
+    expect(gate.blockers).toEqual([]);
+  });
+
+  it('9. BUY remains conservative: an UNCORRELATED execution still blocks', () => {
+    const result = baseResult({ executionFindings: [execution({ correlation: 'UNCORRELATED' })] });
+    const gate = livePreTradeGate(result, BUY);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blockers.join(' ')).toMatch(/not proven\+quote/);
+  });
+
+  it('11. an UNCORRELATED execution with an unsafe fee does not block, but PROVEN does', () => {
+    for (const feeDisposition of ['BASE', 'UNKNOWN', 'MALFORMED'] as const) {
+      const uncorrelated = baseResult({ executionFindings: [execution({ correlation: 'UNCORRELATED', feeDisposition })] });
+      expect(livePreTradeGate(uncorrelated, SELL).allowed).toBe(true);
+
+      const proven = baseResult({ executionFindings: [execution({ correlation: 'PROVEN', feeDisposition })] });
+      expect(livePreTradeGate(proven, SELL).allowed).toBe(false);
+    }
+  });
+
+  it('12. livePreTradeGate is pure: it does not mutate the reconciliation result', () => {
+    const finding = execution({ correlation: 'UNCORRELATED' });
+    const orderFinding = order({ disposition: 'AMBIGUOUS' });
+    const result = baseResult({ executionFindings: [finding], orderFindings: [orderFinding] });
+    const execRef = result.executionFindings;
+    const orderRef = result.orderFindings;
+
+    const gate = livePreTradeGate(result, SELL);
+
+    expect(gate.allowed).toBe(false);
+    expect(result.executionFindings).toBe(execRef);
+    expect(result.orderFindings).toBe(orderRef);
+    expect(result.executionFindings).toEqual([finding]);
+    expect(result.orderFindings).toEqual([orderFinding]);
+    expect(Object.prototype.hasOwnProperty.call(result, 'blockers')).toBe(false);
   });
 });

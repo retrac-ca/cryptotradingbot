@@ -306,7 +306,7 @@ describe('executeLiveTest — V1 action-aware pre-trade reconciliation (P2-1)', 
     expect(deps.adapter.submittedOrders).toHaveLength(0);
   });
 
-  it('blocks on an uncorrelated execution (V1-only; the legacy gate did not catch this)', async () => {
+  it('does NOT block on an uncorrelated execution (attribution-scoped V1 SELL gate)', async () => {
     const trade: AccountTrade = {
       executionId: 'e-uncorrelated',
       tradeId: 't1',
@@ -328,8 +328,9 @@ describe('executeLiveTest — V1 action-aware pre-trade reconciliation (P2-1)', 
     };
     const deps = buildDeps({ adapter: (e) => e.seedAccountTrades([trade]) });
     const led = await harness(deps);
-    expect(led).toBe(1);
-    expect(deps.adapter.submittedOrders).toHaveLength(0);
+    expect(led).toBe(0);
+    expect(deps.adapter.submittedOrders).toHaveLength(1);
+    expect(deps.adapter.submittedOrders[0]!.side).toBe('SELL');
   });
 
   it('blocks on a FILLED order whose execution evidence is not proven/attested', async () => {
