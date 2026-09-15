@@ -20,10 +20,15 @@
  *     no order is placed and no exchange order-placement call is made.
  *  4. DIFFERENTIAL FRESHNESS: the quote time (exchange `TimeStamp`/L2 action)
  *     and the local transport time must both be fresh, subject to a bounded
- *     clock-skew guard.
- *  5. ONE ORDER, NO RETRY: confirmation + a single `place()`. Ambiguous outcomes
- *     (timeout/unknown) are NEVER retried — the command reconciles and exits
- *     non-zero, instructing the operator to run `bot reconcile` / `bot trades`.
+ *     clock-skew guard. The EXACT order is prepared and displayed BEFORE
+ *     confirmation; after confirmation the SAME snapshot is revalidated against
+ *     the real clock and the SAME immutable order is submitted — there is NO
+ *     second snapshot and NO post-confirmation re-pricing/re-sizing. If the
+ *     snapshot has aged out, the command fails closed rather than recomputing.
+ *  5. ONE ORDER, NO RETRY: confirmation + a single `placePrepared()`. Ambiguous
+ *     outcomes (timeout/unknown) are NEVER retried — the command reconciles and
+ *     exits non-zero, instructing the operator to run `bot reconcile` / `bot
+ *     trades`.
  *  6. ACK ≠ FILLED: after an ack the command queries authoritative order state
  *     and reconciles; if those confirmations fail it does NOT claim success.
  *     "Accepted != Filled" — a later `bot reconcile` confirms the final fill.
@@ -36,6 +41,7 @@ import { loadConfig } from '../config/load.js';
 import { createExchange } from '../exchanges/index.js';
 import type { ExchangeAdapter } from '../exchanges/ExchangeAdapter.js';
 import { LiveOrderEngine } from '../execution/LiveExecutionEngine.js';
+import type { PreparedLiveOrder, LiveOrderIntent } from '../execution/LiveExecutionEngine.js';
 import { createControlledLiveAuthorization } from '../execution/ControlledLiveAuthorization.js';
 import type { Logger } from '../logging/logger.js';
 import { evaluateFreshness, isValidEpochMs } from '../marketdata/index.js';
@@ -186,6 +192,13 @@ interface SummaryInputs {
   reconciliation: ReconciliationResult;
   gate: LivePreTradeGateResult;
   gates: RefreshGate[];
+  /**
+   * The exact, immutable order prepared for operator authorization. When
+   * present it is the ONLY thing that will be submitted; the display is
+   * generated from it so the confirmed order can never diverge from the
+   * submitted order. Null on the rejection path (nothing is prepared).
+   */
+  prepared?: PreparedLiveOrder | null;
 }
 
 function money(m?: { toString(): string } | null): string {
@@ -217,7 +230,7 @@ function printSummary(i: SummaryInputs, riskCfg: SummaryRiskPolicy): void {
 
   out('LIVE TEST — workflow / decision (NO order placed exactly by this unless confirmed below)');
   out('  Symbol:                   ' + i.symbol);
-  out('  Side / type:              SELL market (risk-reducing)');
+  out('  Side / type:              SELL LIMIT (risk-reducing)');
   out('  Current bid:              ' + money(i.ticker.bid));
   out('  Current ask:              ' + money(i.ticker.ask));
   out('  Base balance (avail):     ' + money(position));
@@ -240,6 +253,19 @@ function printSummary(i: SummaryInputs, riskCfg: SummaryRiskPolicy): void {
     out('  Precision:                ' + (i.decision.quantity.isMultipleOf(i.market.quantityTick) ? 'OK (on tick grid)' : 'NOT on tick grid') + '  tick=' + i.market.quantityTick.toString());
     out('  Min-order:                ' + (i.market.minOrderBase ? (i.decision.quantity.compareTo(i.market.minOrderBase) >= 0 ? 'OK' : 'TOO SMALL') : 'n/a') + '  minOrderBase=' + money(i.market.minOrderBase));
     out('  Balance:                  ' + (position && i.decision.quantity.compareTo(position) <= 0 ? 'OK (covers qty)' : 'NOT ENOUGH'));
+    if (i.prepared) {
+      // The EXACT order the operator is authorizing. This object is submitted
+      // verbatim; nothing is re-derived or re-priced after confirmation.
+      const o = i.prepared.order;
+      out('  Exact order to submit:');
+      out('    symbol:                 ' + o.symbol);
+      out('    side:                   ' + o.side);
+      out('    type:                   LIMIT');
+      out('    quantity:               ' + o.quantity.toString() + ' ' + base);
+      out('    limit price:            ' + money(o.price) + ' ' + quote);
+      out('    notional:               ' + money(i.prepared.approval.estimatedNotional) + ' ' + quote);
+      out('    time in force:          ' + (o.tif ?? 'GTC (default)'));
+    }
   } else {
     out('  Risk decision:            REJECTED — ' + i.decision.reason + (i.decision.detail ? ': ' + i.decision.detail : ''));
   }
@@ -480,8 +506,9 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
   };
   const fetchDeps = { adapter, nowMs: now, policy };
 
-  // Initial snapshot — used only for the operator DISPLAY (the proposed trade).
-  // This is NOT the basis for the final placement decision.
+  // S1: the ONE market/account snapshot. It is the sole basis for the prepared
+  // order — the exact order shown to and confirmed by the operator. There is no
+  // second snapshot and no post-confirmation re-pricing/re-sizing.
   let initial: LiveSnapshot;
   try {
     initial = await fetchLiveSnapshot(fetchDeps, symbol);
@@ -539,13 +566,13 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
     gate,
     gates,
   };
-  printSummary(summary, cfg);
-
   if (!decision.approved) {
+    printSummary(summary, cfg);
     err('\nlive-test refused: risk decision not approved (' + decision.reason + '). No order placed.');
     return 1;
   }
   if (!gate.allowed) {
+    printSummary(summary, cfg);
     err(
       '\nlive-test refused: action-aware pre-trade reconciliation blocked this SELL.\n  ' +
         gate.blockers.join('\n  ') +
@@ -554,45 +581,11 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
     return 1;
   }
 
-  const prompt =
-    '\nThis will SELL up to ' +
-    decision.quantity.toString() +
-    ' ' + symbol.split('/')[0] +
-    ' (notional ' + money(decision.estimatedNotional) + ' ' + symbol.split('/')[1] +
-    ') on the LIVE ' + cfg.exchange.toUpperCase() +
-    ' account.\nType EXECUTE and press Enter to place the order, or anything else to abort.\n> ';
-  const confirmed = deps.confirm ? await deps.confirm(prompt) : await defaultConfirm(prompt);
-  if (!confirmed) {
-    err('live-test aborted: not confirmed. No order was placed.');
-    return 1;
-  }
-
-  // F-4: AFTER the operator confirms, re-fetch a FRESH snapshot and rebuild the
-  // RiskContext with a fresh observation time. The final placement uses ONLY this
-  // fresh data, so an arbitrary operator delay can no longer let a stale or
-  // missing-timestamp snapshot pass the final risk gate. The order is placed via
-  // the existing LiveOrderEngine, which re-runs RiskManager.evaluate(freshCtx).
-  let fresh: LiveSnapshot;
-  try {
-    fresh = await fetchLiveSnapshot(fetchDeps, symbol);
-  } catch (e) {
-    err('live-test aborted at execution: fresh market data unavailable (' + (e instanceof Error ? e.message : String(e)) + ').\n  NO ORDER placed. Re-run when market data is available.');
-    return 1;
-  }
-  const freshCtx = buildLiveRiskContext({
-    snapshot: fresh,
-    portfolio: deps.portfolio,
-    symbol,
-    side: 'SELL',
-    reason,
-    sellTarget,
-    managedValuation: await fetchManagedValuation(adapter, deps.portfolio, symbol, now),
-    freshnessPolicy: policy,
-  });
-
-  // Only AFTER operator confirmation and a fresh snapshot do we arm the
-  // controlled-test mutation authorization. This is the explicit, narrowly-scoped
-  // gate that lets the controlled SELL/LIMIT path reach the adapter's placeOrder.
+  // Controlled-test mutation authorization: a process-local, single-use
+  // capability required BOTH by the engine gate and by the adapter's SendOrder
+  // boundary. It is created before display so the exact order can be prepared
+  // and shown, but it has no effect until `placeOrder` is reached inside the
+  // locked submission path below. It is never persisted.
   const controlledAuth = createControlledLiveAuthorization({
     side: 'SELL',
     type: 'limit',
@@ -609,9 +602,46 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
     maxLiveBaseQuantity: Money.fromNumber(cfg.liveMaxBaseQuantity),
     controlledLiveAuthorization: controlledAuth,
   });
-  // Explicit LIMIT order: the reference price (bid for a SELL) is the hard
-  // exchange-side bound — the order can never execute worse than this price.
-  const result = await engine.place(freshCtx, { reason, type: 'limit', price: freshCtx.price ?? undefined });
+
+  // Prepare the EXACT immutable order from S1 BEFORE displaying/confirming.
+  // `prepare` runs risk and builds the order but performs no exchange mutation.
+  // The reference price (bid for a SELL) is the hard exchange-side bound — the
+  // order can never execute worse than this price.
+  const intent: LiveOrderIntent = { reason, type: 'limit', price: displayCtx.price ?? undefined };
+  let prepared: PreparedLiveOrder;
+  try {
+    prepared = engine.prepare(displayCtx, intent);
+  } catch (e) {
+    printSummary(summary, cfg);
+    err('\nlive-test refused: could not prepare the exact order (' + (e instanceof Error ? e.message : String(e)) + '). No order placed.');
+    return 1;
+  }
+  printSummary({ ...summary, prepared }, cfg);
+
+  const [base, quote] = symbol.split('/');
+  const prompt =
+    '\nThis will submit a LIMIT ' + prepared.order.side + ' on the LIVE ' + cfg.exchange.toUpperCase() + ' account:\n' +
+    '  symbol:        ' + prepared.order.symbol + '\n' +
+    '  quantity:      ' + prepared.order.quantity.toString() + ' ' + base + '\n' +
+    '  limit price:   ' + money(prepared.order.price) + ' ' + quote + '\n' +
+    '  notional:      ' + money(prepared.approval.estimatedNotional) + ' ' + quote + '\n' +
+    '  time in force: ' + (prepared.order.tif ?? 'GTC (default)') + '\n' +
+    'Type EXECUTE and press Enter to place this EXACT order, or anything else to abort.\n> ';
+  const confirmed = deps.confirm ? await deps.confirm(prompt) : await defaultConfirm(prompt);
+  if (!confirmed) {
+    err('live-test aborted: not confirmed. No order was placed.');
+    return 1;
+  }
+
+  // F-4 (revised): after confirmation, revalidate the SAME S1 context with only
+  // `nowMs` advanced to the real submission time. There is NO second market
+  // snapshot and NO re-pricing/re-sizing. The original exchange quote timestamp
+  // and local observation timestamp are preserved, so if the operator waited
+  // past the freshness window the risk re-evaluation fails closed and
+  // `placePrepared` refuses. If still valid, the EXACT prepared order is
+  // submitted unchanged.
+  const confirmCtx: RiskContext = { ...displayCtx, nowMs: now() };
+  const result = await engine.placePrepared(confirmCtx, prepared);
 
   if (result.order.status === 'REJECTED') {
     err('\nlive-test: order rejected by the exchange/live engine: ' + result.message + '\n  No retry. Run `bot reconcile` / `bot trades` if needed.');

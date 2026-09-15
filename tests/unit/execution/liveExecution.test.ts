@@ -373,3 +373,66 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     expect(exchange.submittedOrders[0]!.price?.toString()).toBe('40000.00000000');
   });
 });
+
+describe('LiveOrderEngine — prepare/placePrepared (exact-order authorization)', () => {
+  it('placePrepared submits the SAME prepared order when the approval remains equivalent', async () => {
+    const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
+    const engine = buildEngine(exchange);
+    const ctx = riskContext();
+    const prepared = engine.prepare(ctx, limitIntent('exact'));
+    expect(prepared.order.quantity.toFixed(8)).toBe('2.50000000');
+    expect(prepared.order.price!.toFixed(8)).toBe('40000.00000000');
+    // Revalidate against the SAME context with only nowMs advanced (still fresh).
+    const revalidated: RiskContext = { ...ctx, nowMs: ctx.nowMs + 1_000 };
+    const result = await engine.placePrepared(revalidated, prepared);
+    expect(result.order.status).toBe('SUBMITTED');
+    expect(exchange.submittedOrders).toHaveLength(1);
+    // The EXACT prepared order (same clientOrderId, quantity, limit price) was sent.
+    expect(exchange.submittedOrders[0]!.clientOrderId).toBe(prepared.order.clientOrderId);
+    expect(exchange.submittedOrders[0]!.quantity.toFixed(8)).toBe('2.50000000');
+    expect(exchange.submittedOrders[0]!.price!.toFixed(8)).toBe('40000.00000000');
+  });
+
+  it('placePrepared rejects when the revalidation would produce a different transaction', async () => {
+    const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
+    const engine = buildEngine(exchange);
+    const prepared = engine.prepare(riskContext(), limitIntent('exact'));
+    // A context whose risk evaluation yields a DIFFERENT quantity/price.
+    const divergent = riskContext({ price: Money.fromString('50000') });
+    const result = await engine.placePrepared(divergent, prepared);
+    expect(result.order.status).toBe('REJECTED');
+    expect(result.unknownOutcome).toBe(false);
+    expect(exchange.submittedOrders).toHaveLength(0);
+    // No CREATED/SUBMITTED order was persisted on the refusal path.
+    expect(new OrderStore(LEDGER).allOrders().size).toBe(0);
+  });
+
+  it('placePrepared rejects a prepared order whose transaction fields were mutated', async () => {
+    const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
+    const engine = buildEngine(exchange);
+    const ctx = riskContext();
+    const prepared = engine.prepare(ctx, limitIntent('exact'));
+    // Tamper with the prepared order AFTER prepare (a caller must never do this).
+    const mutated = {
+      ...prepared,
+      order: { ...prepared.order, quantity: Money.fromString('1') },
+    };
+    const revalidated: RiskContext = { ...ctx, nowMs: ctx.nowMs + 1_000 };
+    const result = await engine.placePrepared(revalidated, mutated);
+    expect(result.order.status).toBe('REJECTED');
+    expect(exchange.submittedOrders).toHaveLength(0);
+    expect(new OrderStore(LEDGER).allOrders().size).toBe(0);
+  });
+
+  it('placePrepared fails closed when the captured snapshot is stale at submission', async () => {
+    const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
+    const engine = buildEngine(exchange);
+    const ctx = riskContext();
+    const prepared = engine.prepare(ctx, limitIntent('exact'));
+    const stale: RiskContext = { ...ctx, nowMs: ctx.nowMs + 5 * 60_000 };
+    const result = await engine.placePrepared(stale, prepared);
+    expect(result.order.status).toBe('REJECTED');
+    expect(exchange.submittedOrders).toHaveLength(0);
+    expect(new OrderStore(LEDGER).allOrders().size).toBe(0);
+  });
+});

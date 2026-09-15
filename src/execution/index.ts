@@ -18,7 +18,7 @@ export type {
   PaperExecutionConfig,
 } from './PaperExecutionTypes.js';
 export { LiveOrderEngine, LiveGateError } from './LiveExecutionEngine.js';
-export type { LiveGate, LiveExecutionConfig, LiveOrderResult, RecoveryResult } from './LiveExecutionEngine.js';
+export type { LiveGate, LiveExecutionConfig, LiveOrderResult, PreparedLiveOrder, RecoveryResult } from './LiveExecutionEngine.js';
 export { LiveOrderMonitor } from './LiveOrderMonitor.js';
 export type { LiveOrderMonitorDeps, LiveMonitorReport, LiveMonitorTransition } from './LiveOrderMonitor.js';
 export {

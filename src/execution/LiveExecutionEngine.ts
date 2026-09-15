@@ -127,6 +127,20 @@ export interface LiveOrderIntent {
   price?: Money;
 }
 
+/**
+ * An immutable, operator-authorized order prepared BEFORE confirmation.
+ *
+ * `order` is the exact transaction that must be submitted verbatim; `approval`
+ * is the RiskApproval that authorized it and is retained so the post-confirmation
+ * revalidation can prove the SAME transaction is still valid at submission time.
+ * A caller must never rebuild or re-derive the order after this is produced.
+ */
+export interface PreparedLiveOrder {
+  order: NewOrder;
+  approval: RiskApproval;
+  intent: LiveOrderIntent;
+}
+
 export interface LiveOrderResult {
   order: Order;
   /** True if the placement outcome is unknown and reconciliation is required. */
@@ -242,6 +256,106 @@ export class LiveOrderEngine {
     }
     const order = this.orderFromApproval(ctx.symbol, decision, intent);
     return this.submit(order);
+  }
+
+  /**
+   * Prepare an immutable, operator-facing order from a risk decision. NO
+   * exchange mutation occurs and the exchange is never contacted. The returned
+   * `PreparedLiveOrder.order` is the exact transaction that a later
+   * `placePrepared` will submit; it must be displayed to the operator and then
+   * passed back UNCHANGED. This is the ONLY supported controlled-live path that
+   * lets a human authorize a specific order, so the order a human confirms can
+   * never diverge from the order submitted.
+   *
+   * Throws `LiveGateError` when risk rejects the intent (the caller refuses and
+   * places nothing), mirroring `place()`'s fail-closed behavior.
+   */
+  prepare(ctx: RiskContext, intent: LiveOrderIntent): PreparedLiveOrder {
+    this.assertGate();
+
+    const decision = this.riskManager.evaluate(ctx);
+    if (!decision.approved) {
+      throw new LiveGateError(
+        `risk rejected: ${decision.reason}${decision.detail ? `: ${decision.detail}` : ''}`,
+      );
+    }
+    const order = this.orderFromApproval(ctx.symbol, decision, intent);
+    return { order, approval: decision, intent };
+  }
+
+  /**
+   * Submit a PREPARED order after operator confirmation, without ever
+   * recomputing its quantity or price.
+   *
+   * Post-confirmation revalidation: the caller passes the SAME RiskContext that
+   * produced the prepared order, with only `nowMs` advanced to the actual
+   * submission time. Risk is re-evaluated against that context; the resulting
+   * approval must be transaction-equivalent to the original approval. This
+   * re-checks execution-time freshness (quote age, transport age, future skew)
+   * and account state WITHOUT re-pricing: the exchange quote/observation
+   * timestamps are never restamped and the market is never re-read.
+   *
+   * If freshness has expired or the approval would differ, the order is
+   * REJECTED: no exchange contact, no CREATED persistence, no retry, no
+   * re-prompt, and no silent substitution. On success, the exact prepared order
+   * (including its clientOrderId) flows through the existing submission path.
+   */
+  async placePrepared(ctx: RiskContext, prepared: PreparedLiveOrder): Promise<LiveOrderResult> {
+    this.assertGate();
+
+    const decision = this.riskManager.evaluate(ctx);
+    if (!decision.approved) {
+      return this.riskRejected(ctx.symbol, decision, prepared.intent.reason);
+    }
+    if (
+      !LiveOrderEngine.sameTransaction(decision, prepared.approval) ||
+      !LiveOrderEngine.preparedMatchesApproval(prepared.order, decision)
+    ) {
+      // The operator-authorized transaction is no longer valid at submission
+      // time (e.g. freshness expired, account state changed, or the prepared
+      // order no longer matches its authorizing approval). Fail closed and NEVER
+      // substitute a recomputed order.
+      return {
+        order: this.buildRejected(
+          prepared.order,
+          'confirmed order no longer valid (freshness expired or risk approval changed); no order placed',
+        ),
+        unknownOutcome: false,
+        message: 'refused: confirmed order no longer valid; re-run live-test',
+      };
+    }
+    // The prepared order is within the controlled-live scope: its type is
+    // validated by `orderFromApproval` at prepare time and re-validated by
+    // `validateOrder` (tick/min/balance/caps) inside the submission lock, and by
+    // the adapter's controlled-authorization boundary at SendOrder.
+    return this.submit(prepared.order);
+  }
+
+  /** True when two approvals authorize the SAME transaction (not object identity). */
+  private static sameTransaction(a: RiskApproval, b: RiskApproval): boolean {
+    return (
+      a.symbol === b.symbol &&
+      a.side === b.side &&
+      a.quantity.equals(b.quantity) &&
+      a.price.equals(b.price)
+    );
+  }
+
+  /**
+   * True when a prepared order's transaction fields EXACTLY match an approval.
+   * Defense-in-depth: it makes a post-prepare mutation of `prepared.order`
+   * unable to reach submission (the order is still the prepared object, but it
+   * must be the prepared transaction).
+   */
+  private static preparedMatchesApproval(order: NewOrder, approval: RiskApproval): boolean {
+    return (
+      order.symbol === approval.symbol &&
+      order.side === approval.side &&
+      order.type === 'limit' &&
+      order.price !== undefined &&
+      order.price.equals(approval.price) &&
+      order.quantity.equals(approval.quantity)
+    );
   }
 
   // ---- internal risk-gating + submission ----

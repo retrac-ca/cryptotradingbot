@@ -255,8 +255,13 @@ trading.
 **Controlled-test mutation arming (readiness only).** The only way the software
 can reach `SendOrder` today is via the explicit `bot live-test sell` path, which
 creates a narrowly-scoped **controlled-test authorization** (SELL + LIMIT only,
-bounded by `LIVE_MAX_BASE_QUANTITY` / `LIVE_MAX_QUOTE_NOTIONAL`) after the
-operator interactively confirms the displayed order by typing `EXECUTE`. This
+bounded by `LIVE_MAX_BASE_QUANTITY` / `LIVE_MAX_QUOTE_NOTIONAL`). The exact LIMIT
+order (symbol, side, quantity, limit price, notional) is prepared and displayed
+first; the operator's `EXECUTE` authorizes that **exact** order, which is then
+submitted unchanged. There is no post-confirmation repricing: the market data
+used to prepare the order must still be within the configured freshness window
+at submission, otherwise the command refuses (fail closed) instead of
+automatically computing a different order. This
 authorization is **not** autonomous live trading, is **not** a generic "live
 enabled" flag, and is required at both the engine and the adapter layer; it can
 never produce a BUY or MARKET order. `NdaxAdapter.supportsOrderPlacement` remains

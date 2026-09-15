@@ -577,19 +577,37 @@ NDAX timestamp manufactured a local "fresh" time. Now `Ticker.timestampMs` is
 timestamps map to `null` (via `exchangeEpochMs`), never a fabricated `Date.now()`.
 Freshness then fails closed (`QUOTE_MISSING`).
 
-**F-4 (freshness TOCTOU):** `live-test` captured `nowMs` once and reused it after
-the operator typed EXECUTE, so freshness was validated at snapshot time, not
-execution time. Now, after an operator confirms, live-test re-fetches a FRESH
-snapshot (`fetchLiveSnapshot`) at `Date.now()`/injected clock, rebuilds the
-RiskContext with a fresh `nowMs`/observation time, and passes that to
-`LiveOrderEngine.place`, which re-runs RiskManager against it immediately before
-submission. An arbitrary operator delay can no longer let a stale or
-missing-timestamp snapshot pass the final risk gate; the result is NO ORDER.
+**F-4 (freshness TOCTOU) — revised for exact-order authorization:** `live-test`
+previously re-fetched a FRESH snapshot after operator confirmation and rebuilt
+the RiskContext, so the submitted order could be re-priced/re-sized to differ
+from the order the operator was shown and confirmed (a real authorization
+defect). The command now fetches ONE snapshot (S1), prepares an immutable
+`PreparedLiveOrder` (exact `NewOrder` + authorizing `RiskApproval`) BEFORE
+display/confirmation, and displays that exact order (symbol, side, LIMIT type,
+quantity, limit price, notional, TIF). After confirmation it does NOT re-read the
+market and does NOT recompute price/quantity: it re-runs RiskManager against the
+SAME S1 context with only `nowMs` advanced to the real submission time, and
+requires the resulting approval to be transaction-equivalent (`sameTransaction`)
+to the prepared approval. If freshness (quote age, transport age, future skew)
+has expired or the approval would differ, `placePrepared` fails closed with
+REJECTED — no `adapter.placeOrder`, no CREATED persistence, no retry, no
+re-prompt, no substitution. If still valid, the EXACT prepared order (same
+`clientOrderId`, quantity, limit price) is submitted through the existing locked
+path. Execution-time freshness is therefore preserved WITHOUT repricing.
 
 **F-8 (localized):** the final freshness basis is the L1 ticker timestamp — the
 actual price source for the order — not a possibly-newer unrelated L2 timestamp,
 so an L1 stale/missing value is never declared fresh because L2 happened to be
 newer. The broader F-8 redesign remains out of scope.
+
+**Invariant (operator-confirmed order immutability):** the exact order
+parameters displayed to and confirmed by the operator (symbol, side, LIMIT type,
+quantity, limit price) are immutable through submission. No post-confirmation
+market read, repricing, re-sizing, or replacement may alter them; the only
+permitted post-confirmation outcomes are "submit the confirmed order unchanged"
+or "fail closed". This is enforced by preparing the order once
+(`LiveOrderEngine.prepare`) and submitting it verbatim
+(`LiveOrderEngine.placePrepared`), which revalidates but never rebuilds it.
 
 The paper path is unchanged; `supportsOrderPlacement` remains `false`.
 

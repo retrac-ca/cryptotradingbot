@@ -481,37 +481,50 @@ describe('executeLiveTest — risk + confirmation', () => {
 });
 
 
-// --- F-4: execution-time freshness (TOCTOU) ---
+// --- exact-order authorization + execution-time freshness (F-4 revised) ---
+//
+// The order is prepared from a SINGLE snapshot (S1) and displayed BEFORE
+// confirmation. After confirmation the SAME S1 context is revalidated with only
+// `nowMs` advanced; there is no second snapshot and no re-pricing. The exact
+// displayed order is submitted, or the command fails closed.
 
-describe('live-test — F-4 execution-time freshness', () => {
-  it('rejects when the operator waits beyond the freshness limit (data stale at execution)', async () => {
-    // The initial snapshot is fresh (T0). The operator then waits > marketDataMaxAgeMs.
-    // The FRESH pre-submit fetch reads the still-stale ticker timestamp at a later
-    // now, so freshness fails and NO order is placed. Under the old code the
-    // initial nowMs would have been reused, incorrectly approving the order.
-    let clock = T0;
+describe('live-test — exact-order authorization + execution-time freshness', () => {
+  it('A: displays and submits the SAME exact order (type, quantity, limit price)', async () => {
+    let prompt = '';
     const deps = buildDeps({
-      nowMs: () => clock,
-      confirm: async () => {
-        clock += 5 * 60_000; // operator waits 5 minutes beyond the 60s limit
+      confirm: async (m) => {
+        prompt = m;
         return true;
       },
     });
     const led = await executeLiveTest(deps, opts);
-    expect(led).toBe(1);
-    expect(deps.adapter.submittedOrders).toHaveLength(0);
+    expect(led).toBe(0);
+    expect(deps.adapter.submittedOrders).toHaveLength(1);
+    const submitted = deps.adapter.submittedOrders[0]!;
+    // Derived once from S1 (bid 40000): 12/40000 = 0.0003, limit = bid.
+    expect(submitted.type).toBe('limit');
+    expect(submitted.quantity.toFixed(8)).toBe('0.00030000');
+    expect(submitted.price!.toFixed(8)).toBe('40000.00000000');
+    // The confirmation prompt states the exact fields that are submitted.
+    expect(prompt).toContain('LIMIT');
+    expect(prompt).toContain('0.00030000');
+    expect(prompt).toContain('40000.00000000');
   });
 
-  it('uses fresh pre-submit data for the final decision (not the original snapshot)', async () => {
-    // The market updates to a fresh timestamp right as the operator confirms. The
-    // fresh pre-submit fetch sees FRESH data and the order proceeds.
-    let clock = T0;
+  it('B: a market change during confirmation cannot alter the confirmed order', async () => {
     let adapt: FakeExchange;
+    let prompt = '';
     const deps = buildDeps({
-      nowMs: () => clock,
-      confirm: async () => {
-        clock += 2000;
-        adapt.setTicker(SYMBOL, { bid: Money.fromString('40000'), ask: Money.fromString('40001'), last: Money.fromString('40000'), timestampMs: clock });
+      confirm: async (m) => {
+        prompt = m;
+        // The market moves substantially while the operator decides. Under the
+        // old design this would re-price to 12/20000 = 0.0006.
+        adapt.setTicker(SYMBOL, {
+          bid: Money.fromString('20000'),
+          ask: Money.fromString('20001'),
+          last: Money.fromString('20000'),
+          timestampMs: T0,
+        });
         return true;
       },
     });
@@ -519,32 +532,44 @@ describe('live-test — F-4 execution-time freshness', () => {
     const led = await executeLiveTest(deps, opts);
     expect(led).toBe(0);
     expect(deps.adapter.submittedOrders).toHaveLength(1);
+    const submitted = deps.adapter.submittedOrders[0]!;
+    // ORIGINAL S1 values (bid 40000), NOT the changed 20000.
+    expect(submitted.quantity.toFixed(8)).toBe('0.00030000');
+    expect(submitted.price!.toFixed(8)).toBe('40000.00000000');
+    expect(prompt).toContain('40000.00000000');
+    expect(prompt).not.toContain('20000.00000000');
   });
 
-  it('fails closed when the pre-submit exchange timestamp is missing (never substitutes local time)', async () => {
+  it('C: stale data after confirmation fails closed with no submission or persistence', async () => {
     let clock = T0;
-    let adapt: FakeExchange;
     const deps = buildDeps({
       nowMs: () => clock,
       confirm: async () => {
-        // NDAX provides no authoritative timestamp at pre-submit time.
-        adapt.setTicker(SYMBOL, { ...ticker(), timestampMs: null as unknown as number });
+        clock += 5 * 60_000; // operator waits beyond the 60s freshness window
         return true;
       },
     });
-    adapt = deps.adapter;
+    const led = await executeLiveTest(deps, opts);
+    expect(led).toBe(1);
+    expect(deps.adapter.submittedOrders).toHaveLength(0);
+    // No CREATED/SUBMITTED (or any) order was persisted.
+    expect(deps.store.allOrders().size).toBe(0);
+  });
+
+  it('D: fails closed when the exchange timestamp is missing (never substitutes local time)', async () => {
+    const deps = buildDeps({
+      adapter: (e) => {
+        e.setTicker(SYMBOL, { ...ticker(), timestampMs: null as unknown as number });
+      },
+    });
     const led = await executeLiveTest(deps, opts);
     expect(led).toBe(1);
     expect(deps.adapter.submittedOrders).toHaveLength(0);
   });
 
-  it('fails closed when the fresh pre-submit fetch fails (no market data)', async () => {
-    const deps = buildDeps({
-      confirm: async () => {
-        deps.adapter.setFailures({ getTicker: { kind: 'network' } });
-        return true;
-      },
-    });
+  it('D2: fails closed when the single pre-prepare market fetch fails', async () => {
+    const deps = buildDeps();
+    deps.adapter.setFailures({ getTicker: { kind: 'network' } });
     const led = await executeLiveTest(deps, opts);
     expect(led).toBe(1);
     expect(deps.adapter.submittedOrders).toHaveLength(0);
