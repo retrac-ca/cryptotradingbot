@@ -3,7 +3,7 @@
  * against the exchange's authoritative account state (read-only during analysis;
  * a `--commit` flag enables the deterministic `commitProven()` path).
  *
- * Requires NDAX_ENABLE_AUTHENTICATED_READS=true and valid credentials. Any read
+ * Requires ENABLE_AUTHENTICATED_READS=true and valid credentials. Any read
  * failure or discrepancy is reported; trading should pause until the account is
  * brought back into a consistent state. The exchange is authoritative for
  * balances/open orders/history; reconciliation NEVER fabricates identities or
@@ -37,7 +37,7 @@ export const reconcileCommand: CommandHandler = async (args): Promise<number> =>
 
   if (!cfg.enableAuthenticatedReads) {
     // eslint-disable-next-line no-console
-    console.error('Reconciliation needs authenticated account reads, but NDAX_ENABLE_AUTHENTICATED_READS is not "true".');
+    console.error('Reconciliation needs authenticated account reads, but ENABLE_AUTHENTICATED_READS is not "true".');
     return 1;
   }
 

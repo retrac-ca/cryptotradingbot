@@ -617,7 +617,7 @@ export const resolveLiveOrderCommand: CommandHandler = async (args): Promise<num
 
   if (!cfg.enableAuthenticatedReads) {
     // eslint-disable-next-line no-console
-    console.error('The live-order resolution needs authenticated account reads, but NDAX_ENABLE_AUTHENTICATED_READS is not "true".');
+    console.error('The live-order resolution needs authenticated account reads, but ENABLE_AUTHENTICATED_READS is not "true".');
     return 2;
   }
 

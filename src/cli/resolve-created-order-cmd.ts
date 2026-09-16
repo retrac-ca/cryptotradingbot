@@ -415,7 +415,7 @@ export const resolveCreatedOrderCommand: CommandHandler = async (args): Promise<
 
   if (!cfg.enableAuthenticatedReads) {
     // eslint-disable-next-line no-console
-    console.error('Resolving a CREATED order needs authenticated account reads, but NDAX_ENABLE_AUTHENTICATED_READS is not "true".');
+    console.error('Resolving a CREATED order needs authenticated account reads, but ENABLE_AUTHENTICATED_READS is not "true".');
     return 2;
   }
 

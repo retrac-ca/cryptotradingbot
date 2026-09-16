@@ -7,6 +7,7 @@
  */
 
 import { createLogger } from '../logging/logger.js';
+import { VERSION } from './context.js';
 import { backtestCommand } from './backtest-cmd.js';
 import { configureCommand } from './config-cmd.js';
 import { liveMonitorCommand } from './live-monitor-cmd.js';
@@ -41,7 +42,7 @@ export const COMMANDS = {
 
 export type CommandName = keyof typeof COMMANDS;
 
-const USAGE = `cryptotradingbot v${'0.0.1'}
+const USAGE = `cryptotradingbot v${VERSION}
 
 Usage: bot <command> [options]
 
