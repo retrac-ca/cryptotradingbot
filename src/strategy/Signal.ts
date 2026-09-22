@@ -9,6 +9,7 @@
  */
 
 import type { Signal as CanonicalSignal, OrderSide } from '../order.js';
+import type { Money } from '../money/Money.js';
 
 export type { Signal } from '../order.js';
 export type SignalType = 'BUY' | 'SELL' | 'HOLD';
@@ -25,6 +26,11 @@ export interface SignalOptions {
   confidence?: number;
   /** Optional human-readable rationale for auditability. */
   reason?: string;
+  /**
+   * Optional entry anchor price (quote per base unit) carried onto the resulting
+   * position when a BUY is filled while flat. Strategy-agnostic opaque data.
+   */
+  entryAnchorPrice?: Money;
 }
 
 /** Build a canonical signal for a symbol at the current logical time. */
@@ -39,6 +45,7 @@ export function signal(
     type,
     ...(options.confidence !== undefined ? { confidence: options.confidence } : {}),
     ...(options.reason ? { reason: options.reason } : {}),
+    ...(options.entryAnchorPrice !== undefined ? { entryAnchorPrice: options.entryAnchorPrice } : {}),
     timestampMs: nowMs,
   };
 }

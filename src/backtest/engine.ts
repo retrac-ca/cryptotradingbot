@@ -52,6 +52,12 @@ interface PendingIntent {
   quantity: Money;
   signalBarIndex: number;
   decisionTsMs: number;
+  /**
+   * The strategy-agnostic entry anchor captured from the signal at DECISION time
+   * (bar i). It is frozen here and passed verbatim to `applyFill`; it is NEVER
+   * recomputed from the fill bar (i+1). `null` when the signal carried none.
+   */
+  entryAnchorPrice: Money | null;
 }
 
 export function runBacktest(input: BacktestRunInput): BacktestResult {
@@ -143,6 +149,9 @@ export function runBacktest(input: BacktestRunInput): BacktestResult {
           quantity: decision.quantity,
           signalBarIndex: i,
           decisionTsMs,
+          // Capture the anchor from the DECISION bar's signal; it is carried
+          // verbatim to the fill and never recomputed at the fill bar.
+          entryAnchorPrice: signal.entryAnchorPrice ?? null,
         };
       } else {
         rejections.push({
@@ -281,7 +290,17 @@ function executePending(portfolio: Portfolio, fillBar: import('../types.js').Can
 
   let next: Portfolio;
   try {
-    next = portfolio.applyFill(params.symbol, p.side, p.quantity, fillPrice, fee);
+    next = portfolio.applyFill(
+      params.symbol,
+      p.side,
+      p.quantity,
+      fillPrice,
+      fee,
+      params.fillTimeMs,
+      // The EXACT anchor stored at decision time; never recomputed from the
+      // fill bar's OHLC.
+      p.entryAnchorPrice ?? undefined,
+    );
   } catch (err) {
     // Any accounting-invariant failure (e.g. an oversell) is a deterministic
     // execution rejection and MUST leave the portfolio unchanged.
@@ -331,6 +350,7 @@ function buildStrategyContext(
     symbol,
     quantity: position?.quantity ?? Money.zero(),
     averageEntryPrice: position?.averageEntryPrice ?? null,
+    entryAnchorPrice: position?.entryAnchorPrice ?? null,
     realizedPnl: position?.realizedPnl ?? Money.zero(),
   };
   return {
@@ -367,9 +387,13 @@ function buildRiskContext(
   const prices = new Map<string, Money>([[symbol, price]]);
   const mtm = portfolio.markToMarket(prices);
   const position = portfolio.position(symbol);
+  // The entry anchor is opaque execution data, NOT a risk input. Strip it so it
+  // never enters RiskContext / RiskManager / RiskApproval.
+  const riskSignal = { ...signal };
+  delete riskSignal.entryAnchorPrice;
   return {
     symbol,
-    signal,
+    signal: riskSignal,
     nowMs,
     marketDataTimestampMs: nowMs,
     marketDataObservedAtMs: nowMs,

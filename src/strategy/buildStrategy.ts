@@ -8,6 +8,7 @@
 
 import type { BotConfig } from '../config/schema.js';
 import './movingAverageCrossover.js'; // side-effect: ensures built-in strategies are registered
+import './trendPullbackRecovery.js'; // side-effect: registers the TPR strategy
 import type { Strategy } from './Strategy.js';
 import { createStrategy } from './registry.js';
 

@@ -72,6 +72,12 @@ export interface SelectedTrade {
   estimatedNotional: Money;
   decision: RiskApproval;
   relativeSpread: number | null;
+  /**
+   * Optional strategy-agnostic entry anchor price carried from the BUY signal.
+   * Opaque data: it is NOT part of the risk decision and never affects sizing.
+   * `null` when the signal did not provide one.
+   */
+  entryAnchorPrice: Money | null;
 }
 
 export interface CoordinatorResult {
@@ -153,6 +159,7 @@ export class MarketCoordinator {
           symbol,
           quantity: managed?.quantity ?? Money.zero(),
           averageEntryPrice: managed?.averageEntryPrice ?? null,
+          entryAnchorPrice: managed?.entryAnchorPrice ?? null,
           realizedPnl: managed?.realizedPnl ?? Money.zero(),
         },
         insufficientData: candles.length < strategy.warmupCandles,
@@ -200,6 +207,9 @@ export class MarketCoordinator {
           estimatedNotional: decision.estimatedNotional,
           decision,
           relativeSpread: spread,
+          // Carry the strategy's anchor verbatim. It is NOT routed through
+          // RiskManager/RiskContext/RiskApproval and never alters the decision.
+          entryAnchorPrice: signal.entryAnchorPrice ?? null,
         });
       }
     }

@@ -166,5 +166,12 @@ export interface Signal {
   confidence?: number;
   /** Optional human-readable rationale for auditability. */
   reason?: string;
+  /**
+   * Optional strategy-agnostic entry anchor price (quote per base unit), set by
+   * a strategy on a BUY signal. It is carried (as opaque data) to the resulting
+   * position and frozen there by `Portfolio.applyFill`; it is NEVER used for
+   * risk sizing or execution pricing. A `Money | null` on the position.
+   */
+  entryAnchorPrice?: Money;
   timestampMs: number;
 }

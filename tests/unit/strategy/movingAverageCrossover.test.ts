@@ -29,6 +29,7 @@ const context = (
     symbol: 'BTC/CAD',
     quantity: opts.quantity ? Money.fromString(opts.quantity) : Money.zero(),
     averageEntryPrice: null,
+    entryAnchorPrice: null,
     realizedPnl: Money.zero(),
   };
   return {

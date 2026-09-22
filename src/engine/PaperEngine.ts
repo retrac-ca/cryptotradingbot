@@ -42,6 +42,7 @@ import type { PaperExecutionConfig } from '../execution/PaperExecutionTypes.js';
 import type { PaperStateStore } from '../persistence/PaperStateStore.js';
 import type { Timeframe, MarketInfo } from '../types.js';
 import { MarketCoordinator } from './MarketCoordinator.js';
+import type { SelectedTrade } from './MarketCoordinator.js';
 import { eligibleSymbols } from './universe.js';
 
 export interface PaperEngineDeps {
@@ -216,7 +217,7 @@ export class PaperEngine {
   }
 
   private executeSelected(
-    selected: { symbol: string; side: 'BUY' | 'SELL'; quantity: Money; referencePrice: Money },
+    selected: SelectedTrade,
     nowMs: number,
   ): void {
     const ticker = this.marketData.getTicker(selected.symbol);
@@ -232,6 +233,9 @@ export class PaperEngine {
       type: 'market' as const,
       quantity: selected.quantity,
       reason: 'coordinator-approved',
+      // Carry the strategy's entry anchor verbatim into the paper order so the
+      // portfolio can freeze it when this BUY opens a flat position.
+      entryAnchorPrice: selected.entryAnchorPrice ?? undefined,
     };
     const fill = this.paper.submitMarketOrder(
       orderRequest,

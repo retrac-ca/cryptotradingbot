@@ -174,10 +174,14 @@ export class Portfolio {
         ...managed,
         quantity: newQty,
         averageEntryPrice: newQty.isZero() ? Money.zero() : managed.costBasis.div(newQty),
+        // Authorizing external inventory onto an existing BOT position preserves
+        // that position's frozen entry anchor.
+        entryAnchorPrice: managed.entryAnchorPrice ?? null,
         sourceQuantities: Portfolio.mergeExternalBreakdown(managed, externalQty),
       });
     } else {
-      // Fresh external authorization: no pre-existing managed position.
+      // Fresh external authorization: no pre-existing managed position. There is
+      // no bot entry, so no entry anchor is recorded.
       state.positions.set(symbol, {
         symbol,
         quantity: externalQty,
@@ -185,6 +189,7 @@ export class Portfolio {
         averageEntryPrice: Money.zero(),
         realizedPnl: Money.zero(),
         feesPaid: Money.zero(),
+        entryAnchorPrice: null,
         source: 'EXTERNAL_AUTHORIZED',
         sourceQuantities: { BOT: Money.zero(), EXTERNAL_AUTHORIZED: externalQty },
       });
@@ -495,9 +500,27 @@ export class Portfolio {
    * @param quantity      filled base quantity (must be > 0)
    * @param price         fill price (quote per base unit)
    * @param fee           fee in quote currency
+   * @param nowMs         fill time (ms epoch); when provided, a SELL updates the
+   *                      durable DAILY realized-P&L bucket (UTC day boundary).
+   *                      Omitted by callers that do not need daily accounting.
+   * @param entryAnchor   optional strategy-agnostic entry anchor price (quote
+   *                      per base unit). Frozen onto the position ONLY when a
+   *                      BUY opens it while flat; ignored on SELL and never
+   *                      overwrites an existing position's anchor. When supplied
+   *                      it MUST be strictly positive (a zero/negative anchor is
+   *                      rejected fail-closed before any state exists). Opaque
+   *                      data: it never affects accounting, sizing, or risk.
    * @returns the updated portfolio (new instance)
    */
-  applyFill(symbol: string, side: OrderSide, quantity: Money, price: Money, fee: Money): Portfolio {
+  applyFill(
+    symbol: string,
+    side: OrderSide,
+    quantity: Money,
+    price: Money,
+    fee: Money,
+    _nowMs?: number,
+    entryAnchor?: Money,
+  ): Portfolio {
     const quote = symbol.split('/')[1]!;
 
     if (!quantity.isPositive()) {
@@ -520,9 +543,22 @@ export class Portfolio {
           costBasis: newCostBasis,
           averageEntryPrice: newCostBasis.div(newQty),
           feesPaid: existing.feesPaid.add(fee),
+          // A BUY that scales an existing long NEVER overwrites the frozen
+          // entry anchor (normalizing a legacy absent value to null).
+          entryAnchorPrice: existing.entryAnchorPrice ?? null,
           sourceQuantities: { BOT: sq.BOT.add(quantity), EXTERNAL_AUTHORIZED: sq.EXTERNAL_AUTHORIZED },
         });
       } else {
+        // Fail closed BEFORE any state is created: a supplied entry anchor must
+        // be strictly positive. An invalid anchor must never become position
+        // state (it would otherwise be persisted and then rejected on load).
+        // No anchor supplied (undefined) preserves the existing null behavior.
+        // Never clamp, substitute, or convert an invalid value.
+        if (entryAnchor !== undefined && !entryAnchor.isPositive()) {
+          throw new Error(
+            `Portfolio.applyFill: entry anchor must be positive when supplied (got ${entryAnchor}) for ${symbol}`,
+          );
+        }
         state.positions.set(symbol, {
           symbol,
           quantity,
@@ -530,6 +566,8 @@ export class Portfolio {
           averageEntryPrice: cost.div(quantity),
           realizedPnl: Money.zero(),
           feesPaid: fee,
+          // Opening while flat freezes the signal's anchor (null when none).
+          entryAnchorPrice: entryAnchor ?? null,
           source: 'BOT',
           sourceQuantities: { BOT: quantity, EXTERNAL_AUTHORIZED: Money.zero() },
         });
@@ -569,6 +607,9 @@ export class Portfolio {
         costBasis: remainingCostBasis,
         realizedPnl: existing.realizedPnl.add(realized),
         feesPaid: existing.feesPaid.add(fee),
+        // A partial SELL preserves the frozen entry anchor; a full SELL removes
+        // the position entirely below.
+        entryAnchorPrice: existing.entryAnchorPrice ?? null,
         sourceQuantities: {
           BOT: sq.BOT.sub(botConsumed),
           EXTERNAL_AUTHORIZED: sq.EXTERNAL_AUTHORIZED.sub(extConsumed),

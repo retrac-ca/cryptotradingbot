@@ -274,6 +274,14 @@ export interface PaperPosition {
   realizedPnl: Money;
   /** Total fees (quote) paid on this position's buys/sells. */
   feesPaid: Money;
+  /**
+   * Strategy-agnostic entry anchor price (quote per base unit) frozen onto the
+   * position at the moment it was opened while flat. `null` when the position
+   * was not opened from a signal carrying an anchor (e.g. legacy/live-loaded or
+   * externally-authorized inventory). It is opaque data for consumers (e.g. a
+   * trailing-stop strategy) and NEVER affects accounting, sizing, or risk.
+   */
+  entryAnchorPrice: Money | null;
   /** Where this managed holding originated (coarse identity of the position). */
   source: PositionSource;
   /**

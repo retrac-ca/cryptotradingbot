@@ -165,7 +165,15 @@ export class PaperExecutionEngine {
       fee,
       nowMs,
     );
-    this.portfolio = this.portfolio.applyFill(req.symbol, req.side, fillQty, fillPrice, fee);
+    this.portfolio = this.portfolio.applyFill(
+      req.symbol,
+      req.side,
+      fillQty,
+      fillPrice,
+      fee,
+      nowMs,
+      req.entryAnchorPrice,
+    );
     return order;
   }
 
@@ -204,7 +212,15 @@ export class PaperExecutionEngine {
         fee,
         nowMs,
       );
-      this.portfolio = this.portfolio.applyFill(req.symbol, req.side, fillQty, fillPrice, fee);
+      this.portfolio = this.portfolio.applyFill(
+        req.symbol,
+        req.side,
+        fillQty,
+        fillPrice,
+        fee,
+        nowMs,
+        req.entryAnchorPrice,
+      );
       return order;
     }
 

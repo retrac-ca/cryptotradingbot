@@ -27,6 +27,13 @@ export interface PaperOrderRequest {
   /** Required for limit orders. */
   limitPrice?: Money;
   reason: string;
+  /**
+   * Optional strategy-agnostic entry anchor price (quote per base unit) carried
+   * from the selected trade. It is passed unchanged to `Portfolio.applyFill`,
+   * which freezes it only when a BUY opens a flat position; it never affects the
+   * simulated fill price or fee.
+   */
+  entryAnchorPrice?: Money;
 }
 
 export interface PaperOrder {

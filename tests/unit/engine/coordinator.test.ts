@@ -273,4 +273,60 @@ describe('MarketCoordinator', () => {
     const b = h.coordinator.evaluate(['BTC/CAD', 'ETH/CAD'], NOW);
     expect(a.selected!.symbol).toBe(b.selected!.symbol);
   });
+
+  it('carries the signal entry anchor price verbatim into SelectedTrade', () => {
+    const h = build();
+    const anchor = Money.fromString('41000');
+    h.strategy.grid.set('BTC/CAD', signal('BTC/CAD', 'BUY', { entryAnchorPrice: anchor }, NOW));
+    h.risk.grid.set('BTC/CAD', approved('BTC/CAD', 'BUY', '0.1', '40000'));
+
+    const r = h.coordinator.evaluate(['BTC/CAD'], NOW);
+    expect(r.selected!.entryAnchorPrice).toBe(anchor);
+    // The anchor is NOT routed through the risk decision/approval.
+    expect('entryAnchorPrice' in r.selected!.decision).toBe(false);
+  });
+
+  it('defaults SelectedTrade.entryAnchorPrice to null when the signal has none', () => {
+    const h = build();
+    h.strategy.grid.set('BTC/CAD', signal('BTC/CAD', 'BUY', {}, NOW));
+    h.risk.grid.set('BTC/CAD', approved('BTC/CAD', 'BUY', '0.1', '40000'));
+
+    const r = h.coordinator.evaluate(['BTC/CAD'], NOW);
+    expect(r.selected!.entryAnchorPrice).toBeNull();
+  });
+
+  it('exposes a frozen position entry anchor through PositionView', () => {
+    const anchor = Money.fromString('39000');
+    const portfolio = port('100000').applyFill(
+      'BTC/CAD',
+      'BUY',
+      Money.fromString('0.1'),
+      Money.fromString('40000'),
+      Money.zero(),
+      undefined,
+      anchor,
+    );
+    let seen: Money | null | undefined;
+    const spy = new GridStrategy();
+    const original = spy.evaluate.bind(spy);
+    spy.evaluate = (ctx: StrategyContext) => {
+      seen = ctx.position.entryAnchorPrice;
+      return original(ctx);
+    };
+    spy.grid.set('BTC/CAD', signal('BTC/CAD', 'HOLD', {}, NOW));
+    const coordinator = new MarketCoordinator({
+      strategy: spy,
+      riskManager: new GriddedRisk(),
+      getPortfolio: () => portfolio,
+      timeframe: TW,
+      marketSource: {
+        getMarketInfo: (s) => market(s),
+        getTicker: () => null,
+        getCandles: () => [],
+      },
+      freshnessPolicy,
+    });
+    coordinator.evaluate(['BTC/CAD'], NOW);
+    expect(seen!.equals(anchor)).toBe(true);
+  });
 });

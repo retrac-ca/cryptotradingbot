@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { signal, hold, signalToOrderSide } from '../../../src/strategy/Signal.js';
+import { Money } from '../../../src/money/Money.js';
 
 describe('Signal helpers', () => {
   it('builds a canonical signal', () => {
@@ -17,7 +18,16 @@ describe('Signal helpers', () => {
     const s = signal('BTC/CAD', 'HOLD', {}, 9);
     expect(s.confidence).toBeUndefined();
     expect(s.reason).toBeUndefined();
+    expect(s.entryAnchorPrice).toBeUndefined();
+    expect('entryAnchorPrice' in s).toBe(false);
     expect(s.timestampMs).toBe(9);
+  });
+
+  it('carries an entry anchor price when provided', () => {
+    const anchor = Money.fromString('123.45');
+    const s = signal('BTC/CAD', 'BUY', { entryAnchorPrice: anchor }, 7);
+    expect(s.entryAnchorPrice).toBe(anchor);
+    expect(s.entryAnchorPrice!.equals(anchor)).toBe(true);
   });
 
   it('hold() is a HOLD signal', () => {

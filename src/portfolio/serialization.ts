@@ -66,6 +66,12 @@ export interface PositionJsonV2 {
   feesPaid: string;
   source: PositionSource;
   sourceQuantities: Record<PositionSource, string>;
+  /**
+   * Optional strategy-agnostic entry anchor price (decimal string). Omitted
+   * entirely when the position has no anchor (`null`). A stored value must be a
+   * valid positive decimal; malformed/non-positive values fail closed on load.
+   */
+  entryAnchorPrice?: string;
 }
 
 /** A position in the legacy (v1) format: ownership components are optional. */
@@ -83,6 +89,8 @@ export interface PositionJsonV1 {
    * omit it; on load it is derived from `source` + `quantity`.
    */
   sourceQuantities?: Partial<Record<PositionSource, string>>;
+  /** Optional entry anchor price; absent => `null` on load. */
+  entryAnchorPrice?: string;
 }
 
 export type PositionJson = PositionJsonV1 | PositionJsonV2;
@@ -392,6 +400,9 @@ export function serializePortfolio(state: PortfolioModel): PortfolioJsonV2 {
         BOT: sq.BOT.toString(),
         EXTERNAL_AUTHORIZED: sq.EXTERNAL_AUTHORIZED.toString(),
       },
+      // Serialize only when an anchor exists; legacy/absent anchors are omitted
+      // so a null anchor never materializes as a synthetic value on disk.
+      ...(p.entryAnchorPrice != null ? { entryAnchorPrice: p.entryAnchorPrice.toString() } : {}),
     };
     positions[sym] = pj;
   }
@@ -546,6 +557,19 @@ function parsePosition(sym: string, p: PositionJson, realm: StateRealm): PaperPo
   const realizedPnl = Money.fromString(p.realizedPnl);
   const feesPaid = Money.fromString(p.feesPaid);
 
+  // Optional entry anchor: absent => `null`. When present it must be a valid,
+  // strictly-positive decimal. Malformed text throws in `Money.fromString`; a
+  // non-positive value fails closed here (consistent with the existing
+  // serialization validation that refuses corrupt persisted state).
+  let entryAnchorPrice: Money | null = null;
+  if (p.entryAnchorPrice !== undefined && p.entryAnchorPrice !== null) {
+    const anchor = Money.fromString(p.entryAnchorPrice);
+    if (!anchor.isPositive()) {
+      throw new Error(`Portfolio state ${sym}: non-positive entry anchor price`);
+    }
+    entryAnchorPrice = anchor;
+  }
+
   // F-10: V1 is long-only (quantity >= 0). A negative aggregate quantity is
   // corrupt state: it would under-count `expectedAssetBalances()` and could
   // mask an unexpected exchange decrease. Fail closed rather than load it.
@@ -592,7 +616,7 @@ function parsePosition(sym: string, p: PositionJson, realm: StateRealm): PaperPo
     sourceQuantities = { BOT: quantity, EXTERNAL_AUTHORIZED: Money.zero() };
   }
 
-  return { symbol: p.symbol, quantity, averageEntryPrice, costBasis, realizedPnl, feesPaid, source, sourceQuantities };
+  return { symbol: p.symbol, quantity, averageEntryPrice, costBasis, realizedPnl, feesPaid, source, sourceQuantities, entryAnchorPrice };
 }
 
 export function deserializePortfolio(json: PortfolioJson, options: DeserializeOptions = {}): PortfolioModel {

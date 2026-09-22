@@ -64,6 +64,53 @@ describe('PaperStateStore — minimal restart-safe persistence', () => {
     );
   });
 
+  it('round-trips a non-null entry anchor through save -> load -> portfolio exactly', () => {
+    const cash = new Map<string, Money>();
+    cash.set('CAD', Money.fromString('100000'));
+    const anchor = Money.fromString('51234.56789012');
+    const original = Portfolio.empty(cash).applyFill(
+      'BTC/CAD',
+      'BUY',
+      Money.fromString('0.25'),
+      Money.fromString('52000'),
+      Money.zero(),
+      undefined,
+      anchor,
+    );
+    const store = new PaperStateStore(freshFile());
+    store.save(original.stateModel, []);
+
+    const r = store.load();
+    expect(r.status).toBe('OK');
+    if (r.status !== 'OK') return;
+    expect(r.data.positions['BTC/CAD'].entryAnchorPrice).toBe('51234.56789012');
+
+    const restored = Portfolio.fromModel(store.toPortfolio(r.data)!);
+    expect(restored.position('BTC/CAD')!.entryAnchorPrice!.equals(anchor)).toBe(true);
+  });
+
+  it('loads a persisted position without an anchor as null', () => {
+    const cash = new Map<string, Money>();
+    cash.set('CAD', Money.fromString('100000'));
+    const original = Portfolio.empty(cash).applyFill(
+      'BTC/CAD',
+      'BUY',
+      Money.fromString('0.25'),
+      Money.fromString('52000'),
+      Money.zero(),
+    );
+    const store = new PaperStateStore(freshFile());
+    store.save(original.stateModel, []);
+
+    const r = store.load();
+    expect(r.status).toBe('OK');
+    if (r.status !== 'OK') return;
+    expect('entryAnchorPrice' in r.data.positions['BTC/CAD']).toBe(false);
+
+    const restored = Portfolio.fromModel(store.toPortfolio(r.data)!);
+    expect(restored.position('BTC/CAD')!.entryAnchorPrice).toBeNull();
+  });
+
   it('a corrupt/version-mismatched file is CORRUPT, never MISSING', () => {
     const p = freshFile();
     rmSync(p, { force: true });

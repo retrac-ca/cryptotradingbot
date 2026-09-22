@@ -16,6 +16,12 @@ export interface PositionView {
   quantity: Money;
   /** Average entry price, if any base units are held. */
   averageEntryPrice: Money | null;
+  /**
+   * The strategy-agnostic entry anchor price frozen onto the position when it
+   * was opened while flat, or `null` when none was recorded. Read-only opaque
+   * data; it never influences sizing or accounting.
+   */
+  entryAnchorPrice: Money | null;
   /** Realized P&L this session in quote currency (informational). */
   realizedPnl: Money;
 }
