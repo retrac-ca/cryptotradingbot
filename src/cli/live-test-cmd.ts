@@ -41,7 +41,7 @@ import { loadConfig } from '../config/load.js';
 import { createExchange } from '../exchanges/index.js';
 import type { ExchangeAdapter } from '../exchanges/ExchangeAdapter.js';
 import { LiveOrderEngine } from '../execution/LiveExecutionEngine.js';
-import type { PreparedLiveOrder, LiveOrderIntent } from '../execution/LiveExecutionEngine.js';
+import type { PreparedLiveOrder, LiveOrderIntent, ManagedOrderGuard } from '../execution/LiveExecutionEngine.js';
 import { createControlledLiveAuthorization } from '../execution/ControlledLiveAuthorization.js';
 import type { Logger } from '../logging/logger.js';
 import { evaluateFreshness, isValidEpochMs } from '../marketdata/index.js';
@@ -470,9 +470,48 @@ export function buildLiveRiskContext(i: {
     currentPosition: managed,
     externalPosition: external,
     openManagedPositionCount: portfolio.managedOpenCount(),
-    realizedPnlToday: portfolio.stateModel.realizedPnl,
+    realizedPnlToday: portfolio.dailyRealizedPnlAt(snapshot.observedAtMs),
     unrealizedPnlToday: mtm ? mtm.unrealizedPnl : null,
     sellTarget,
+  };
+}
+
+/**
+ * Mutation-boundary managed-state guard for the controlled live path (TOCTOU).
+ *
+ * The live-test flow reads managed portfolio state, prepares the EXACT order,
+ * displays it, and waits for operator confirmation. Another process could mutate
+ * the durable managed state in that window, leaving the approved order based on a
+ * stale snapshot. This guard is invoked by the engine INSIDE the submission
+ * mutation lock, immediately before exchange submission: it RELOADS the
+ * authoritative managed state and revalidates the exact order against it. It
+ * performs NO mutation and NEVER resizes, reprices, rebuilds, retries, or
+ * substitutes the order — if the fresh managed position no longer covers the
+ * approved SELL quantity it returns a fail-closed reason.
+ */
+export function buildManagedOrderGuard(live: ManagedStateStore): ManagedOrderGuard {
+  return (order) => {
+    const r = live.load();
+    if (r.status === 'CORRUPT') {
+      return `live managed state is corrupt (${r.reason})`;
+    }
+    if (r.status === 'MISSING') {
+      return 'live managed state is missing at submission time (unexpected state loss)';
+    }
+    const portfolio = live.toPortfolio(r.data);
+    if (!portfolio) {
+      return 'live managed state could not be reconstructed at submission time';
+    }
+    if (order.side === 'SELL') {
+      const managed = portfolio.position(order.symbol)?.quantity ?? Money.zero();
+      if (managed.compareTo(order.quantity) < 0) {
+        return (
+          `managed position for ${order.symbol} is now ${managed.toString()} and no longer covers ` +
+          `the approved SELL quantity ${order.quantity.toString()}; re-run live-test`
+        );
+      }
+    }
+    return null;
   };
 }
 
@@ -601,6 +640,10 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
     maxLiveQuoteNotional: Money.fromNumber(cfg.liveMaxQuoteNotional),
     maxLiveBaseQuantity: Money.fromNumber(cfg.liveMaxBaseQuantity),
     controlledLiveAuthorization: controlledAuth,
+    // TOCTOU: revalidate the exact approved order against freshly reloaded
+    // managed state under the existing mutation lock, immediately before
+    // exchange submission.
+    managedOrderGuard: buildManagedOrderGuard(deps.live),
   });
 
   // Prepare the EXACT immutable order from S1 BEFORE displaying/confirming.

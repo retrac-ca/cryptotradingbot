@@ -100,6 +100,12 @@ interface PortfolioJsonBase {
   positions: Record<string, PositionJson>;
   peakEquity: string;
   realizedPnl: string;
+  /**
+   * Optional (F6): realized P&L for the current UTC calendar day, plus the day
+   * key it belongs to. Absent in legacy files => zero/null (no false blocking).
+   */
+  dailyRealizedPnl?: string;
+  dailyRealizedDayKey?: string | null;
   totalFees: string;
   /** Optional (Gate 5): external holdings that are NOT bot-managed. */
   externalSnapshot?: Record<string, string>;
@@ -487,6 +493,12 @@ export function serializePortfolio(state: PortfolioModel): PortfolioJsonV2 {
     positions,
     peakEquity: state.peakEquity.toString(),
     realizedPnl: state.realizedPnl.toString(),
+    ...(state.dailyRealizedDayKey !== null
+      ? {
+          dailyRealizedPnl: state.dailyRealizedPnl.toString(),
+          dailyRealizedDayKey: state.dailyRealizedDayKey,
+        }
+      : {}),
     totalFees: state.totalFees.toString(),
     externalSnapshot,
     authorizedExternal: [...state.authorizedExternal],
@@ -764,6 +776,8 @@ export function deserializePortfolio(json: PortfolioJson, options: DeserializeOp
     positions,
     peakEquity: Money.fromString(json.peakEquity),
     realizedPnl: Money.fromString(json.realizedPnl),
+    dailyRealizedPnl: Money.fromString(json.dailyRealizedPnl ?? '0'),
+    dailyRealizedDayKey: json.dailyRealizedDayKey ?? null,
     totalFees: Money.fromString(json.totalFees),
     externalSnapshot,
     authorizedExternal: new Set(json.authorizedExternal ?? []),

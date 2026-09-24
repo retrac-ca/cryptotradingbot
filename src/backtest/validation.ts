@@ -166,6 +166,12 @@ export function validateConfig(config: BacktestConfig): void {
   if (typeof config.slippageFraction !== 'number' || !Number.isFinite(config.slippageFraction) || config.slippageFraction < 0) {
     throw new BacktestValidationError('backtest slippageFraction must be a finite, non-negative number');
   }
+
+  // The spread is an EXPLICIT assumption (candles carry no bid/ask history).
+  // Require it to be present and a finite fraction in [0, 1]; never defaulted.
+  if (typeof config.spreadFraction !== 'number' || !Number.isFinite(config.spreadFraction) || config.spreadFraction < 0 || config.spreadFraction > 1) {
+    throw new BacktestValidationError('backtest spreadFraction must be a finite number in [0, 1] (explicit spread assumption)');
+  }
 }
 
 /** Reusable sanity assert for `Money`-typed fields used across the backtest. */

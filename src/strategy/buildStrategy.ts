@@ -22,5 +22,6 @@ export function buildStrategy(cfg: BotConfig, timeframeOverride?: BotConfig['tim
     timeframe: timeframeOverride ?? cfg.timeframe,
     fastPeriod: cfg.maFastPeriod,
     slowPeriod: cfg.maSlowPeriod,
+    stopLossFraction: cfg.stopLossFraction,
   });
 }

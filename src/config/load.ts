@@ -44,7 +44,12 @@ function normalizeKeys(env: NodeJS.ProcessEnv): Record<string, unknown> {
 
 /** Load, validate, and return the resolved bot configuration. */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): BotConfig {
-  dotenv.config();
+  // Tests explicitly control the environment they require and must not inherit
+  // the developer's ambient `.env`. Production (and every non-test invocation)
+  // still loads `.env` exactly as before. `VITEST` is set by the test runner.
+  if (process.env.VITEST !== 'true') {
+    dotenv.config();
+  }
   const normalized = normalizeKeys(env);
 
   const parsed = botConfigSchema.safeParse(normalized);

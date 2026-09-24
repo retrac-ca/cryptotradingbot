@@ -194,6 +194,46 @@ describe('P2-2 — existing CREATED recovery remains fail-closed', () => {
   });
 });
 
+describe('P2-2 — SUBMITTED + null exchangeOrderId is fail-closed and operator-resolved only', () => {
+  it('a durable SUBMITTED live order with null exchangeOrderId blocks new LIVE placement', async () => {
+    const ledger = statePath('p22-submitted-guard', 'ledger.json');
+    const fake = new FakeExchange({ balances: { CAD: '100000' }, markets: { [SYMBOL]: market } });
+    const engine = buildEngine(fake, ledger);
+    new OrderStore(ledger).save(order({ status: 'SUBMITTED', exchangeOrderId: null }));
+
+    await expect(
+      engine.place(riskContext(), { reason: 'blocked', type: 'limit', price: Money.fromString('40000') }),
+    ).rejects.toThrow(/unresolved LIVE order/);
+    expect(fake.submittedOrders).toHaveLength(0);
+  });
+
+  it('recoverOrder cannot auto-resolve a SUBMITTED + null order (stays, no retry)', async () => {
+    const ledger = statePath('p22-submitted-recover', 'ledger.json');
+    const fake = new FakeExchange({ balances: { CAD: '100000' }, markets: { [SYMBOL]: market } });
+    const engine = buildEngine(fake, ledger);
+    const res = await engine.recoverOrder(order({ status: 'SUBMITTED', exchangeOrderId: null }));
+    expect(res.outcome).toBe('UNRESOLVED');
+    expect(res.order.status).toBe('SUBMITTED');
+    expect(res.order.exchangeOrderId).toBeNull();
+    expect(fake.submittedOrders).toHaveLength(0);
+  });
+
+  it('after an explicit operator ABANDON the record is terminal and subsequent placement is safe', async () => {
+    const ledger = statePath('p22-submitted-abandon', 'ledger.json');
+    const fake = new FakeExchange({ balances: { CAD: '100000' }, markets: { [SYMBOL]: market } });
+    const engine = buildEngine(fake, ledger);
+    new OrderStore(ledger).save(abandonedOrder());
+
+    const result = await engine.place(riskContext(), {
+      reason: 'after-operator-abandon',
+      type: 'limit',
+      price: Money.fromString('40000'),
+    });
+    expect(result.order.status).toBe('SUBMITTED');
+    expect(fake.submittedOrders).toHaveLength(1);
+  });
+});
+
 describe('P2-2 — ABANDONED is terminal and durable', () => {
   it('recoverState treats an ABANDONED order as terminal (READY, not unresolved)', () => {
     const ledger = statePath('p22-abandon', 'ledger.json');

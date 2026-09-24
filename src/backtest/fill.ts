@@ -42,12 +42,27 @@ function ceilToIncrement(value: Money, increment: Money): Money {
 /**
  * Compute the deterministic fill price for a side at a bar's OPEN price.
  *
- * `raw = open * (1 ± slippage)`, then:
+ * The open is treated as the reference (mid) price. Two SEPARATE, explicit
+ * costs are applied:
+ *   - spread: half of `spreadFraction` per side (BUY pays above, SELL receives
+ *     below) — an explicit assumption, since candles carry no bid/ask history;
+ *   - slippage: the full `slippageFraction` per side (BUY pays above, SELL
+ *     receives below).
+ *
+ * `raw = open * (1 ± (spread/2 + slippage))`, then:
  *   - BUY  -> round UP to `priceTick`;
  *   - SELL -> round DOWN to `priceTick`.
  */
-export function computeFillPrice(open: Money, side: OrderSide, slippageFraction: number, priceTick: Money): Money {
-  const factor = slippageFactor(slippageFraction, side);
+export function computeFillPrice(
+  open: Money,
+  side: OrderSide,
+  slippageFraction: number,
+  priceTick: Money,
+  spreadFraction: number = 0,
+): Money {
+  const halfSpread = BigInt(Math.round((spreadFraction / 2) * Number(SLIP_SCALE)));
+  const adjustment = slippageFactor(slippageFraction, side) - SLIP_SCALE; // ±slip
+  const factor = SLIP_SCALE + adjustment + (side === 'BUY' ? halfSpread : -halfSpread);
   const raw = open.mulFraction(factor, SLIP_SCALE);
   if (side === 'BUY') return ceilToIncrement(raw, priceTick);
   return raw.floorToIncrement(priceTick);

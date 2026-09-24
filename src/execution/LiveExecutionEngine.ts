@@ -107,7 +107,31 @@ export interface LiveExecutionConfig {
    * path and is passed to the adapter's `placeOrder`.
    */
   controlledLiveAuthorization?: ControlledLiveAuthorization;
+  /**
+   * Optional mutation-boundary guard that revalidates the exact order against a
+   * freshly reloaded managed portfolio under the submission lock (TOCTOU). See
+   * {@link ManagedOrderGuard}. When absent, no managed-state revalidation is
+   * performed. It never permits re-sizing/re-pricing; a non-null reason fails the
+   * submission closed.
+   */
+  managedOrderGuard?: ManagedOrderGuard;
 }
+
+/**
+ * Optional TOCTOU guard for the authoritative managed portfolio.
+ *
+ * It is invoked by the engine INSIDE the LIVE submission mutation lock, after a
+ * FRESH managed-state reload and IMMEDIATELY before any exchange mutation. It
+ * receives the EXACT order that is about to be submitted and MUST NOT mutate,
+ * resize, reprice, replace, or rebuild it.
+ *
+ * Returns `null` when the order remains valid against the freshly reloaded
+ * managed state, or a fail-closed reason string when it does not. A non-null
+ * reason blocks submission: no CREATED persistence, no exchange call, no retry,
+ * and no substitution. The caller is responsible for reloading the managed state
+ * inside the guard (the engine never holds or mutates managed portfolio state).
+ */
+export type ManagedOrderGuard = (order: NewOrder) => string | null;
 
 export interface LiveOrderIntent {
   /** Human reason this order is being placed, for auditability. */
@@ -446,6 +470,22 @@ export class LiveOrderEngine {
       // safe) and survives restart.
       this.assertNoUnresolvedLiveOrder();
       await this.validateOrder(order);
+
+      // Managed-state TOCTOU (controlled live): the operator-authorized order was
+      // prepared from a managed-state snapshot taken before confirmation. Another
+      // process could have mutated the durable managed portfolio in that window.
+      // Under the SAME mutation lock, immediately before any exchange mutation,
+      // re-run the managed-quantity validation against the FRESHLY reloaded
+      // managed state. A non-null reason fails closed: the EXACT order is never
+      // resized, repriced, rebuilt, retried, or substituted.
+      const managedBlock = this.cfg.managedOrderGuard?.(order) ?? null;
+      if (managedBlock) {
+        return {
+          order: this.buildRejected(order, managedBlock),
+          unknownOutcome: false,
+          message: `refused: ${managedBlock}`,
+        };
+      }
 
       // Persist-before-submit: claim the internally-generated clientOrderId.
       if (this.store.get(order.clientOrderId)) {

@@ -55,6 +55,7 @@ export class LiveMarketData implements MarketDataProvider {
   private readonly orderBookIntervalMs: number;
   private readonly candleIntervalMs: number;
   private readonly candleTimeframes: Timeframe[];
+  private readonly candleLookbackMs: number | undefined;
   private readonly staleAfterMs: number;
   private readonly state = new Map<string, Snapshot>();
   private readonly timers = new Map<string, ReturnType<typeof setInterval>>();
@@ -68,6 +69,7 @@ export class LiveMarketData implements MarketDataProvider {
     this.orderBookIntervalMs = config.orderBookIntervalMs ?? DEFAULT_ORDER_BOOK_MS;
     this.candleIntervalMs = config.candleIntervalMs ?? 0;
     this.candleTimeframes = config.candleTimeframes ?? [];
+    this.candleLookbackMs = config.candleLookbackMs;
     this.staleAfterMs = config.staleAfterMs ?? Number.POSITIVE_INFINITY;
   }
 
@@ -201,7 +203,14 @@ export class LiveMarketData implements MarketDataProvider {
         this.upsert(key, { data: stamped, candles: null, updatedMs: Date.now(), error: null, consecutiveFailures: 0 });
         this.events.emit('orderBook', stamped);
       } else {
-        const candles = await this.adapter.getCandles(symbol, timeframe!);
+        // F4: request enough history to warm up the configured strategy on this
+        // timeframe (the adapter's fixed default window is too short for >= 1h).
+        const candles = this.candleLookbackMs !== undefined
+          ? await this.adapter.getCandles(symbol, timeframe!, {
+              fromMs: Date.now() - this.candleLookbackMs,
+              toMs: Date.now(),
+            })
+          : await this.adapter.getCandles(symbol, timeframe!);
         this.upsert(key, { data: null, candles, updatedMs: Date.now(), error: null, consecutiveFailures: 0 });
         this.events.emit('candles', candles);
       }

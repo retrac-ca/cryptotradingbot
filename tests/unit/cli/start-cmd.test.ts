@@ -30,6 +30,9 @@ describe('bot start — live confirmation gates', () => {
 
   it('requires REAL_FUNDS_AT_RISK=true acknowledgement, even with --confirm-live', async () => {
     vi.stubEnv('TRADING_MODE', 'live');
+    // Explicitly control the environment: the developer's ambient .env must not
+    // decide this outcome.
+    vi.stubEnv('REAL_FUNDS_AT_RISK', 'false');
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const code = await startCommand(['--confirm-live']);
     expect(code).toBe(1);

@@ -9,6 +9,12 @@
 
 export { LiveMarketData } from './LiveMarketData.js';
 export {
+  completedCandles,
+  requiredCandleLookbackMs,
+  TIMEFRAME_MS,
+  CANDLE_WARMUP_MARGIN_BARS,
+} from './candles.js';
+export {
   evaluateFreshness,
   newestQuoteTimestampMs,
   QUOTE_FRESHNESS_REASON,

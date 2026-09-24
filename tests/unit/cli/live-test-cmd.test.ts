@@ -576,6 +576,57 @@ describe('live-test — exact-order authorization + execution-time freshness', (
   });
 });
 
+describe('live-test — managed-state TOCTOU at the submission boundary', () => {
+  function portfolioWith(btc: string): Portfolio {
+    return Portfolio.empty(new Map([['CAD', Money.fromString('100000')]]))
+      .applyFill(SYMBOL, 'BUY', Money.fromString(btc), ticker().bid!, Money.fromString('5'));
+  }
+
+  it('A: unchanged managed state still reaches submission', async () => {
+    const deps = buildDeps();
+    const led = await executeLiveTest(deps, opts);
+    expect(led).toBe(0);
+    expect(deps.adapter.submittedOrders).toHaveLength(1);
+    expect(deps.adapter.submittedOrders[0]!.quantity.toFixed(8)).toBe('0.00030000');
+    expect(deps.adapter.submittedOrders[0]!.price!.toFixed(8)).toBe('40000.00000000');
+  });
+
+  it('B: managed state reduced during confirmation blocks the approved SELL (no re-price, no order)', async () => {
+    let live!: ManagedStateStore;
+    const deps = buildDeps({
+      confirm: async () => {
+        // A concurrent process mutates the durable managed state while the
+        // operator confirms, leaving the approved 0.0003 BTC SELL uncovered.
+        live.save(portfolioWith('0.0001').stateModel);
+        return true;
+      },
+    });
+    live = deps.live;
+    const led = await executeLiveTest(deps, opts);
+    expect(led).toBe(1);
+    expect(deps.adapter.submittedOrders).toHaveLength(0);
+    expect(deps.store.allOrders().size).toBe(0);
+  });
+
+  it('C: managed state growth during confirmation cannot resize/reprice the approved order', async () => {
+    let live!: ManagedStateStore;
+    const deps = buildDeps({
+      confirm: async () => {
+        live.save(portfolioWith('5').stateModel);
+        return true;
+      },
+    });
+    live = deps.live;
+    const led = await executeLiveTest(deps, opts);
+    expect(led).toBe(0);
+    expect(deps.adapter.submittedOrders).toHaveLength(1);
+    // Exact S1-derived order is submitted; the larger managed position does NOT
+    // cause the order to grow or the price to change.
+    expect(deps.adapter.submittedOrders[0]!.quantity.toFixed(8)).toBe('0.00030000');
+    expect(deps.adapter.submittedOrders[0]!.price!.toFixed(8)).toBe('40000.00000000');
+  });
+});
+
 // NDAX quote-freshness basis (F-3/F-8): the L2 order-book `ActionDateTime`
 // is the authoritative quote freshness timestamp. The L1 `TimeStamp` is a
 // last-trade/session timestamp that can lag the quote, so it must NOT be used

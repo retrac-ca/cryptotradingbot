@@ -1,26 +1,33 @@
 /**
  * `bot resolve-created-order` — operator-only quarantine/resolution of a durable
- * LIVE `CREATED` order whose exchange outcome is FUNDAMENTALLY AMBIGUOUS.
+ * LIVE order whose exchange outcome is FUNDAMENTALLY AMBIGUOUS because it has NO
+ * exchangeOrderId.
  *
- * A durable `CREATED` order (crash after persist-before-submit but before/around
- * SendOrder) may or may not have reached the exchange. The system cannot prove
- * which, because:
- *   - the submission may or may not have happened;
+ * Two local states are eligible:
+ *   - `CREATED`: a crash after persist-before-submit but before/around SendOrder.
+ *     The bot cannot prove whether the submission reached the exchange.
+ *   - `SUBMITTED` with `exchangeOrderId = null`: the exchange returned an
+ *     acceptance receipt but no exchange order id, so the bot has NO identity
+ *     with which to reconcile the outcome.
+ *
+ * In BOTH cases the system cannot prove the exchange outcome, because:
+ *   - the submission may or may not have happened / may or may not be live;
  *   - NDAX `ClientOrderId` lookup is not supported and its uniqueness is not
  *     proven (we send 0 by default);
  *   - heuristic matching by symbol/side/quantity/price is forbidden;
- *   - an exchange `OrderId` is the only reliable identity, and a CREATED order
- *     has none.
+ *   - an exchange `OrderId` is the only reliable identity, and these orders have
+ *     none.
  *
  * This command therefore NEVER tries to reconstruct the exchange outcome
  * automatically. It offers exactly two explicit operator resolutions:
  *   A. ATTACH  — the operator asserts the exact exchange OrderId that belongs to
- *                this CREATED order; the command verifies the exchange order's
- *                identity (symbol/side/type/quantity/limit price) via READ-ONLY
- *                reads, attaches the id, and adopts the authoritative status.
- *   B. ABANDON — the operator deliberately closes the local CREATED record. This
- *                is NOT proof that no exchange order exists; it is an explicit
- *                operator acknowledgement that the outcome cannot be determined.
+ *                this order; the command verifies the exchange order's identity
+ *                (symbol/side/type/quantity/limit price) via READ-ONLY reads,
+ *                attaches the id, and adopts the authoritative status.
+ *   B. ABANDON — the operator deliberately closes the local record. This is NOT
+ *                proof that no exchange order exists (nor that the order was
+ *                never submitted); it is an explicit operator acknowledgement
+ *                that the outcome cannot be determined.
  *
  * SAFETY CONTRACT:
  *   - The exchange adapter is wrapped in a read-only proxy; no code path can
@@ -46,7 +53,7 @@
 import { loadConfig } from '../config/load.js';
 import { createExchange } from '../exchanges/index.js';
 import { Portfolio } from '../portfolio/Portfolio.js';
-import type { Order } from '../order.js';
+import type { Order, OrderStatus } from '../order.js';
 import type { AccountTrade, Balance } from '../types.js';
 import { OrderStore, withStateDirLock } from '../persistence/index.js';
 import { toReadOnlyAdapter, type FeeCtx } from './manual-cmd.js';
@@ -63,6 +70,20 @@ const blocked = (lines: string[], json: Record<string, unknown>): CliCommandResu
 const failed = (lines: string[], json: Record<string, unknown>): CliCommandResult => ({ code: 1, lines, json });
 
 type ResolutionMode = 'ATTACH' | 'ABANDON';
+
+/**
+ * Local statuses that represent a fundamentally UNIDENTIFIED LIVE order: a
+ * durable record with NO exchangeOrderId whose exchange outcome cannot be
+ * proven. `CREATED` = persisted before an ambiguous submission; `SUBMITTED` =
+ * an acceptance receipt with no exchange order id to reconcile against. Both are
+ * resolved by the SAME operator-only ATTACH/ABANDON path.
+ */
+const UNIDENTIFIED_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>(['CREATED', 'SUBMITTED']);
+
+/** True when `order` is an unidentified LIVE order eligible for this resolution. */
+function isUnidentifiedLiveOrder(order: Order): boolean {
+  return order.exchangeOrderId == null && UNIDENTIFIED_STATUSES.has(order.status);
+}
 
 interface ResolveCreatedOrderArgs {
   clientOrderId: string;
@@ -196,6 +217,19 @@ function renderEvidence(
     '  local status:             ' + order.status,
     '  exchangeOrderId:          ' + (order.exchangeOrderId ?? 'null (ambiguous)'),
   ];
+  if (order.status === 'SUBMITTED') {
+    // SUBMITTED + null exchangeOrderId: the exchange returned an acceptance
+    // receipt but the bot cannot identify the order. State this explicitly: the
+    // outcome is UNKNOWN and there is NO id to reconcile, without claiming the
+    // exchange order does not exist or was never submitted.
+    lines.push(
+      '',
+      'WARNING: this local order is SUBMITTED but has NO exchangeOrderId.',
+      'The exchange outcome is UNKNOWN. The bot received a submission receipt but has',
+      'NO exchangeOrderId with which to reconcile this order. This command does NOT',
+      'prove the exchange order does not exist, and does NOT prove it was never submitted.',
+    );
+  }
   if (exchangeOrder) {
     lines.push(
       '',
@@ -223,8 +257,9 @@ function renderEvidence(
 }
 
 /**
- * Resolve a durable LIVE CREATED order via an explicit operator action.
- * NEVER submits/cancels/retries; the exchange adapter is already read-only.
+ * Resolve a durable LIVE unidentified order (CREATED, or SUBMITTED with no
+ * exchangeOrderId) via an explicit operator action. NEVER submits/cancels/retries;
+ * the exchange adapter is already read-only.
  */
 export async function runResolveCreatedOrder(deps: ResolveCreatedOrderDeps, argv: string[]): Promise<CliCommandResult> {
   const parsed = parseResolveCreatedOrderArgs(argv);
@@ -237,16 +272,19 @@ export async function runResolveCreatedOrder(deps: ResolveCreatedOrderDeps, argv
   if (!initial) {
     return failed([`live order ${o.clientOrderId} not found in the order ledger`], { error: 'order_not_found', clientOrderId: o.clientOrderId });
   }
-  if (initial.status !== 'CREATED') {
+  if (initial.status === 'CREATED' && initial.exchangeOrderId != null) {
     return failed(
-      [`order ${o.clientOrderId} status is ${initial.status}, not CREATED; it is already resolved or is not a CREATED order`],
-      { error: 'not_created', clientOrderId: o.clientOrderId, status: initial.status },
+      [`order ${o.clientOrderId} already has exchangeOrderId ${initial.exchangeOrderId}; it is not an ambiguous unidentified order`],
+      { error: 'already_has_exchange_id', clientOrderId: o.clientOrderId },
     );
   }
-  if (initial.exchangeOrderId != null) {
+  if (!isUnidentifiedLiveOrder(initial)) {
     return failed(
-      [`order ${o.clientOrderId} already has exchangeOrderId ${initial.exchangeOrderId}; it is not an ambiguous CREATED order`],
-      { error: 'already_has_exchange_id', clientOrderId: o.clientOrderId },
+      [
+        `order ${o.clientOrderId} status is ${initial.status} (exchangeOrderId=${initial.exchangeOrderId ?? 'null'}); ` +
+          'it is not an unresolved CREATED/SUBMITTED order without an exchangeOrderId (already resolved or not eligible)',
+      ],
+      { error: 'not_created', clientOrderId: o.clientOrderId, status: initial.status },
     );
   }
 
@@ -290,7 +328,8 @@ export async function runResolveCreatedOrder(deps: ResolveCreatedOrderDeps, argv
       '',
       'WARNING: ABANDON is NOT proof that no exchange order exists.',
       'The exchange outcome cannot be proven from the available interfaces.',
-      'Abandoning this local CREATED record does NOT prove that no exchange order exists.',
+      `Abandoning this local ${initial.status} record does NOT prove that no exchange order exists,`,
+      'and does NOT prove that it was never submitted.',
       'If an exchange order does exist, abandoning here does not cancel or close it.',
       'This is a LOCAL OPERATOR RESOLUTION, not an exchange outcome.',
     );
@@ -301,14 +340,15 @@ export async function runResolveCreatedOrder(deps: ResolveCreatedOrderDeps, argv
     const applied = withStateDirLock(deps.cfg.stateDir, () => {
       const current = deps.orders.get(o.clientOrderId);
       if (!current) throw new Error(`order ${o.clientOrderId} no longer exists`);
-      if (current.status !== 'CREATED') {
-        throw new Error(`order ${o.clientOrderId} is no longer CREATED (status ${current.status}); already resolved`);
-      }
-      if (current.exchangeOrderId != null) {
-        throw new Error(`order ${o.clientOrderId} already has exchangeOrderId ${current.exchangeOrderId}; already resolved`);
+      if (!isUnidentifiedLiveOrder(current)) {
+        throw new Error(
+          `order ${o.clientOrderId} is no longer an unidentified CREATED/SUBMITTED order ` +
+            `(status ${current.status}, exchangeOrderId ${current.exchangeOrderId ?? 'null'}); already resolved`,
+        );
       }
       // TOCTOU: the durable identity/details must be unchanged since the initial read.
       if (
+        current.status !== initial.status ||
         current.symbol !== initial.symbol ||
         current.side !== initial.side ||
         current.type !== initial.type ||
@@ -391,8 +431,8 @@ export async function runResolveCreatedOrder(deps: ResolveCreatedOrderDeps, argv
             '',
             'ABANDON APPLIED (LOCAL OPERATOR RESOLUTION; provenanceProof=false).',
             `  order status:            ${applied.order.status}`,
-            'The local CREATED record is now terminal. This did NOT prove that the exchange',
-            'has no order, and did NOT cancel/close any exchange order.',
+            'The local unidentified order record is now terminal. This did NOT prove that the',
+            'exchange has no order, and did NOT cancel/close any exchange order.',
           ];
     return ok([...lines, ...footer], json);
   } catch (err) {
@@ -415,7 +455,7 @@ export const resolveCreatedOrderCommand: CommandHandler = async (args): Promise<
 
   if (!cfg.enableAuthenticatedReads) {
     // eslint-disable-next-line no-console
-    console.error('Resolving a CREATED order needs authenticated account reads, but ENABLE_AUTHENTICATED_READS is not "true".');
+    console.error('Resolving an unidentified live order needs authenticated account reads, but ENABLE_AUTHENTICATED_READS is not "true".');
     return 2;
   }
 

@@ -45,6 +45,8 @@ export class Portfolio {
       positions: new Map(),
       peakEquity: Portfolio.equityOf({ cash: new Map(initialCash), positions: new Map() }),
       realizedPnl: Money.zero(),
+      dailyRealizedPnl: Money.zero(),
+      dailyRealizedDayKey: null,
       totalFees: Money.zero(),
       externalSnapshot: new Map(ownership.externalSnapshot ?? []),
       authorizedExternal: new Set(ownership.authorizedExternal ?? []),
@@ -518,7 +520,7 @@ export class Portfolio {
     quantity: Money,
     price: Money,
     fee: Money,
-    _nowMs?: number,
+    nowMs?: number,
     entryAnchor?: Money,
   ): Portfolio {
     const quote = symbol.split('/')[1]!;
@@ -621,6 +623,17 @@ export class Portfolio {
       state.cash.set(quote, state.cash.get(quote)!.add(proceeds));
       state.realizedPnl = state.realizedPnl.add(realized);
       state.totalFees = state.totalFees.add(fee);
+
+      // Daily realized-P&L bucket (F6): reset when the fill falls on a new UTC
+      // calendar day. Lifetime `realizedPnl` above is never affected.
+      if (nowMs !== undefined) {
+        const dayKey = utcDayKey(nowMs);
+        if (state.dailyRealizedDayKey !== dayKey) {
+          state.dailyRealizedDayKey = dayKey;
+          state.dailyRealizedPnl = Money.zero();
+        }
+        state.dailyRealizedPnl = state.dailyRealizedPnl.add(realized);
+      }
     }
 
     // Track peak equity (cost-basis baseline) for drawdown.
@@ -630,6 +643,18 @@ export class Portfolio {
     }
 
     return new Portfolio(state);
+  }
+
+  /**
+   * F6: realized P&L (quote) for the UTC calendar day containing `nowMs`.
+   * Returns zero when the stored bucket belongs to a different day, so the
+   * daily-loss gate resets at the day boundary WITHOUT mutating state or
+   * touching lifetime `realizedPnl`. Durable across restarts.
+   */
+  dailyRealizedPnlAt(nowMs: number): Money {
+    return this.state.dailyRealizedDayKey === utcDayKey(nowMs)
+      ? this.state.dailyRealizedPnl
+      : Money.zero();
   }
 
   // --- Idempotent live fill accounting (Gate 7.2) ---
@@ -703,7 +728,7 @@ export class Portfolio {
     }
 
     const cost = fill.quantity.mul(fill.price).add(fill.fee);
-    let next = this.applyFill(symbol, side, fill.quantity, fill.price, fill.fee);
+    let next = this.applyFill(symbol, side, fill.quantity, fill.price, fill.fee, fill.timestampMs ?? undefined);
     if (side === 'BUY') {
       const res = next.stateModel.orderReservations.get(orderId);
       if (res && res.status === 'ACTIVE') {
@@ -926,7 +951,7 @@ export class Portfolio {
     }
 
     // Apply the order-aggregate fill via the non-idempotent accounting path.
-    let next = this.applyFill(op.symbol, op.side, op.quantity, op.price, op.fee);
+    let next = this.applyFill(op.symbol, op.side, op.quantity, op.price, op.fee, op.executedAtMs ?? undefined);
     if (op.side === 'BUY') {
       // Pair the cash reduction with the reservation consumption + release so the
       // deployed quote (`cash - reserved`) stays correct, then release the
@@ -1139,7 +1164,7 @@ export class Portfolio {
     // Apply the order-aggregate fill via the shared accounting path (correct SELL
     // provenance consumption, cash/proceeds, realized P&L and fees). Do NOT
     // duplicate the SELL accounting math here.
-    let next = this.applyFill(symbol, side, attestedFilledQuantity, attestedAveragePrice, op.fee);
+    let next = this.applyFill(symbol, side, attestedFilledQuantity, attestedAveragePrice, op.fee, op.attestedAtMs);
     if (side === 'BUY') {
       next = next.consumeOrderReservation(clientOrderId, cost);
       next = next.releaseQuote(reservation!.currency, cost);
@@ -1261,6 +1286,8 @@ export class Portfolio {
       ),
       peakEquity: this.state.peakEquity,
       realizedPnl: this.state.realizedPnl,
+      dailyRealizedPnl: this.state.dailyRealizedPnl,
+      dailyRealizedDayKey: this.state.dailyRealizedDayKey,
       totalFees: this.state.totalFees,
       externalSnapshot: new Map(this.state.externalSnapshot),
       authorizedExternal: new Set(this.state.authorizedExternal),
@@ -1291,4 +1318,15 @@ export class Portfolio {
       ),
     };
   }
+}
+
+/**
+ * UTC calendar-day key (`YYYY-MM-DD`) for an epoch-ms timestamp.
+ *
+ * The repository's timestamps are epoch-ms and the exchange/NDAX conventions are
+ * UTC (NDAX request dates are UTC), and there is no configured operational
+ * timezone, so the daily boundary is UTC and explicit.
+ */
+function utcDayKey(nowMs: number): string {
+  return new Date(nowMs).toISOString().slice(0, 10);
 }

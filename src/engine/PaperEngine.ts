@@ -38,7 +38,7 @@ import type { Strategy } from '../strategy/Strategy.js';
 import type { RiskManager } from '../risk/RiskManager.js';
 import { Portfolio } from '../portfolio/Portfolio.js';
 import { PaperExecutionEngine } from '../execution/PaperExecutionEngine.js';
-import type { PaperExecutionConfig } from '../execution/PaperExecutionTypes.js';
+import type { PaperExecutionConfig, PaperOrder } from '../execution/PaperExecutionTypes.js';
 import type { PaperStateStore } from '../persistence/PaperStateStore.js';
 import type { Timeframe, MarketInfo } from '../types.js';
 import { MarketCoordinator } from './MarketCoordinator.js';
@@ -79,6 +79,7 @@ export class PaperEngine {
   private readonly logger: Logger;
   private readonly marketData: MarketDataProvider;
   private readonly exchange: ExchangeAdapter;
+  private readonly riskManager: RiskManager;
   private portfolio: Portfolio;
   private readonly store: PaperStateStore | null;
   private readonly paper: PaperExecutionEngine;
@@ -101,6 +102,7 @@ export class PaperEngine {
     this.logger = deps.logger;
     this.marketData = deps.marketData;
     this.exchange = deps.exchange;
+    this.riskManager = deps.riskManager;
     this.portfolio = deps.portfolio;
     this.store = deps.store;
     this.paper = new PaperExecutionEngine(deps.paperConfig, deps.portfolio);
@@ -237,6 +239,10 @@ export class PaperEngine {
       // portfolio can freeze it when this BUY opens a flat position.
       entryAnchorPrice: selected.entryAnchorPrice ?? undefined,
     };
+    // Capture the durable entry basis BEFORE the fill so a realized loss on a
+    // SELL can be attributed without relying on the (possibly closed) position
+    // afterwards.
+    const avgEntryBefore = this.portfolio.position(selected.symbol)?.averageEntryPrice ?? null;
     const fill = this.paper.submitMarketOrder(
       orderRequest,
       {
@@ -247,6 +253,7 @@ export class PaperEngine {
       nowMs,
     );
     this.portfolio = this.paper.currentPortfolio;
+    this.armCooldownOnLosingClose(fill, avgEntryBefore, nowMs);
     this.logger.info(
       {
         symbol: selected.symbol,
@@ -260,6 +267,29 @@ export class PaperEngine {
       'paper fill',
     );
     this.persist();
+  }
+
+  /**
+   * F5: arm the RiskManager cooldown ONLY after a SELL that actually realizes a
+   * loss. Uses the same realized-P&L formula as the Portfolio (filled quantity ×
+   * (fill price − average entry) − fee), where average entry includes entry
+   * fees. A profitable/breakeven close, a rejected/open order, a BUY, or a
+   * position with no positive cost basis (external/zero-basis inventory) never
+   * arms it.
+   */
+  private armCooldownOnLosingClose(fill: PaperOrder, avgEntryBefore: Money | null, nowMs: number): void {
+    if (fill.side !== 'SELL') return;
+    if (fill.status !== 'FILLED' && fill.status !== 'PARTIALLY_FILLED') return;
+    if (!fill.filledQuantity.isPositive() || fill.averagePrice === null) return;
+    if (avgEntryBefore === null || !avgEntryBefore.isPositive()) return;
+    const realized = fill.filledQuantity.mul(fill.averagePrice.sub(avgEntryBefore)).sub(fill.fee);
+    if (realized.isNegative()) {
+      this.riskManager.recordLoss(nowMs);
+      this.logger.info(
+        { symbol: fill.symbol, realized: realized.toString() },
+        'risk cooldown armed after a losing close',
+      );
+    }
   }
 
   /** Recompute the eligible universe from the configured/approved symbols + discovered markets. */

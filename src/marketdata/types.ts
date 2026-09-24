@@ -24,6 +24,13 @@ export interface MarketDataConfig {
   /** Poll interval for candles. 0 disables candle polling. Default 0. */
   candleIntervalMs?: number;
   /**
+   * How far back (ms) each candle fetch requests history. This must be large
+   * enough to warm up the configured strategy on the configured timeframe (see
+   * `requiredCandleLookbackMs`). When omitted, the adapter's own default window
+   * applies (which may be too short for higher timeframes).
+   */
+  candleLookbackMs?: number;
+  /**
    * A snapshot older than `staleAfterMs` (relative to its poll interval) is
    * reported stale by `isStale`. Default 2.5x the poll interval for that kind.
    */

@@ -61,6 +61,15 @@ export interface BacktestConfig {
   feeModel: BacktestFeeModel;
   /** Deterministic per-side slippage fraction (>= 0) applied at the fill. */
   slippageFraction: number;
+  /**
+   * FULL quoted bid/ask spread fraction (>= 0) assumed for the fill, applied
+   * HALF per side: a BUY pays `reference * (1 + spread/2)`, a SELL receives
+   * `reference * (1 - spread/2)`. This is an EXPLICIT assumption because OHLC
+   * candles do NOT contain historical bid/ask data — it is never inferred from
+   * the candles. `0` means "assume no spread" (visible in the result/output).
+   * Slippage is separate and applied on top.
+   */
+  spreadFraction: number;
   /** Explicit market constraints (ticks + minimum). */
   marketConstraints: BacktestMarketConstraints;
 }
@@ -157,6 +166,8 @@ export interface BacktestResult {
   marketConstraints: BacktestMarketConstraints;
   feeModel: BacktestFeeModel;
   slippageFraction: number;
+  /** The explicit full-spread assumption used (half applied per side). */
+  spreadFraction: number;
   trades: BacktestTrade[];
   rejections: BacktestRejection[];
   equityCurve: { timestampMs: number; equity: Money }[];

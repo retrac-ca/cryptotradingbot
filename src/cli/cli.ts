@@ -2,14 +2,16 @@
  * CLI entrypoint.
  *
  * Command dispatcher for the `bot` binary. Each subcommand is a small module.
- * Commands cover setup/config, paper+start engines, status, backtesting, the
- * order ledger (trades), and read-only reconciliation.
+ * Commands cover setup/config, paper+start engines, status, read-only historical
+ * candle acquisition, backtesting, the order ledger (trades), and read-only
+ * reconciliation.
  */
 
 import { createLogger } from '../logging/logger.js';
 import { VERSION } from './context.js';
 import { backtestCommand } from './backtest-cmd.js';
 import { configureCommand } from './config-cmd.js';
+import { fetchCandlesCommand } from './fetch-candles-cmd.js';
 import { liveMonitorCommand } from './live-monitor-cmd.js';
 import { liveOnboardExternalCommand } from './live-onboard-external-cmd.js';
 import { liveTestCommand } from './live-test-cmd.js';
@@ -30,6 +32,7 @@ export const COMMANDS = {
   start: startCommand,
   status: statusCommand,
   backtest: backtestCommand,
+  'fetch-candles': fetchCandlesCommand,
   trades: tradesCommand,
   reconcile: reconcileCommand,
   'live-test': liveTestCommand,
@@ -53,6 +56,7 @@ Commands:
   start     Start the bot (paper by default)
   status    Show current bot / trading status
   backtest  Run a historical backtest from a candles JSON file
+  fetch-candles Acquire historical candles from the exchange (READ-ONLY public data; never trades)
   trades    Show the durable order ledger
   reconcile Reconcile the order ledger against the exchange (read-only)
   live-test One-shot, operator-gated LIVE SELL (e.g. first-risk-validated live order)
@@ -60,7 +64,7 @@ Commands:
   live-onboard-external Authorize existing EXTERNAL exchange inventory as bot-managed (local ownership only; NOT trading)
   manual    Constrained MANUAL EXECUTION BRIDGE (operator interface; never places/cancels an exchange order)
   resolve-live-order Operator-attested resolution of an ambiguous FILLED live order (never submits/cancels)
-  resolve-created-order Operator-only ATTACH/ABANDON resolution of an ambiguous CREATED live order (never submits/cancels)
+  resolve-created-order Operator-only ATTACH/ABANDON resolution of an unidentified live order (CREATED, or SUBMITTED without an exchangeOrderId; never submits/cancels)
   help      Show this help
 
 Run "bot <command> --help" for command-specific options.

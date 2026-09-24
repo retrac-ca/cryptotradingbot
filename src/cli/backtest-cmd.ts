@@ -8,13 +8,15 @@
  *
  * Usage:
  *   bot backtest <candles.json> [--initial-capital N] [--fee F] [--slippage S]
- *                 [--price-tick P] [--quantity-tick Q] [--min-order-base B]
- *                 [--out FILE]
+ *                 [--spread X] [--price-tick P] [--quantity-tick Q]
+ *                 [--min-order-base B] [--out FILE]
  *
  * Explicit market constraints (`--price-tick`, `--quantity-tick`,
  * `--min-order-base`) are REQUIRED; the simulator never invents tick/minimum
- * defaults. Fee and slippage must be non-negative. Results are a HISTORICAL
- * SIMULATION, not a prediction of future performance.
+ * defaults. Fee, slippage and spread must be non-negative. `--spread` is the
+ * explicit full bid/ask spread assumption (half applied per side); because OHLC
+ * candles contain no bid/ask history it is never inferred from the data. Results
+ * are a HISTORICAL SIMULATION, not a prediction of future performance.
  */
 
 import { writeFileSync } from 'node:fs';
@@ -31,6 +33,7 @@ interface BacktestArgs {
   initialCapital: number;
   feeFraction: number;
   slippageFraction: number;
+  spreadFraction: number;
   priceTick: string | null;
   quantityTick: string | null;
   minOrderBase: string | null;
@@ -54,6 +57,7 @@ function parseArgs(args: string[]): BacktestArgs {
   let initialCapital = 10000;
   let feeFraction = 0.002;
   let slippageFraction = 0;
+  let spreadFraction = 0;
   let priceTick: string | null = null;
   let quantityTick: string | null = null;
   let minOrderBase: string | null = null;
@@ -63,6 +67,7 @@ function parseArgs(args: string[]): BacktestArgs {
     if (a === '--initial-capital') initialCapital = parsePositiveNumber(a, args[++i]);
     else if (a === '--fee') feeFraction = parsePositiveNumber(a, args[++i]);
     else if (a === '--slippage') slippageFraction = parsePositiveNumber(a, args[++i]);
+    else if (a === '--spread') spreadFraction = parsePositiveNumber(a, args[++i]);
     else if (a === '--price-tick') priceTick = args[++i] ?? null;
     else if (a === '--quantity-tick') quantityTick = args[++i] ?? null;
     else if (a === '--min-order-base') minOrderBase = args[++i] ?? null;
@@ -70,10 +75,10 @@ function parseArgs(args: string[]): BacktestArgs {
     else if (!a.startsWith('--')) file = a;
     else fail(`unknown flag "${a}"`);
   }
-  if (!file) fail('usage: bot backtest <candles.json> [--initial-capital N] [--fee F] [--slippage S] [--price-tick P] [--quantity-tick Q] [--min-order-base B] [--out FILE]');
+  if (!file) fail('usage: bot backtest <candles.json> [--initial-capital N] [--fee F] [--slippage S] [--spread X] [--price-tick P] [--quantity-tick Q] [--min-order-base B] [--out FILE]');
   if (priceTick === null) fail('--price-tick is required (the simulator never invents a price tick)');
   if (quantityTick === null) fail('--quantity-tick is required (the simulator never invents a quantity tick)');
-  return { file, initialCapital, feeFraction, slippageFraction, priceTick, quantityTick, minOrderBase, outFile };
+  return { file, initialCapital, feeFraction, slippageFraction, spreadFraction, priceTick, quantityTick, minOrderBase, outFile };
 }
 
 export const backtestCommand: CommandHandler = async (args): Promise<number> => {
@@ -122,6 +127,7 @@ export const backtestCommand: CommandHandler = async (args): Promise<number> => 
     quoteCurrency: quote,
     feeModel: { kind: 'rate', currency: 'quote', rate: opts.feeFraction },
     slippageFraction: opts.slippageFraction,
+    spreadFraction: opts.spreadFraction,
     marketConstraints,
   };
 
@@ -160,6 +166,8 @@ export const backtestCommand: CommandHandler = async (args): Promise<number> => 
   console.log('  Fee model:        ' + result.feeModel.currency + '-' + result.feeModel.kind + ' @ ' + result.feeModel.rate);
   // eslint-disable-next-line no-console
   console.log('  Slippage:         ' + result.slippageFraction);
+  // eslint-disable-next-line no-console
+  console.log('  Spread (full):    ' + result.spreadFraction + ' (explicit assumption; half applied per side)');
   // eslint-disable-next-line no-console
   console.log('  Starting capital: ' + m.startingCapital.toString());
   // eslint-disable-next-line no-console

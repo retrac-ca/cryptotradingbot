@@ -14,18 +14,29 @@
  * strategy -> signal pipeline, not to be profitable yet.
  */
 
-import type { StrategyContext } from './StrategyContext.js';
+import type { Ticker } from '../types.js';
+import { Money } from '../money/Money.js';
+import type { StrategyContext, PositionView } from './StrategyContext.js';
 import type { Strategy } from './Strategy.js';
 import type { Signal } from './Signal.js';
 import { signal } from './Signal.js';
 import { sma } from './indicators.js';
 import { registerStrategy, type StrategyRegistryParams } from './registry.js';
 
+/** Resolve a fraction to an exact numerator over 1e9 (fixed-point, no floats). */
+const FRACTION_SCALE = 1_000_000_000n;
+
 export interface MovingAverageCrossoverParams {
   /** Fast SMA period (must be < slowPeriod). */
   fastPeriod: number;
   /** Slow SMA period. */
   slowPeriod: number;
+  /**
+   * Stop-loss fraction below the average entry price for an open long
+   * (e.g. 0.05 = exit if price falls 5% below entry). `0` disables the stop.
+   * Derived from the DURABLE position entry basis, so it survives a restart.
+   */
+  stopLossFraction?: number;
 }
 
 export class MovingAverageCrossoverStrategy implements Strategy {
@@ -35,6 +46,7 @@ export class MovingAverageCrossoverStrategy implements Strategy {
   readonly warmupCandles;
   readonly fastPeriod;
   readonly slowPeriod;
+  readonly stopLossFraction;
 
   /** Per-symbol last known fast-vs-slow relationship (null until first computed). */
   private crossState = new Map<string, boolean | null>();
@@ -46,9 +58,14 @@ export class MovingAverageCrossoverStrategy implements Strategy {
     if (params.slowPeriod <= params.fastPeriod) {
       throw new Error('MovingAverageCrossover: slowPeriod must be greater than fastPeriod.');
     }
+    const stop = params.stopLossFraction ?? 0;
+    if (!Number.isFinite(stop) || stop < 0 || stop > 1) {
+      throw new Error('MovingAverageCrossover: stopLossFraction must be a finite fraction in [0, 1].');
+    }
     this.timeframe = timeframe;
     this.fastPeriod = params.fastPeriod;
     this.slowPeriod = params.slowPeriod;
+    this.stopLossFraction = stop;
     // Need at least the slow period of candles plus one so both MAs are warm.
     this.warmupCandles = params.slowPeriod + 1;
   }
@@ -68,40 +85,81 @@ export class MovingAverageCrossoverStrategy implements Strategy {
     }
 
     const nowFastAbove = fast.compareTo(slow) > 0;
-    const prev = this.crossState.get(symbol);
 
-    if (prev !== null && prev !== undefined && prev !== nowFastAbove) {
-      // A cross just happened (state flipped).
-      if (nowFastAbove) {
-        // Golden cross. If we're flat, open long.
-        if (position.quantity.isZero()) {
-          this.crossState.set(symbol, nowFastAbove);
-          return signal(symbol, 'BUY', {
-            confidence: 0.6,
-            reason: `fast MA (${this.fastPeriod}) crossed above slow MA (${this.slowPeriod})`,
-          }, nowMs);
-        }
-      } else {
-        // Death cross. If we hold a long, exit (SELL).
-        if (position.quantity.isPositive()) {
-          this.crossState.set(symbol, nowFastAbove);
-          return signal(symbol, 'SELL', {
-            confidence: 0.6,
-            reason: `fast MA (${this.fastPeriod}) crossed below slow MA (${this.slowPeriod})`,
-          }, nowMs);
-        }
+    // --- Exit an existing long. ---
+    // This is LEVEL-based, not transition-based: a long is exited whenever the
+    // fast MA is strictly below the slow MA (or the stop is breached), so a
+    // transition missed while the process was offline can never strand a
+    // position. On equality (fast === slow) the position is HELD.
+    if (position.quantity.isPositive()) {
+      const stopReason = this.stopLossReason(context, position);
+      if (stopReason !== null) {
+        this.crossState.set(symbol, nowFastAbove);
+        return signal(symbol, 'SELL', { confidence: 0.6, reason: stopReason }, nowMs);
       }
+      if (fast.compareTo(slow) < 0) {
+        this.crossState.set(symbol, nowFastAbove);
+        return signal(symbol, 'SELL', {
+          confidence: 0.6,
+          reason: `fast MA (${this.fastPeriod}) below slow MA (${this.slowPeriod})`,
+        }, nowMs);
+      }
+      this.crossState.set(symbol, nowFastAbove);
+      return signal(symbol, 'HOLD', { reason: 'holding long' }, nowMs);
     }
 
-    // No transition, or we're not in a state that warrants acting. Record state
-    // on first evaluation so the next tick can detect a transition.
+    // A negative/non-zero non-long quantity is never traded (V1 is long-only).
+    if (!position.quantity.isZero()) {
+      this.crossState.set(symbol, nowFastAbove);
+      return signal(symbol, 'HOLD', { reason: 'non-flat position' }, nowMs);
+    }
+
+    // --- Flat: enter on a fresh golden cross (transition-based). ---
+    const prev = this.crossState.get(symbol);
     this.crossState.set(symbol, nowFastAbove);
+    if (prev === false && nowFastAbove) {
+      return signal(symbol, 'BUY', {
+        confidence: 0.6,
+        reason: `fast MA (${this.fastPeriod}) crossed above slow MA (${this.slowPeriod})`,
+      }, nowMs);
+    }
     return signal(symbol, 'HOLD', { reason: 'no cross' }, nowMs);
   }
 
-  describe(): string {
-    return `MovingAverageCrossover(fast=${this.fastPeriod}, slow=${this.slowPeriod}, timeframe=${this.timeframe})`;
+  /**
+   * Stop-loss reason for an open long, or null when no stop applies.
+   *
+   * The threshold is derived from the DURABLE position average entry price
+   * (which includes entry fees) and the configured fraction, so it is
+   * deterministic and survives a process restart without any strategy memory.
+   * A long with no positive entry basis (e.g. externally-authorized inventory
+   * carried at zero cost) has no stop. The mark price is the ticker's last
+   * traded price, falling back to bid/ask.
+   */
+  private stopLossReason(context: StrategyContext, position: PositionView): string | null {
+    if (this.stopLossFraction <= 0) return null;
+    const entry = position.averageEntryPrice;
+    if (entry === null || !entry.isPositive()) return null;
+    const price = markPrice(context.ticker);
+    if (price === null) return null;
+    const stopNumerator = FRACTION_SCALE - BigInt(Math.round(this.stopLossFraction * Number(FRACTION_SCALE)));
+    const threshold = entry.mulFraction(stopNumerator, FRACTION_SCALE);
+    if (price.compareTo(threshold) <= 0) {
+      return `stop-loss: price ${price} <= threshold ${threshold} (entry ${entry}, stop ${this.stopLossFraction})`;
+    }
+    return null;
   }
+
+  describe(): string {
+    return `MovingAverageCrossover(fast=${this.fastPeriod}, slow=${this.slowPeriod}, timeframe=${this.timeframe}, stopLoss=${this.stopLossFraction})`;
+  }
+}
+
+/** Best available mark price from a ticker snapshot, or null. */
+function markPrice(ticker: Ticker | null): Money | null {
+  if (!ticker) return null;
+  const price = ticker.last ?? ticker.bid ?? ticker.ask;
+  return price !== null && price.isPositive() ? price : null;
 }
 
 // Self-registration: importing this module (directly, via index.ts, or via the
@@ -110,5 +168,6 @@ export class MovingAverageCrossoverStrategy implements Strategy {
 registerStrategy('moving-average-crossover', (params: StrategyRegistryParams) => {
   const fast = typeof params.fastPeriod === 'number' ? params.fastPeriod : 10;
   const slow = typeof params.slowPeriod === 'number' ? params.slowPeriod : 30;
-  return new MovingAverageCrossoverStrategy(params.timeframe, { fastPeriod: fast, slowPeriod: slow });
+  const stopLossFraction = typeof params.stopLossFraction === 'number' ? params.stopLossFraction : 0;
+  return new MovingAverageCrossoverStrategy(params.timeframe, { fastPeriod: fast, slowPeriod: slow, stopLossFraction });
 });

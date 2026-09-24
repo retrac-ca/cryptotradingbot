@@ -106,6 +106,21 @@ function candles(closes: number[], nowMs: number): Candle[] {
   }));
 }
 
+function tickerAt(tsMs: number, last: string): Ticker {
+  return {
+    symbol: SYMBOL,
+    bid: Money.fromString(last),
+    ask: Money.fromString(last),
+    last: Money.fromString(last),
+    open: null,
+    high: null,
+    low: null,
+    baseVolume: null,
+    quoteVolume: null,
+    timestampMs: tsMs,
+  };
+}
+
 const STATE_FILE = statePath('paperengine', 'state.json');
 
 function buildDeps(
@@ -246,8 +261,9 @@ describe('PaperEngine — end-to-end paper trading flow', () => {
     const engine = new PaperEngine(deps);
     expect(engine.currentPortfolio.position(SYMBOL)!.quantity.toFixed(8)).toBe('0.50000000');
 
-    // Now a death cross should SELL the restored position (not re-buy and not
-    // restart at zero). No signal yet at first eval.
+    // F1: a restored long with the fast MA BELOW the slow MA is exited on the
+    // very first evaluation. The exit is level-based and needs no volatile
+    // crossState, so a restart can never strand the position.
     data.ticker = {
       symbol: SYMBOL,
       bid: Money.fromString('1999'),
@@ -261,18 +277,9 @@ describe('PaperEngine — end-to-end paper trading flow', () => {
       timestampMs: 2_000_000,
     };
     data.candles = candles([16, 15, 14, 13, 12, 11, 10], 2_000_000);
-    await engine.evaluateOnce(2_000_000); // establish state (HOLD)
-    await engine.evaluateOnce(2_000_000); // still HOLD
-    // Flip to golden to confirm we do not double-trade, then back to death to exit.
-    data.candles = candles([10, 11, 12, 13, 14, 15, 16], 2_000_000);
-    await engine.evaluateOnce(2_000_000);
-    // Since we already hold a position, the golden cross should NOT add (flat-check
-    // on BUY) -> still holding.
-    expect(engine.currentPortfolio.position(SYMBOL)!.quantity.toFixed(8)).toBe('0.50000000');
-    // Death cross now exits.
-    data.candles = candles([16, 15, 14, 13, 12, 11, 10], 2_000_000);
     await engine.evaluateOnce(2_000_000);
     expect(engine.currentPortfolio.position(SYMBOL)).toBeNull();
+    expect(engine.orderHistory.some((o) => o.side === 'SELL' && o.status === 'FILLED')).toBe(true);
   });
 
   it('fails closed and continuous operation survives a market-data failure', async () => {
@@ -319,6 +326,72 @@ describe('PaperEngine — end-to-end paper trading flow', () => {
     await engine.evaluateOnce(4_000_000);
     expect(engine.currentPortfolio.position(SYMBOL)).not.toBeNull();
     expect(engine.orderHistory.filter((o) => o.side === 'BUY' && o.status === 'FILLED')).toHaveLength(1);
+  });
+
+  it('F5: arms the risk cooldown after a losing close and blocks the next BUY', async () => {
+    rmSync(STATE_FILE, { force: true });
+    const { deps, data, risk } = buildDeps();
+    const engine = new PaperEngine(deps);
+    await engine.start();
+    const now = 7_000_000;
+
+    // Establish fast-below (flat) then golden cross -> BUY.
+    data.ticker = tickerAt(now, '15');
+    data.candles = candles([16, 15, 14, 13, 12, 11, 10], now);
+    await engine.evaluateOnce(now);
+    data.candles = candles([10, 11, 12, 13, 14, 15, 16], now);
+    await engine.evaluateOnce(now);
+    expect(engine.currentPortfolio.position(SYMBOL)).not.toBeNull();
+
+    // Price collapses -> stop-loss/death-cross SELL at a loss.
+    data.ticker = tickerAt(now, '10');
+    data.candles = candles([16, 15, 14, 13, 12, 11, 10], now);
+    await engine.evaluateOnce(now);
+    expect(engine.currentPortfolio.position(SYMBOL)).toBeNull();
+    expect(risk.remainingCooldownMs(now)).toBeGreaterThan(0);
+
+    // A fresh golden cross shortly after is blocked by the active cooldown.
+    const later = now + 1000;
+    data.ticker = tickerAt(later, '15');
+    data.candles = candles([10, 11, 12, 13, 14, 15, 16], later);
+    await engine.evaluateOnce(later);
+    expect(engine.currentPortfolio.position(SYMBOL)).toBeNull();
+    expect(engine.orderHistory.filter((o) => o.side === 'BUY' && o.status === 'FILLED')).toHaveLength(1);
+
+    engine.stop();
+    rmSync(STATE_FILE, { force: true });
+  });
+
+  it('F5: a profitable close does NOT arm the cooldown', async () => {
+    rmSync(STATE_FILE, { force: true });
+    const { deps, data, risk } = buildDeps();
+    const engine = new PaperEngine(deps);
+    await engine.start();
+    const now = 8_000_000;
+
+    data.ticker = tickerAt(now, '15');
+    data.candles = candles([16, 15, 14, 13, 12, 11, 10], now);
+    await engine.evaluateOnce(now);
+    data.candles = candles([10, 11, 12, 13, 14, 15, 16], now);
+    await engine.evaluateOnce(now); // BUY ~15
+    expect(engine.currentPortfolio.position(SYMBOL)).not.toBeNull();
+
+    // Exit higher than entry -> profitable close, no cooldown.
+    data.ticker = tickerAt(now, '20');
+    data.candles = candles([16, 15, 14, 13, 12, 11, 10], now);
+    await engine.evaluateOnce(now);
+    expect(engine.currentPortfolio.position(SYMBOL)).toBeNull();
+    expect(risk.remainingCooldownMs(now)).toBe(0);
+
+    // A fresh golden cross is allowed again immediately.
+    data.ticker = tickerAt(now, '15');
+    data.candles = candles([10, 11, 12, 13, 14, 15, 16], now);
+    await engine.evaluateOnce(now);
+    expect(engine.currentPortfolio.position(SYMBOL)).not.toBeNull();
+    expect(engine.orderHistory.filter((o) => o.side === 'BUY' && o.status === 'FILLED')).toHaveLength(2);
+
+    engine.stop();
+    rmSync(STATE_FILE, { force: true });
   });
 
   it('PROOF: paper execution can never invoke live NDAX order placement', async () => {

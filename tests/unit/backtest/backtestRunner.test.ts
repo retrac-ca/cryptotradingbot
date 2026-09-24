@@ -76,6 +76,7 @@ function btConfig(over: Partial<BacktestConfig> = {}): BacktestConfig {
     quoteCurrency: 'CAD',
     feeModel: { kind: 'rate', currency: 'quote', rate: 0.002 },
     slippageFraction: 0,
+    spreadFraction: 0,
     marketConstraints: {
       priceTick: Money.fromString('0.01'),
       quantityTick: Money.fromString('0.00000001'),

@@ -305,8 +305,17 @@ export interface PortfolioModel {
   positions: Map<string, PaperPosition>;
   /** Peak aggregate equity (quote), for drawdown calculations. */
   peakEquity: Money;
-  /** Aggregate realized P&L (quote) across all positions. */
+  /** Aggregate realized P&L (quote) across all positions (LIFETIME). */
   realizedPnl: Money;
+  /**
+   * Realized P&L (quote) for the current calendar day only (UTC day boundary),
+   * used by the daily-loss gate. Reset when a fill occurs on a new UTC day.
+   * `dailyRealizedDayKey` records which day the bucket belongs to; it is null
+   * until the first SELL fill. This does NOT change `realizedPnl` (lifetime).
+   */
+  dailyRealizedPnl: Money;
+  /** UTC calendar-day key (`YYYY-MM-DD`) the `dailyRealizedPnl` bucket belongs to. */
+  dailyRealizedDayKey: string | null;
   /** Aggregate fees paid (quote) across all trades. */
   totalFees: Money;
   /**

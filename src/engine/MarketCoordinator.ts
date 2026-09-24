@@ -36,6 +36,7 @@ import type { Candle, MarketInfo, Ticker, Timeframe } from '../types.js';
 import type { Signal } from '../strategy/Signal.js';
 import { Money } from '../money/Money.js';
 import { evaluateFreshness, type FreshnessPolicy } from '../marketdata/freshness.js';
+import { completedCandles } from '../marketdata/candles.js';
 
 export interface CoordinatorMarketSource {
   /** Market metadata per symbol (null => unknown, risk fails closed). */
@@ -146,7 +147,10 @@ export class MarketCoordinator {
         continue;
       }
 
-      const candles = marketSource.getCandles(symbol, timeframe);
+      // F7: only COMPLETED candles are ever fed to the strategy, so the
+      // live/paper decision input matches the backtest for equivalent completed
+      // data. The currently-forming candle (end time in the future) is excluded.
+      const candles = completedCandles(marketSource.getCandles(symbol, timeframe), nowMs);
       const managed = portfolio.position(symbol) ?? null;
 
       const strategyCtx: StrategyContext = {
@@ -300,7 +304,7 @@ export class MarketCoordinator {
       currentPosition: managed?.quantity ?? Money.zero(),
       externalPosition: portfolio.external(symbol),
       openManagedPositionCount: portfolio.managedOpenCount(),
-      realizedPnlToday: portfolio.stateModel.realizedPnl,
+      realizedPnlToday: portfolio.dailyRealizedPnlAt(nowMs),
       unrealizedPnlToday: mtm ? mtm.unrealizedPnl : null,
     };
   }

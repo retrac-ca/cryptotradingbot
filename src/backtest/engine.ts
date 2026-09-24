@@ -86,6 +86,7 @@ export function runBacktest(input: BacktestRunInput): BacktestResult {
   const mc = config.marketConstraints;
   const feeModel = config.feeModel;
   const slippage = config.slippageFraction;
+  const spread = config.spreadFraction;
 
   const warnings: string[] = [...cv.warnings];
 
@@ -121,6 +122,7 @@ export function runBacktest(input: BacktestRunInput): BacktestResult {
         quote,
         mc,
         slippage,
+        spread,
         feeModel,
         signalBarIndex: p.signalBarIndex,
         decisionTsMs: p.decisionTsMs,
@@ -194,6 +196,12 @@ export function runBacktest(input: BacktestRunInput): BacktestResult {
     );
   }
 
+  if (spread <= 0) {
+    warnings.push(
+      'spreadFraction is 0: the simulation assumes NO bid/ask spread. Candles carry no historical bid/ask, so set --spread to model this cost explicitly',
+    );
+  }
+
   return {
     config,
     symbol,
@@ -203,6 +211,7 @@ export function runBacktest(input: BacktestRunInput): BacktestResult {
     marketConstraints: mc,
     feeModel,
     slippageFraction: slippage,
+    spreadFraction: spread,
     trades,
     rejections,
     equityCurve,
@@ -219,6 +228,7 @@ interface ExecParams {
   quote: string;
   mc: BacktestConfig['marketConstraints'];
   slippage: number;
+  spread: number;
   feeModel: BacktestConfig['feeModel'];
   signalBarIndex: number;
   decisionTsMs: number;
@@ -237,8 +247,8 @@ interface ExecOutcome {
 function executePending(portfolio: Portfolio, fillBar: import('../types.js').Candle, p: PendingIntent, params: ExecParams): ExecOutcome {
   const openPrice = fillBar.open;
 
-  // Deterministic fill price at the next bar's OPEN.
-  const fillPrice = computeFillPrice(openPrice, p.side, params.slippage, params.mc.priceTick);
+  // Deterministic fill price at the next bar's OPEN (spread + slippage by side).
+  const fillPrice = computeFillPrice(openPrice, p.side, params.slippage, params.mc.priceTick, params.spread);
 
   // Solve the exact cost/fee at the ACTUAL fill price.
   const notional = p.quantity.mul(fillPrice);
@@ -412,7 +422,7 @@ function buildRiskContext(
     currentPosition: position?.quantity ?? Money.zero(),
     externalPosition: portfolio.external(symbol),
     openManagedPositionCount: portfolio.managedOpenCount(),
-    realizedPnlToday: portfolio.stateModel.realizedPnl,
+    realizedPnlToday: portfolio.dailyRealizedPnlAt(nowMs),
     unrealizedPnlToday: mtm.unrealizedPnl,
   };
 }

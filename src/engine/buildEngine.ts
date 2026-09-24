@@ -14,7 +14,7 @@
 import { Money } from '../money/Money.js';
 import { join } from 'node:path';
 import { createExchange } from '../exchanges/index.js';
-import { LiveMarketData } from '../marketdata/index.js';
+import { LiveMarketData, requiredCandleLookbackMs } from '../marketdata/index.js';
 import type { FreshnessPolicy } from '../marketdata/freshness.js';
 import { buildStrategy } from '../strategy/index.js';
 import { buildRiskManager } from '../risk/index.js';
@@ -45,14 +45,18 @@ export function buildEngineDeps(cfg: BotConfig, logger: Logger): PaperEngineDeps
   const evaluateIntervalMs = cfg.evaluateIntervalSeconds * 1000;
   // Effective symbol set = the curated universe (falls back to tradingPairs).
   const symbols = cfg.universeMarkets.length ? cfg.universeMarkets : cfg.tradingPairs;
+
+  const strategy = buildStrategy(cfg);
+
   const marketData = new LiveMarketData(exchange, {
     symbols,
     candleTimeframes: [cfg.timeframe],
     candleIntervalMs: evaluateIntervalMs,
+    // F4: request enough candle history to warm up the strategy on the
+    // configured timeframe (the adapter default is a fixed ~24h window).
+    candleLookbackMs: requiredCandleLookbackMs(cfg.timeframe, strategy.warmupCandles),
     // ticker default (2s) via omission
   });
-
-  const strategy = buildStrategy(cfg);
 
   const riskManager = buildRiskManager(cfg);
 

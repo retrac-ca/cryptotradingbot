@@ -8,6 +8,8 @@
  */
 
 import './movingAverageCrossover.js';
+import './donchianBreakout.js';
+import './meanReversion.js';
 import './trendPullbackRecovery.js';
 
 export type { Strategy } from './Strategy.js';
@@ -16,6 +18,14 @@ export { signal, hold, signalToOrderSide } from './Signal.js';
 export type { Signal, SignalType, SignalOptions } from './Signal.js';
 export { sma, ema } from './indicators.js';
 export { MovingAverageCrossoverStrategy } from './movingAverageCrossover.js';
+export { DonchianBreakoutStrategy, DEFAULT_DONCHIAN_LOOKBACK } from './donchianBreakout.js';
+export type { DonchianBreakoutParams } from './donchianBreakout.js';
+export {
+  MeanReversionStrategy,
+  DEFAULT_MEAN_REVERSION_PERIOD,
+  DEFAULT_MEAN_REVERSION_DEVIATION,
+} from './meanReversion.js';
+export type { MeanReversionParams } from './meanReversion.js';
 export {
   TrendPullbackRecoveryStrategy,
   DEFAULT_TPR_SMA_PERIOD,

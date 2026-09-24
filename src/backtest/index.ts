@@ -14,6 +14,16 @@
 export { runBacktest, buildMarketInfo } from './engine.js';
 export { computeMetrics } from './report.js';
 export {
+  acquireCandles,
+  candlesToRows,
+  DEFAULT_BARS_PER_PAGE,
+} from './candleAcquisition.js';
+export type {
+  AcquireCandlesOptions,
+  AcquireCandlesResult,
+  CandleRowJson,
+} from './candleAcquisition.js';
+export {
   validateCandles,
   validateConfig,
   BacktestValidationError,
