@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="referrer" content="same-origin" />
+    <title>NDAX Bot — Monitoring</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div data-dashboard-root>
+      <header class="app-header">
+        <div class="app-header__brand">
+          <span class="app-header__title">NDAX BOT</span>
+          <span class="app-header__version" data-header="version">—</span>
+        </div>
+        <div class="app-header__status" aria-label="System status">
+          <span data-header="mode"></span>
+          <span data-header="api"></span>
+          <span data-header="ndax"></span>
+        </div>
+      </header>
+
+      <p class="read-only-banner" role="note">
+        READ-ONLY monitoring interface. No trading controls. Unauthenticated —
+        intended for loopback-only access.
+      </p>
+
+      <main>
+        <section
+          class="panel"
+          data-section="overview"
+          aria-labelledby="overview-heading"
+          tabindex="-1"
+        ></section>
+        <section
+          class="panel"
+          data-section="market"
+          aria-labelledby="market-heading"
+          tabindex="-1"
+        ></section>
+        <section
+          class="panel"
+          data-section="portfolio"
+          aria-labelledby="portfolio-heading"
+          tabindex="-1"
+        ></section>
+        <section
+          class="panel"
+          data-section="reconciliation"
+          aria-labelledby="reconciliation-heading"
+          tabindex="-1"
+        ></section>
+        <section
+          class="panel"
+          data-section="orders"
+          aria-labelledby="orders-heading"
+          tabindex="-1"
+        ></section>
+        <section
+          class="panel"
+          data-section="system"
+          aria-labelledby="system-heading"
+          tabindex="-1"
+        ></section>
+      </main>
+
+      <footer class="app-footer">
+        <span>Observation only. Values are exact decimal strings from the read-only API.</span>
+      </footer>
+    </div>
+
+    <noscript>
+      <p class="read-only-banner">JavaScript is required to display the monitoring dashboard.</p>
+    </noscript>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

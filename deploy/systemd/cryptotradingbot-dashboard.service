@@ -1,0 +1,68 @@
+# Cryptotradingbot read-only monitoring dashboard — systemd USER unit.
+#
+# Runs ONLY `bot dashboard` (the GET-only monitoring HTTP API + static UI).
+# It NEVER starts the trading bot and NEVER places/cancels/resolves orders.
+# It binds to loopback (127.0.0.1:8787) by default.
+#
+# Install (as the login user; never done automatically by this repo):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/cryptotradingbot-dashboard.service ~/.config/systemd/user/
+#   npm run build                     # produces dist/ and dist/dashboard/
+#   systemctl --user daemon-reload
+#   systemd-analyze --user verify ~/.config/systemd/user/cryptotradingbot-dashboard.service
+#   systemctl --user enable cryptotradingbot-dashboard.service
+#   systemctl --user start  cryptotradingbot-dashboard.service
+#
+# Stop any already-running dashboard FIRST (it owns 127.0.0.1:8787):
+#   pgrep -af 'dist/index.js dashboard'   # identify, then stop that process
+#
+# Optional persistence after logout (host-level, explicit operator opt-in):
+#   loginctl enable-linger "$USER"
+#
+# Remote access is provided by a private, authenticated access layer in front of
+# loopback (Tailscale recommended). See docs/DASHBOARD_DEPLOYMENT.md.
+
+[Unit]
+Description=Cryptotradingbot read-only monitoring dashboard (GET-only; never trades)
+Documentation=file:%h/code/cryptotradingbot/docs/DASHBOARD_DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+# Fail fast (and cleanly) if the dashboard has not been built yet.
+AssertPathExists=%h/code/cryptotradingbot/dist/index.js
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/cryptotradingbot
+ExecStart=/usr/bin/node %h/code/cryptotradingbot/dist/index.js dashboard
+Restart=on-failure
+RestartSec=5
+
+# Emit structured JSON logs (pino). NODE_ENV here only skips the pino-pretty
+# transport used in local development; it does NOT change trading, accounting,
+# authorization, or reconciliation behavior.
+Environment=NODE_ENV=production
+
+# The application loads its own .env from WorkingDirectory. Do NOT put secrets
+# in this unit, and do NOT set DASHBOARD_HOST / DASHBOARD_ALLOW_REMOTE here:
+# keep the listener on loopback and expose it only via a private access layer.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# M2 — contain the write-capable dashboard process.
+# The entire home directory is READ-ONLY to the service; the ONLY writable path
+# is the repository's shared state directory. The dashboard needs it solely for
+# the existing reconciliation mutation lock (creates/removes
+# .state/.mutation.lock); it never writes accounting/trading state and cannot
+# modify the repository, .env, source, dist/, or anything else under $HOME.
+ProtectHome=read-only
+ReadWritePaths=%h/code/cryptotradingbot/.state
+
+[Install]
+WantedBy=default.target

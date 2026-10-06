@@ -31,6 +31,11 @@ export type PaperStatePayload = PortfolioJson & {
 export class PaperStateStore {
   constructor(private readonly filePath: string) {}
 
+  /** The durable paper-state file path (read-only metadata; no mutation). */
+  get path(): string {
+    return this.filePath;
+  }
+
   /** Tri-state load (OK / MISSING / CORRUPT). CORRUPT is never MISSING. */
   load(): LoadResult<PaperStatePayload> {
     const r = readEnvelope(this.filePath, 'paper', 'portfolio');

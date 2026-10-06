@@ -11,6 +11,7 @@ import { createLogger } from '../logging/logger.js';
 import { VERSION } from './context.js';
 import { backtestCommand } from './backtest-cmd.js';
 import { configureCommand } from './config-cmd.js';
+import { dashboardCommand } from './dashboard-cmd.js';
 import { fetchCandlesCommand } from './fetch-candles-cmd.js';
 import { liveMonitorCommand } from './live-monitor-cmd.js';
 import { liveOnboardExternalCommand } from './live-onboard-external-cmd.js';
@@ -28,6 +29,7 @@ import { tradesCommand } from './trades-cmd.js';
 export const COMMANDS = {
   setup: setupCommand,
   config: configureCommand,
+  dashboard: dashboardCommand,
   paper: paperCommand,
   start: startCommand,
   status: statusCommand,
@@ -52,6 +54,7 @@ Usage: bot <command> [options]
 Commands:
   setup     Create/configure the .env file interactively
   config    Show the effective resolved (non-secret) configuration
+  dashboard Start the READ-ONLY monitoring HTTP API (observational only; never trades)
   paper     Start the bot in PAPER (simulated) trading mode
   start     Start the bot (paper by default)
   status    Show current bot / trading status

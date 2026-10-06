@@ -165,6 +165,45 @@ export const botConfigSchema = z.object({
     .default('info'),
   reconcileIntervalSeconds: z.coerce.number().int().min(1).default(60),
   killSwitch: boolFromString.default(false),
+
+  // --- Read-only monitoring dashboard API (Stage 2) ---
+  // Bind host/port for the READ-ONLY HTTP monitoring API (`bot dashboard`).
+  // The API has no authentication and is NOT intended to be publicly exposed;
+  // the default binds to LOOPBACK ONLY. Setting a non-loopback host is an
+  // explicit operator decision. This never enables order placement.
+  dashboardHost: z.string().min(1).default('127.0.0.1'),
+  dashboardPort: z.coerce.number().int().min(1).max(65535).default(8787),
+  // Directory from which the read-only dashboard UI static assets are served.
+  // Only this directory is exposed (path traversal and dotfiles are rejected;
+  // only web-asset extensions are served). Empty means use the built output
+  // (`dist/dashboard`). It NEVER enables order placement.
+  dashboardStaticDir: z.string().default(''),
+  // Explicit, deliberate opt-in required to bind the dashboard to a
+  // NON-loopback address. Defaults OFF. The dashboard is an UNAUTHENTICATED
+  // read-only API; remote access should be provided by a private, authenticated
+  // access layer (e.g. Tailscale) while the server stays on 127.0.0.1. This
+  // only ever affects the dashboard listener — never trading.
+  dashboardAllowRemote: boolFromString.default(false),
+  // Explicit allowlist of request `Host` hostnames for the dashboard. A request
+  // whose Host hostname is not exactly listed is rejected (421) before any
+  // endpoint work — the primary defense against DNS rebinding. Entries are
+  // hostnames only (an optional :port is parsed but ignored); NO wildcards, NO
+  // suffix matching. Defaults to loopback hostnames. When Tailscale Serve is
+  // used, add the actual tailnet hostname here explicitly (e.g.
+  // `DASHBOARD_ALLOWED_HOSTS=127.0.0.1,localhost,::1,machine.tailnet.ts.net`).
+  dashboardAllowedHosts: z
+    .string()
+    .default('127.0.0.1,localhost,::1')
+    .transform((s) => s.split(',').map((h) => h.trim()).filter(Boolean))
+    .pipe(
+      z
+        .array(
+          z
+            .string()
+            .regex(/^[A-Za-z0-9._:\-\[\]]+$/, 'must be a hostname (no wildcards or paths)'),
+        )
+        .min(1),
+    ),
 });
 
 export type BotConfig = z.infer<typeof botConfigSchema>;
