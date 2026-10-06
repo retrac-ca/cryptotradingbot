@@ -370,10 +370,18 @@ export class RiskManager {
    * Max-open-positions gate (BUY only). External holdings are NOT open bot
    * positions; this bounds only bot-managed entries. `0` in config means no
    * limit. Returns a rejection or null.
+   *
+   * Semantics: this caps the number of DISTINCT managed symbols the bot holds,
+   * i.e. it only blocks a BUY that would OPEN A NEW managed position. A BUY that
+   * ADDS to a symbol the bot already manages does not open a new position and is
+   * therefore not blocked here; it remains bounded by the per-asset position cap,
+   * the portfolio-exposure cap, and the funding/reservation checks.
    */
   private checkMaxOpenPositions(ctx: RiskContext, side: OrderSide): RiskDecision | null {
     const limit = this.cfg.maxOpenPositions;
     if (limit <= 0) return null;
+    // Adding to an already-managed symbol is not opening a new position.
+    if (ctx.currentPosition !== null && ctx.currentPosition.isPositive()) return null;
     const count = ctx.openManagedPositionCount ?? 0;
     if (count >= limit) {
       return this.reject(ctx.symbol, side, 'MAX_OPEN_POSITIONS');

@@ -1,7 +1,19 @@
-# CREATED-order recovery (controlled LIVE)
+# CREATED / SUBMITTED / UNKNOWN order recovery (controlled LIVE)
 
-This is a concise operator procedure for the one ambiguous LIVE state that the
-bot cannot resolve by itself: a durable `CREATED` order.
+This is a concise operator procedure for the ambiguous LIVE states that the bot
+cannot resolve by itself: a durable unidentified LIVE order — one with **no
+`exchangeOrderId`** — in status `CREATED`, `SUBMITTED`, or `UNKNOWN`. All three
+are resolved by the same operator-only ATTACH/ABANDON command
+(`bot resolve-created-order`).
+
+| Local status | Meaning |
+| --- | --- |
+| `CREATED` | Persisted before `SendOrder`; a crash left it unresolved. May or may not have reached the exchange. |
+| `SUBMITTED` (no id) | The exchange returned an acceptance receipt but **no** OrderId, so there is no id to reconcile against. |
+| `UNKNOWN` (no id) | An ambiguous submission (timeout / network / invalid response); may or may not have reached the exchange. |
+
+An `UNKNOWN`/`SUBMITTED` order **with** an `exchangeOrderId` is **not** handled
+here — it is reconciled/accounted by `bot live-monitor` / `bot resolve-live-order`.
 
 ## Why a CREATED order can exist
 
@@ -20,8 +32,8 @@ null`.
 
 ## Why it is ambiguous
 
-From the durable `CREATED` record alone the bot cannot prove whether NDAX
-received the order:
+From the durable unidentified record alone (`CREATED`, `SUBMITTED`-without-id,
+or `UNKNOWN`-without-id) the bot cannot prove whether NDAX received the order:
 
 - the submission may or may not have happened;
 - NDAX `ClientOrderId` lookup is not supported and its uniqueness is not proven
@@ -30,8 +42,9 @@ received the order:
 - an exchange `OrderId` is the only reliable exchange identity, and a `CREATED`
   order has none.
 
-A `CREATED` order therefore **blocks all new LIVE placement** until an operator
-resolves it. Reconciliation also fails closed while it exists.
+An unidentified LIVE order (`CREATED`, `SUBMITTED`-without-id, or
+`UNKNOWN`-without-id) therefore **blocks all new LIVE placement** until an
+operator resolves it. Reconciliation also fails closed while it exists.
 
 ## Why automatic retry is unsafe
 
@@ -55,7 +68,7 @@ can also inspect the NDAX web UI directly.
 ## Resolve: ATTACH
 
 Use ATTACH when you have identified the **exact** exchange `OrderId` that
-belongs to this local `CREATED` order:
+belongs to this local unidentified order:
 
 ```bash
 bot resolve-created-order <clientOrderId> \
@@ -66,7 +79,7 @@ bot resolve-created-order <clientOrderId> \
 
 The command re-reads that exact exchange order and verifies the identity
 (`exchangeOrderId`, symbol, side, type, requested quantity, limit price) against
-the durable `CREATED` record. Any mismatch fails closed. On success it attaches
+the durable unidentified record. Any mismatch fails closed. On success it attaches
 the id and adopts the authoritative exchange status. It does **not** account any
 fill: if the order is `FILLED`, finish accounting with the existing
 `bot live-monitor` / `bot resolve-live-order` paths.
@@ -74,7 +87,7 @@ fill: if the order is `FILLED`, finish accounting with the existing
 ## Resolve: ABANDON
 
 Use ABANDON when the exchange outcome cannot be determined and you deliberately
-want to close the local `CREATED` record:
+want to close the local unidentified record:
 
 ```bash
 bot resolve-created-order <clientOrderId> \

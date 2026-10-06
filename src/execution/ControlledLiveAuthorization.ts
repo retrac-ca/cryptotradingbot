@@ -4,12 +4,14 @@
  *
  * This is NOT autonomous live trading and NOT a generic "live enabled" flag.
  * It is a single-purpose authorization object that:
- *   - is created ONLY by the controlled live-test path (`bot live-test sell`),
- *   - is restricted to SELL + LIMIT only,
+ *   - is created ONLY by the controlled live-test path
+ *     (`bot live-test sell` / `bot live-test buy`),
+ *   - is restricted to a SINGLE explicit side (SELL or BUY) + LIMIT only,
  *   - carries the controlled-test exposure caps,
  *   - is required BOTH by the LiveOrderEngine (to permit the controlled path)
  *     AND by the exchange adapter (to permit the actual SendOrder mutation),
- *   - cannot be used for BUY, MARKET, autonomous, or general live trading.
+ *   - cannot be used for MARKET, autonomous, or general live trading, and can
+ *     never authorize the opposite side from the one it was minted for.
  *
  * `NdaxAdapter.capabilities.supportsOrderPlacement` stays `false` (the adapter
  * does NOT generally support autonomous placement); this authorization is a
@@ -17,13 +19,17 @@
  *
  * ANTI-FORGERY (runtime): TypeScript types disappear at runtime, so a plain
  * object can never be trusted by shape alone. A `ControlledLiveAuthorization` is
- * therefore only "genuine" if its token was issued by THIS running process:
- * `createControlledLiveAuthorization` records the token in a module-private
- * registry, and `isControlledLiveAuthorization` requires that token to be
- * present there. A hand-constructed `{ kind: 'controlled-live-test', token: 'x' }`
- * (or any valid-looking UUID that was never issued) is rejected. The registry is
- * never exported, never persisted, and never loaded from state, so the
- * authorization is a process-local capability, not a forgeable value.
+ * therefore only "genuine" if its token was issued by THIS running process AND
+ * the scope it carries is BYTE-FOR-BYTE the scope that was issued for that token:
+ * `createControlledLiveAuthorization` records the issued scope in a module-private
+ * registry, and `isControlledLiveAuthorization` requires the token to be present
+ * and the supplied scope to EQUAL the issued scope. A hand-constructed
+ * `{ kind: 'controlled-live-test', token: 'x' }` (or any valid-looking UUID that
+ * was never issued) is rejected. Cloning a genuine SELL authorization and
+ * flipping `scope.side` to `'BUY'` is rejected because the flipped scope no
+ * longer equals the issued scope. The registry is never exported, never
+ * persisted, and never loaded from state, so the authorization is a process-local
+ * capability, not a forgeable value.
  *
  * SINGLE-USE: the authorization is intended for one controlled live invocation.
  * `isControlledLiveOrder` consumes the token when it authorizes an order at the
@@ -39,9 +45,10 @@
 import { randomUUID } from 'node:crypto';
 import { Money } from '../money/Money.js';
 
-/** The only permitted controlled-test order shape. */
+/** The only permitted controlled-test order shape (one explicit side + LIMIT). */
 export interface ControlledLiveScope {
-  side: 'SELL';
+  /** The single side this authorization permits. Never both, never a default. */
+  side: 'SELL' | 'BUY';
   type: 'limit';
   /** Hard max base quantity (enforced again at the execution boundary). */
   maxBaseQuantity: Money;
@@ -58,28 +65,29 @@ export interface ControlledLiveAuthorization {
 }
 
 /**
- * Process-local issued-token registry.
+ * Process-local issued-scope registry (token -> the EXACT scope that was issued).
  *
- * A token enters this set ONLY when `createControlledLiveAuthorization` runs in
- * this process. The set is module-private and never exported, serialized, or
- * loaded from state. `isControlledLiveAuthorization` requires membership, which
- * is the runtime proof that the running process actually issued the
- * authorization. A token is removed when it authorizes an order at the mutation
- * boundary (`isControlledLiveOrder`), making the authorization single-use.
+ * A token enters this map ONLY when `createControlledLiveAuthorization` runs in
+ * this process. The map is module-private and never exported, serialized, or
+ * loaded from state. `isControlledLiveAuthorization` requires membership AND that
+ * the presented scope equals the issued scope, which is the runtime proof that
+ * the running process actually issued THIS authorization for THIS side/scope. A
+ * token is removed when it authorizes an order at the mutation boundary
+ * (`isControlledLiveOrder`), making the authorization single-use.
  */
-const issuedTokens = new Set<string>();
+const issuedScopes = new Map<string, ControlledLiveScope>();
 
 /** True only for a genuine positive `Money` (fixed-point) value. */
 function isPositiveMoney(v: unknown): v is Money {
   return v instanceof Money && v.isPositive();
 }
 
-/** True if `scope` is a complete, runtime-usable controlled scope (SELL + LIMIT + positive Money caps). */
+/** True if `scope` is a complete, runtime-usable controlled scope (SELL|BUY + LIMIT + positive Money caps). */
 function isValidScope(scope: unknown): scope is ControlledLiveScope {
   if (typeof scope !== 'object' || scope === null) return false;
   const s = scope as Partial<ControlledLiveScope>;
   return (
-    s.side === 'SELL' &&
+    (s.side === 'SELL' || s.side === 'BUY') &&
     s.type === 'limit' &&
     isPositiveMoney(s.maxBaseQuantity) &&
     isPositiveMoney(s.maxQuoteNotional)
@@ -87,15 +95,41 @@ function isValidScope(scope: unknown): scope is ControlledLiveScope {
 }
 
 /**
+ * True when a presented scope is EXACTLY the scope that was issued for its token.
+ * This is what prevents cloning a genuine SELL authorization and flipping the
+ * side/caps to something else: the token exists, but the scope would not match.
+ */
+function scopeMatchesIssued(scope: unknown, issued: ControlledLiveScope | undefined): scope is ControlledLiveScope {
+  if (!issued || !isValidScope(scope)) return false;
+  return (
+    scope.side === issued.side &&
+    scope.type === issued.type &&
+    scope.maxBaseQuantity.equals(issued.maxBaseQuantity) &&
+    scope.maxQuoteNotional.equals(issued.maxQuoteNotional)
+  );
+}
+
+/** A frozen, private copy of an issued scope (never leak the caller's object). */
+function freezeScope(scope: ControlledLiveScope): ControlledLiveScope {
+  return {
+    side: scope.side,
+    type: scope.type,
+    maxBaseQuantity: scope.maxBaseQuantity,
+    maxQuoteNotional: scope.maxQuoteNotional,
+  };
+}
+
+/**
  * Create a controlled-test authorization. Validates the strict scope and fails
- * closed on anything that is not SELL + LIMIT with positive caps. This is the
- * ONLY way to obtain a genuine `ControlledLiveAuthorization`; the returned
- * token is registered with the process-local registry so that it passes
+ * closed on anything that is not a single explicit side (SELL|BUY) + LIMIT with
+ * positive caps. This is the ONLY way to obtain a genuine
+ * `ControlledLiveAuthorization`; the returned token and its exact scope are
+ * registered with the process-local registry so that it passes
  * `isControlledLiveAuthorization`.
  */
 export function createControlledLiveAuthorization(scope: ControlledLiveScope): ControlledLiveAuthorization {
-  if (scope.side !== 'SELL') {
-    throw new Error('controlled live test is SELL-only');
+  if (scope.side !== 'SELL' && scope.side !== 'BUY') {
+    throw new Error('controlled live test side must be exactly SELL or BUY');
   }
   if (scope.type !== 'limit') {
     throw new Error('controlled live test is LIMIT-only');
@@ -107,8 +141,9 @@ export function createControlledLiveAuthorization(scope: ControlledLiveScope): C
     throw new Error('controlled live test requires a positive max quote notional');
   }
   const token = randomUUID();
-  issuedTokens.add(token);
-  return { kind: 'controlled-live-test', scope, token };
+  const issued = freezeScope(scope);
+  issuedScopes.set(token, issued);
+  return { kind: 'controlled-live-test', scope: issued, token };
 }
 
 /**
@@ -124,11 +159,12 @@ export function isControlledLiveAuthorization(value: unknown): value is Controll
   const v = value as { kind?: unknown; token?: unknown; scope?: unknown };
   if (v.kind !== 'controlled-live-test') return false;
   if (typeof v.token !== 'string') return false;
-  // The token must have been issued by THIS running process. Merely having the
-  // right shape (or a UUID-looking string) is never sufficient.
-  if (!issuedTokens.has(v.token)) return false;
-  // The scope must be complete and usable so it can be enforced at the boundary.
-  if (!isValidScope(v.scope)) return false;
+  // The token must have been issued by THIS running process AND the presented
+  // scope must equal the issued scope. Merely having the right shape (or a
+  // UUID-looking string) is never sufficient, and a genuine token with a
+  // tampered scope (e.g. SELL->BUY) is rejected.
+  const issued = issuedScopes.get(v.token);
+  if (!scopeMatchesIssued(v.scope, issued)) return false;
   return true;
 }
 
@@ -141,17 +177,21 @@ export interface ControlledOrderLike {
 }
 
 /**
- * True if `order` is a controlled-test order (SELL + LIMIT) AND is authorized by
- * a genuine controlled-test authorization, AND stays within the authorization's
- * own scope caps (max base quantity, positive price, quote notional <= max quote
- * notional). This is the adapter-side check: a BUY or MARKET order is NEVER
- * authorized, and an oversized order is never authorized, so it cannot slip
- * through even with a borrowed/forged authorization object.
+ * True if `order` is a controlled-test order (exactly the authorized side +
+ * LIMIT) AND is authorized by a genuine controlled-test authorization, AND stays
+ * within the authorization's own scope caps (max base quantity, positive price,
+ * quote notional <= max quote notional). This is the adapter-side check: a MARKET
+ * order is NEVER authorized, the OPPOSITE side is never authorized, and an
+ * oversized order is never authorized, so it cannot slip through even with a
+ * borrowed/forged authorization object.
  *
  * The caps are enforced HERE independently of `LiveOrderEngine`'s
  * `cfg.maxLiveBaseQuantity` / `cfg.maxLiveQuoteNotional`, so the authorization
  * remains safe if a future caller passes an issued authorization with a
  * different (e.g. smaller) scope.
+ *
+ * The order side must EQUAL the authorization's side, so a SELL authorization
+ * can never authorize a BUY and vice versa.
  *
  * Single-use: on success this consumes the token (removes it from the registry),
  * so the authorization can permit at most one order at the mutation boundary.
@@ -159,8 +199,8 @@ export interface ControlledOrderLike {
 export function isControlledLiveOrder(order: ControlledOrderLike, authorization: unknown): boolean {
   if (!isControlledLiveAuthorization(authorization)) return false;
   const auth = authorization;
-  if (order.side !== 'SELL' || order.type !== 'limit') return false;
-  if (auth.scope.side !== 'SELL' || auth.scope.type !== 'limit') return false;
+  if (order.type !== 'limit' || auth.scope.type !== 'limit') return false;
+  if (order.side !== auth.scope.side) return false;
   if (!order.quantity.isPositive()) return false;
   if (order.quantity.compareTo(auth.scope.maxBaseQuantity) > 0) return false;
   if (!order.price || !order.price.isPositive()) return false;
@@ -170,6 +210,6 @@ export function isControlledLiveOrder(order: ControlledOrderLike, authorization:
   // Consume the token: a token authorizes at most one order at the mutation
   // boundary. Removal also makes `isControlledLiveAuthorization` reject it
   // thereafter, so a reused token can never reach SendOrder again.
-  issuedTokens.delete(auth.token);
+  issuedScopes.delete(auth.token);
   return true;
 }

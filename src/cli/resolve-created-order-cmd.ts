@@ -3,14 +3,17 @@
  * LIVE order whose exchange outcome is FUNDAMENTALLY AMBIGUOUS because it has NO
  * exchangeOrderId.
  *
- * Two local states are eligible:
+ * Three local states are eligible:
  *   - `CREATED`: a crash after persist-before-submit but before/around SendOrder.
  *     The bot cannot prove whether the submission reached the exchange.
  *   - `SUBMITTED` with `exchangeOrderId = null`: the exchange returned an
  *     acceptance receipt but no exchange order id, so the bot has NO identity
  *     with which to reconcile the outcome.
+ *   - `UNKNOWN` with `exchangeOrderId = null`: an ambiguous submission
+ *     (timeout / network / invalid response) that may or may not have reached
+ *     the exchange, with no id to reconcile against.
  *
- * In BOTH cases the system cannot prove the exchange outcome, because:
+ * In ALL cases the system cannot prove the exchange outcome, because:
  *   - the submission may or may not have happened / may or may not be live;
  *   - NDAX `ClientOrderId` lookup is not supported and its uniqueness is not
  *     proven (we send 0 by default);
@@ -75,10 +78,18 @@ type ResolutionMode = 'ATTACH' | 'ABANDON';
  * Local statuses that represent a fundamentally UNIDENTIFIED LIVE order: a
  * durable record with NO exchangeOrderId whose exchange outcome cannot be
  * proven. `CREATED` = persisted before an ambiguous submission; `SUBMITTED` =
- * an acceptance receipt with no exchange order id to reconcile against. Both are
- * resolved by the SAME operator-only ATTACH/ABANDON path.
+ * an acceptance receipt with no exchange order id to reconcile against;
+ * `UNKNOWN` = an ambiguous submission (timeout/network/invalid response) that may
+ * or may not have reached the exchange. All are resolved by the SAME
+ * operator-only ATTACH/ABANDON path. (An `UNKNOWN` order WITH an
+ * `exchangeOrderId` is NOT eligible here — it is handled by the read-only
+ * `live-monitor` / `resolve-live-order` paths.)
  */
-const UNIDENTIFIED_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>(['CREATED', 'SUBMITTED']);
+const UNIDENTIFIED_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
+  'CREATED',
+  'SUBMITTED',
+  'UNKNOWN',
+]);
 
 /** True when `order` is an unidentified LIVE order eligible for this resolution. */
 function isUnidentifiedLiveOrder(order: Order): boolean {
@@ -141,7 +152,7 @@ function parseResolveCreatedOrderArgs(
     }
   }
 
-  if (!opts.clientOrderId) return { ok: false, error: 'clientOrderId is required (the exact local CREATED order id)' };
+  if (!opts.clientOrderId) return { ok: false, error: 'clientOrderId is required (the exact local unidentified LIVE order id)' };
   if (!opts.operator.trim()) return { ok: false, error: '--operator is required (operator identity for the audit trail)' };
   const hasAttach = opts.attachExchangeOrderId !== null;
   if (hasAttach && abandon) {
@@ -229,6 +240,16 @@ function renderEvidence(
       'NO exchangeOrderId with which to reconcile this order. This command does NOT',
       'prove the exchange order does not exist, and does NOT prove it was never submitted.',
     );
+  } else if (order.status === 'UNKNOWN') {
+    // UNKNOWN + null exchangeOrderId: an ambiguous submission the bot could not
+    // identify. Same fail-closed operator resolution as SUBMITTED/null.
+    lines.push(
+      '',
+      'WARNING: this local order is UNKNOWN but has NO exchangeOrderId.',
+      'The submission outcome was ambiguous and the bot has NO exchangeOrderId with',
+      'which to reconcile this order. This command does NOT prove the exchange order',
+      'does not exist, and does NOT prove it was never submitted.',
+    );
   }
   if (exchangeOrder) {
     lines.push(
@@ -282,7 +303,7 @@ export async function runResolveCreatedOrder(deps: ResolveCreatedOrderDeps, argv
     return failed(
       [
         `order ${o.clientOrderId} status is ${initial.status} (exchangeOrderId=${initial.exchangeOrderId ?? 'null'}); ` +
-          'it is not an unresolved CREATED/SUBMITTED order without an exchangeOrderId (already resolved or not eligible)',
+          'it is not an unresolved CREATED/SUBMITTED/UNKNOWN order without an exchangeOrderId (already resolved or not eligible)',
       ],
       { error: 'not_created', clientOrderId: o.clientOrderId, status: initial.status },
     );
@@ -342,7 +363,7 @@ export async function runResolveCreatedOrder(deps: ResolveCreatedOrderDeps, argv
       if (!current) throw new Error(`order ${o.clientOrderId} no longer exists`);
       if (!isUnidentifiedLiveOrder(current)) {
         throw new Error(
-          `order ${o.clientOrderId} is no longer an unidentified CREATED/SUBMITTED order ` +
+          `order ${o.clientOrderId} is no longer an unidentified CREATED/SUBMITTED/UNKNOWN order ` +
             `(status ${current.status}, exchangeOrderId ${current.exchangeOrderId ?? 'null'}); already resolved`,
         );
       }

@@ -129,6 +129,11 @@ export function livePreTradeGate(
   }
 
   // Ambiguous reservations must block (retained, not safe to release).
+  // DEFENSIVE: the current `reservationDisposition` classifier only returns
+  // RELEASE or RETAIN (never AMBIGUOUS), so this branch does not currently fire.
+  // It is retained so the gate stays fail-closed if that type ever produces an
+  // AMBIGUOUS reservation. The real reservation boundary is transactional
+  // (Portfolio.reserveOrder at submission), not this preflight projection.
   for (const r of result.reservationFindings) {
     if (r.disposition === 'AMBIGUOUS') {
       blockers.push(`reservation for ${r.orderId} is ambiguous`);

@@ -470,13 +470,13 @@ export class NdaxAdapter implements ExchangeAdapter {
   ): void {
     // Existing fully-armed path (internal test switch only — never set via config).
     if (this.enableOrderPlacement) return;
-    // Explicit, narrowly-scoped controlled-test authorization: SELL + LIMIT only.
+    // Explicit, narrowly-scoped controlled-test authorization: one side + LIMIT only.
     if (authorization && order && isControlledLiveOrder(order, authorization)) return;
     throw new OrderRejectedError(
       'NDAX order placement is disabled. The SendOrder/CancelOrder network ' +
         'paths are implemented but not enabled: supportsOrderPlacement remains ' +
-        'false and live trading fails closed. Only the explicitly-authorized ' +
-        'controlled LIMIT-only SELL test may reach SendOrder.',
+        'false and live trading fails closed. Only an explicitly-authorized ' +
+        'controlled LIMIT-only SELL/BUY test may reach SendOrder.',
     );
   }
 

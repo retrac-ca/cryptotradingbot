@@ -36,11 +36,22 @@ export type {
   ReattachmentResult,
   ReattachmentPolicy,
 } from './recovery.js';
-export { evaluateLiveBuyReadiness, ndaxLiveBuyFacts } from './readiness.js';
+export {
+  evaluateLiveBuyReadiness,
+  structuralPlacementGuarantees,
+  FUNDAMENTALLY_UNPROVABLE_PROPERTIES,
+  SAFETY_COMPENSATIONS,
+} from './readiness.js';
 export type {
   LiveBuyReadinessInput,
   LiveBuyReadinessReport,
   ReadinessCondition,
   ReadinessVerdict,
-  ConditionStatus,
+  ReadinessCategory,
+  ReadinessBasis,
+  ReadinessStatus,
+  ControlledRealBuyEvidence,
+  StructuralPlacementAdapter,
+  UnprovableProperty,
+  SafetyCompensation,
 } from './readiness.js';

@@ -289,12 +289,46 @@ describe('Controlled-LIVE authorization — engine gate', () => {
 });
 
 describe('Controlled-LIVE authorization — factory scope', () => {
-  it('only creates a SELL + LIMIT authorization', () => {
-    expect(() => createControlledLiveAuthorization({ side: 'BUY', type: 'limit', maxBaseQuantity: Money.fromString('0.01'), maxQuoteNotional: Money.fromString('100') })).toThrow(/SELL-only/);
+  it('creates a single explicit side (SELL or BUY) + LIMIT authorization only', () => {
+    // BUY is now a valid controlled scope (single explicit side).
+    const buy = createControlledLiveAuthorization({ side: 'BUY', type: 'limit', maxBaseQuantity: Money.fromString('0.01'), maxQuoteNotional: Money.fromString('100') });
+    expect(buy.scope.side).toBe('BUY');
+    expect(isControlledLiveAuthorization(buy)).toBe(true);
+    // MARKET is never allowed, and caps must be positive.
     expect(() => createControlledLiveAuthorization({ side: 'SELL', type: 'market', maxBaseQuantity: Money.fromString('0.01'), maxQuoteNotional: Money.fromString('100') })).toThrow(/LIMIT-only/);
+    expect(() => createControlledLiveAuthorization({ side: 'BUY', type: 'market', maxBaseQuantity: Money.fromString('0.01'), maxQuoteNotional: Money.fromString('100') })).toThrow(/LIMIT-only/);
     expect(() => createControlledLiveAuthorization({ side: 'SELL', type: 'limit', maxBaseQuantity: Money.zero(), maxQuoteNotional: Money.fromString('100') })).toThrow(/positive/);
+    expect(() => createControlledLiveAuthorization({ side: 'NOPE' as never, type: 'limit', maxBaseQuantity: Money.fromString('0.01'), maxQuoteNotional: Money.fromString('100') })).toThrow(/SELL or BUY/);
     const a = auth();
     expect(isControlledLiveAuthorization(a)).toBe(true);
+  });
+
+  it('a BUY authorization authorizes only a BUY and never a SELL', () => {
+    const buy = createControlledLiveAuthorization({ side: 'BUY', type: 'limit', maxBaseQuantity: Money.fromString('0.01'), maxQuoteNotional: Money.fromString('100') });
+    const buyOrder = { side: 'BUY', type: 'limit', quantity: Money.fromString('0.001'), price: Money.fromString('40000') };
+    const sellOrder = { side: 'SELL', type: 'limit', quantity: Money.fromString('0.001'), price: Money.fromString('40000') };
+    // Wrong side must NOT consume the token.
+    expect(isControlledLiveOrder(sellOrder, buy)).toBe(false);
+    // Correct side consumes it once.
+    expect(isControlledLiveOrder(buyOrder, buy)).toBe(true);
+    expect(isControlledLiveOrder(buyOrder, buy)).toBe(false);
+  });
+
+  it('a SELL authorization can never authorize a BUY', () => {
+    const sell = auth();
+    const buyOrder = { side: 'BUY', type: 'limit', quantity: Money.fromString('0.001'), price: Money.fromString('40000') };
+    expect(isControlledLiveOrder(buyOrder, sell)).toBe(false);
+    // The token was not consumed by the wrong-side attempt.
+    expect(isControlledLiveAuthorization(sell)).toBe(true);
+  });
+
+  it('a genuine token with a tampered scope (SELL->BUY) is rejected (anti-forgery)', () => {
+    const sell = auth();
+    const flipped = { kind: sell.kind, token: sell.token, scope: { ...sell.scope, side: 'BUY' } };
+    expect(isControlledLiveAuthorization(flipped)).toBe(false);
+    expect(isControlledLiveOrder({ side: 'BUY', type: 'limit', quantity: Money.fromString('0.001'), price: Money.fromString('40000') }, flipped)).toBe(false);
+    // The original is still genuine and unconsumed.
+    expect(isControlledLiveAuthorization(sell)).toBe(true);
   });
 
   it('isControlledLiveOrder only accepts a genuine SELL + LIMIT within the authorization scope', () => {

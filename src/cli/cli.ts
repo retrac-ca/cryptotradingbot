@@ -59,12 +59,12 @@ Commands:
   fetch-candles Acquire historical candles from the exchange (READ-ONLY public data; never trades)
   trades    Show the durable order ledger
   reconcile Reconcile the order ledger against the exchange (read-only)
-  live-test One-shot, operator-gated LIVE SELL (e.g. first-risk-validated live order)
+  live-test One-shot operator-gated LIVE order: "sell" (risk-reducing) or "buy" (controlled LIMIT, managed CAD)
   live-monitor READ-ONLY lifecycle observer for unresolved LIVE orders (never submits/cancels)
   live-onboard-external Authorize existing EXTERNAL exchange inventory as bot-managed (local ownership only; NOT trading)
   manual    Constrained MANUAL EXECUTION BRIDGE (operator interface; never places/cancels an exchange order)
   resolve-live-order Operator-attested resolution of an ambiguous FILLED live order (never submits/cancels)
-  resolve-created-order Operator-only ATTACH/ABANDON resolution of an unidentified live order (CREATED, or SUBMITTED without an exchangeOrderId; never submits/cancels)
+  resolve-created-order Operator-only ATTACH/ABANDON resolution of an unidentified live order (CREATED / SUBMITTED / UNKNOWN without an exchangeOrderId; never submits/cancels)
   help      Show this help
 
 Run "bot <command> --help" for command-specific options.

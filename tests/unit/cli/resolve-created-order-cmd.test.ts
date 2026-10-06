@@ -81,6 +81,11 @@ function submittedUnidentifiedOrder(over: Partial<Order> = {}): Order {
   return createdOrder({ status: 'SUBMITTED', exchangeOrderId: null, ...over });
 }
 
+/** An UNKNOWN live order with NO exchangeOrderId (ambiguous submission). */
+function unknownUnidentifiedOrder(over: Partial<Order> = {}): Order {
+  return createdOrder({ status: 'UNKNOWN', exchangeOrderId: null, ...over });
+}
+
 /** A fake whose getBalances hook can simulate a concurrent ledger mutation. */
 class MutatingFake extends FakeExchange {
   beforeBalances?: () => void;
@@ -562,6 +567,122 @@ describe('bot resolve-created-order — SUBMITTED + null exchangeOrderId (uniden
       orders.save(submittedUnidentifiedOrder({ status: 'ABANDONED' }));
     };
     const res = await runResolveCreatedOrder(deps, SUBMITTED_ARGS);
+    expect(res.code).toBe(2);
+    expect(res.json.error).toBe('resolution_aborted');
+    expect(existsSync(join(stateDir, '.mutation.lock'))).toBe(false);
+    dispose();
+  });
+});
+
+describe('bot resolve-created-order — UNKNOWN + null exchangeOrderId (ambiguous submission)', () => {
+  const UNKNOWN_ARGS = [
+    CLIENT,
+    '--operator',
+    'operator-alice',
+    '--abandon',
+    '--reason',
+    'ambiguous submission; no exchangeOrderId to reconcile',
+    '--confirm',
+  ];
+
+  it('ABANDON resolves the stuck UNKNOWN/null order to a terminal local state', async () => {
+    const { deps, orders, dispose } = makeDeps({ liveOrder: unknownUnidentifiedOrder() });
+    const res = await runResolveCreatedOrder(deps, UNKNOWN_ARGS);
+    expect(res.code).toBe(0);
+    expect(res.json.outcome).toBe('ABANDON');
+    const reloaded = orders.get(CLIENT)!;
+    expect(reloaded.status).toBe('ABANDONED');
+    expect(reloaded.exchangeOrderId).toBeNull();
+    expect(reloaded.filledQuantity.isZero()).toBe(true);
+    expect(reloaded.averagePrice).toBeNull();
+    expect(reloaded.resolution?.kind).toBe('ABANDON');
+    expect(reloaded.resolution?.operator).toBe('operator-alice');
+    expect(reloaded.resolution?.accountingAuthority).toBe('operator_attestation');
+    expect(reloaded.resolution?.provenanceProof).toBe(false);
+    dispose();
+  });
+
+  it('clearly states the outcome is UNKNOWN and that there is no exchangeOrderId', async () => {
+    const { deps, dispose } = makeDeps({ liveOrder: unknownUnidentifiedOrder() });
+    const res = await runResolveCreatedOrder(deps, UNKNOWN_ARGS);
+    expect(res.code).toBe(0);
+    const text = res.lines.join('\n');
+    expect(text).toMatch(/UNKNOWN but has NO exchangeOrderId/);
+    expect(text).toMatch(/submission outcome was ambiguous/i);
+    expect(text).toMatch(/NO exchangeOrderId with\s+which to reconcile/i);
+    expect(text).toMatch(/does NOT\s+prove the exchange order\s+does not exist/i);
+    expect(text).toMatch(/does NOT prove it was never submitted/i);
+    dispose();
+  });
+
+  it('does not invent an exchangeOrderId, a fill, or touch unrelated state', async () => {
+    const { deps, orders, stateDir, dispose } = makeDeps({ liveOrder: unknownUnidentifiedOrder() });
+    const live = new ManagedStateStore(join(stateDir, 'live.json'));
+    const before = Portfolio.empty(new Map([['CAD', Money.fromString('1000')]])).reserveOrder(
+      OTHER_CLIENT,
+      'CAD',
+      Money.fromString('300'),
+    );
+    live.save(before.stateModel);
+    const res = await runResolveCreatedOrder(deps, UNKNOWN_ARGS);
+    expect(res.code).toBe(0);
+    const reloaded = orders.get(CLIENT)!;
+    expect(reloaded.exchangeOrderId).toBeNull();
+    expect(reloaded.filledQuantity.isZero()).toBe(true);
+    expect(reloaded.averagePrice).toBeNull();
+    const after = live.toPortfolio(live.load().data!)!;
+    expect(after.liveOrderAttestation(CLIENT)).toBeNull();
+    expect(after.appliedCount()).toBe(0);
+    expect(after.orderReservation(OTHER_CLIENT)?.status).toBe('ACTIVE');
+    dispose();
+  });
+
+  it('ATTACH verifies the exact operator-asserted exchange identity and adopts its status', async () => {
+    const fake = new FakeExchange();
+    fake.seedOrders([exchangeOrder({ exchangeOrderId: '555', status: 'OPEN' })]);
+    const { deps, orders, dispose } = makeDeps({ fake, liveOrder: unknownUnidentifiedOrder() });
+    const res = await runResolveCreatedOrder(deps, ATTACH_ARGS);
+    expect(res.code).toBe(0);
+    expect(res.json.outcome).toBe('ATTACH');
+    const reloaded = orders.get(CLIENT)!;
+    expect(reloaded.status).toBe('OPEN');
+    expect(reloaded.exchangeOrderId).toBe('555');
+    expect(reloaded.resolution?.kind).toBe('ATTACH');
+    dispose();
+  });
+
+  it('UNKNOWN WITH a valid exchangeOrderId is NOT eligible here (other paths handle it)', async () => {
+    const { deps, orders, dispose } = makeDeps({
+      liveOrder: unknownUnidentifiedOrder({ exchangeOrderId: '999' }),
+    });
+    const res = await runResolveCreatedOrder(deps, UNKNOWN_ARGS);
+    expect(res.code).toBe(1);
+    expect(res.json.error).toBe('not_created');
+    expect(orders.get(CLIENT)!.status).toBe('UNKNOWN');
+    expect(orders.get(CLIENT)!.exchangeOrderId).toBe('999');
+    dispose();
+  });
+
+  it('never calls SendOrder or CancelOrder (read-only)', async () => {
+    const fake = new FakeExchange();
+    const place = vi.spyOn(fake, 'placeOrder');
+    const cancel = vi.spyOn(fake, 'cancelOrder');
+    const { deps, dispose } = makeDeps({ fake, liveOrder: unknownUnidentifiedOrder() });
+    const res = await runResolveCreatedOrder(deps, UNKNOWN_ARGS);
+    expect(res.code).toBe(0);
+    expect(place).not.toHaveBeenCalled();
+    expect(cancel).not.toHaveBeenCalled();
+    expect(fake.submittedOrders).toHaveLength(0);
+    dispose();
+  });
+
+  it('aborts safely (TOCTOU) when the order changes after the initial read', async () => {
+    const fake = new MutatingFake();
+    const { deps, orders, stateDir, dispose } = makeDeps({ fake, liveOrder: unknownUnidentifiedOrder() });
+    fake.beforeBalances = () => {
+      orders.save(unknownUnidentifiedOrder({ quantity: Money.fromString('0.2') }));
+    };
+    const res = await runResolveCreatedOrder(deps, UNKNOWN_ARGS);
     expect(res.code).toBe(2);
     expect(res.json.error).toBe('resolution_aborted');
     expect(existsSync(join(stateDir, '.mutation.lock'))).toBe(false);

@@ -1647,3 +1647,99 @@ cross-file consistency validation into the live/manual production startup gate
 cross-file contradictions (orphan reservation, accounted intent without a
 settlement). `supportsOrderPlacement` remains `false`; no SendOrder/CancelOrder;
 no PAPER/LIVE/manual boundary change; no `.soak` change; nothing committed.
+
+## 41. NDAX controlled LIVE BUY readiness model redesign (2026-10-04)
+
+**Decision:** Replace the homogeneous Gate 7.4 readiness model — which required
+`adapterSupportsOrderPlacement === true`, `reattachmentTrustworthy === true`,
+`executionIdentityTrustworthy === true`, a static `noOrderOwnershipConflict`, and
+an `operatorConfirmed` pre-fact — with a categorized model that blocks only on
+genuinely required conditions and handles the NDAX limitations with explicit,
+tested **compensating controls**.
+
+**What is superseded.** The statements in §33/§34 that `executionIdentityTrustworthy`
+stays UNKNOWN and that the live-BUY readiness gate therefore permanently blocks no
+longer describe the implementation. The controlled `bot live-test buy` path is now
+reachable when all genuinely required conditions hold; it is still single-use,
+human-confirmed (`EXECUTE`), LIMIT-only, managed-CAD-funded, and no autonomous
+route exists. `NdaxAdapter.capabilities.supportsOrderPlacement` remains `false`.
+
+**Readiness categories (`src/execution/readiness.ts`):**
+- **STRUCTURAL_GUARANTEE** — controlled-authorization capability, side/LIMIT
+  scoping, single-use, positive caps, `supportsOrderPlacement` stays false, adapter
+  honors the controlled exception. These are true **by construction** and are
+  reported with `basis: 'STRUCTURAL_GUARANTEE'`; the evaluator does NOT observe
+  them at runtime. Enforcement lives at `ControlledLiveAuthorization`,
+  `isControlledLiveOrder`, `NdaxAdapter.placeOrder` and `LiveOrderEngine.assertGate`.
+  (`structuralGeneralPlacementDisabled` and `structuralCapsPositive` are the two
+  that are additionally corroborated by a direct read of the adapter/config.)
+- **READ_ONLY_VERIFIABLE** — LIVE mode, REAL_FUNDS_AT_RISK, kill switch,
+  authenticated reads, freshness, valuation, reconciliation, unresolved orders,
+  current order conflict, risk, quantity/price, exchange quote, managed CAD, fee.
+  Reported with `basis: 'RUNTIME_OBSERVED'`.
+- **REQUIRES_CONTROLLED_REAL_BUY** — the empirical results of the first real BUY.
+  Reported as pending; they NEVER block it.
+- **FUNDAMENTALLY_UNPROVABLE** — deterministic lost-ack re-attachment, universal
+  executionId uniqueness, complete per-order execution enumeration, universal
+  exactly-once accounting, exchange-proven provenance. Each maps to a compensating
+  control; none blocks.
+- **SAFETY_COMPENSATION** — transactional managed-CAD reservation, persist-before-
+  submit, ambiguous→UNKNOWN, UNKNOWN is durable and retains the reservation, UNKNOWN
+  blocks placement, no retry/reprice/heuristic matching, no "absent from OpenOrders
+  ⇒ never existed", no automatic re-attachment, accounting fail-closed + operator
+  attestation non-proven.
+
+**Consequences.** `operatorConfirmed` is no longer a readiness input (confirmation
+is the post-display interactive `EXECUTE`). The current order conflict is derived
+read-only from the actual reconciliation/ledger observations. The former
+`noConflictingActiveReservation` readiness condition was **removed**: the
+reconciliation classifier (`reservationDisposition`) can only return `RELEASE` or
+`RETAIN`, never `AMBIGUOUS`, so the check was vacuous. Reservation safety is
+enforced transactionally at submission (`buildManagedQuoteReservation` +
+`Portfolio.reserveOrder`, fresh state under the mutation lock, fail-closed), and
+orphan reservations are surfaced as operator findings; this is recorded as the
+`transactionalManagedReservation` safety compensation rather than a preflight
+observation. `supportsOrderPlacement` and the adapter boundary are unchanged;
+`enableOrderPlacement` remains an internal test-only switch never set via
+configuration. The first real BUY is the empirical test for BUY-specific behavior
+and was NOT executed as part of this change.
+
+## 42. First-BUY finalization: risk semantics, UNKNOWN recovery, runbook (2026-10-05)
+
+**Decision:** Finalize the controlled LIVE BUY path for its first real use with
+three narrowly-scoped changes; nothing in the controlled authorization, engine,
+adapter, reconciliation, or external-CAD classification changes.
+
+1. **`MAX_OPEN_POSITIONS` semantics.** The BUY-only max-open-positions gate now
+   bounds only the number of DISTINCT managed symbols. A BUY that ADDS to a
+   symbol the bot already manages is **not** blocked by this gate (it is still
+   bounded by the per-asset position cap, the portfolio-exposure cap, and the
+   funding/reservation checks). Previously the gate counted the candidate symbol
+   as a "new" position, so a residual managed position (e.g. external-authorized
+   dust) could permanently block adding to that same symbol.
+   (`src/risk/RiskManager.ts#checkMaxOpenPositions`.)
+
+2. **`MAX_POSITION_SIZE_FRACTION` documentation.** This value is, and remains, a
+   per-POSITION size cap expressed as a fraction of managed portfolio value (the
+   BUY is sized to the remaining room under it). `.env.example` previously
+   described it incorrectly as a fraction of the deployable quote balance; the
+   documentation is corrected to match the tested behavior. No behavior change.
+
+3. **Unidentified-live-order recovery extended to `UNKNOWN`.** An ambiguous
+   submission with **no** `exchangeOrderId` (`UNKNOWN`) is now eligible for the
+   existing operator-only ATTACH/ABANDON resolution, alongside `CREATED` and
+   `SUBMITTED`-without-id. ATTACH still verifies the exchange order identity
+   read-only; ABANDON still sets a terminal local `ABANDONED` record and is NOT
+   proof that no exchange order exists; neither accounts a fill; the reservation
+   is untouched. `UNKNOWN`/`SUBMITTED` WITH an `exchangeOrderId` remain handled by
+   `live-monitor` / `resolve-live-order`.
+   (`src/cli/resolve-created-order-cmd.ts`; `docs/CREATED_ORDER_RECOVERY.md`.)
+
+**Operator runbook.** `docs/FIRST_LIVE_BUY.md` documents the pre-flight, exact
+command, confirmation, post-submit observation/accounting, UNKNOWN handling, and
+stop conditions for the first BUY. The CLI help now names `live-test buy`.
+
+**Consequences.** No safety control is weakened: the single-use, side-scoped,
+LIMIT-only controlled authorization and `supportsOrderPlacement=false` are
+unchanged; BUY remains the only operator-confirmed production placement path; the
+first real BUY is still a separate operator action.

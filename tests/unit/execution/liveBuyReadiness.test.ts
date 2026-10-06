@@ -1,15 +1,22 @@
 /**
- * Gate 7.4 — first-live-BUY readiness gate.
+ * Controlled-LIVE BUY readiness model (redesign).
  *
- * The gate is READ-ONLY: it inspects pre-assessed conditions and, fail-closed,
- * blocks live BUY unless EVERY requirement is verified true. `null` (unknown)
- * is treated as a blocker, never as "assume OK". NDAX currently lacks a
- * provably-unique lost-ack re-attachment mechanism and a mapped execution/fill
- * identity, so the NDAX facts make the gate return NOT_READY — live BUY stays
- * disabled.
+ * The model is READ-ONLY and fail-closed for BLOCKING conditions, but it no
+ * longer blocks on facts NDAX cannot prove. This suite proves:
+ *   - controlled BUY can be READY with `supportsOrderPlacement=false`;
+ *   - every BLOCKING condition (structural guarantee + read-only) blocks when
+ *     false/unknown;
+ *   - structural conditions are represented as `basis: STRUCTURAL_GUARANTEE`
+ *     (construction/enforcement), distinct from read-only runtime observations;
+ *   - reservation safety is transactional, so no vacuous "no conflicting active
+ *     reservation" readiness observation is reported;
+ *   - the first-controlled-real-BUY evidence NEVER blocks (it is pending);
+ *   - the fundamentally-unprovable properties NEVER block (they are compensated);
+ *   - the compensating controls are enumerated as ACTIVE;
+ *   - there is no `operatorConfirmed` readiness field.
  *
- * This file also proves (against a fake Portfolio, NO exchange submission) that
- * the reservation → idempotent fill → remaining-release lifecycle composes.
+ * It also keeps the pure reservation -> idempotent fill -> release lifecycle
+ * proof (no exchange submission).
  */
 
 import { describe, expect, it } from 'vitest';
@@ -17,84 +24,247 @@ import { Money } from '../../../src/money/Money.js';
 import { Portfolio } from '../../../src/portfolio/Portfolio.js';
 import {
   evaluateLiveBuyReadiness,
-  ndaxLiveBuyFacts,
+  structuralPlacementGuarantees,
+  FUNDAMENTALLY_UNPROVABLE_PROPERTIES,
+  SAFETY_COMPENSATIONS,
 } from '../../../src/execution/index.js';
 import type { LiveBuyReadinessInput } from '../../../src/execution/index.js';
 import type { Fill } from '../../../src/order.js';
 
 function fullReady(): LiveBuyReadinessInput {
   return {
-    operatorConfirmed: true,
-    adapterSupportsOrderPlacement: true,
-    adapterReadyVerified: true,
+    structuralAuthorizationCapability: true,
+    structuralSideScopedToBuy: true,
+    structuralLimitOnly: true,
+    structuralSingleUse: true,
+    structuralCapsPositive: true,
+    structuralGeneralPlacementDisabled: true,
+    structuralAdapterHonorsAuthorization: true,
+    tradingModeIsLive: true,
+    realFundsAtRisk: true,
+    killSwitchInactive: true,
+    authenticatedReadsEnabled: true,
+    authenticatedReadVerified: true,
     snapshotFresh: true,
     portfolioValuationValid: true,
-    reconciliationSafeToTrade: true,
-    noUnresolvedUnknownOrders: true,
-    noOrderOwnershipConflict: true,
-    exchangeQuoteSufficient: true,
-    managedCashSufficient: true,
+    reconciliationGateAllowed: true,
+    noUnresolvedLiveOrder: true,
+    currentExchangeOrderConflictClear: true,
+    riskApproved: true,
     orderQuantityValid: true,
     referencePriceValid: true,
+    exchangeQuoteSufficient: true,
+    managedCashSufficient: true,
     feeCovered: true,
-    durableOrderIdentity: true,
-    reattachmentTrustworthy: true,
-    executionIdentityTrustworthy: true,
   };
 }
 
-describe('Gate 7.4 — first-live-BUY readiness gate (fail closed)', () => {
-  it('READY only when every condition is verified true', () => {
+const BLOCKING_KEYS = Object.keys(fullReady()) as (keyof LiveBuyReadinessInput)[];
+
+describe('liveBuyReadiness — blocking conditions (fail closed)', () => {
+  it('READY only when every blocking condition is verified true', () => {
     const report = evaluateLiveBuyReadiness(fullReady());
     expect(report.verdict).toBe('READY');
     expect(report.liveBuyAllowed).toBe(true);
     expect(report.blockers).toHaveLength(0);
   });
 
-  it('any single missing condition blocks live BUY', () => {
-    for (const key of Object.keys(fullReady()) as (keyof LiveBuyReadinessInput)[]) {
+  it('any single missing blocking condition blocks live BUY', () => {
+    for (const key of BLOCKING_KEYS) {
       const input = fullReady();
       input[key] = false;
       const report = evaluateLiveBuyReadiness(input);
-      expect(report.verdict).toBe('NOT_READY');
+      expect(report.verdict, `expected ${key} to block`).toBe('NOT_READY');
       expect(report.liveBuyAllowed).toBe(false);
       expect(report.blockers).toContain(key);
-      // Exactly the one blocker.
       expect(report.blockers).toHaveLength(1);
     }
   });
 
-  it('an UNKNOWN (null) condition is treated as a blocker, never assumed OK', () => {
-    const input = fullReady();
-    input.executionIdentityTrustworthy = null;
-    const report = evaluateLiveBuyReadiness(input);
-    expect(report.verdict).toBe('NOT_READY');
-    expect(report.blockers).toContain('executionIdentityTrustworthy');
-    const cond = report.conditions.find((c) => c.id === 'executionIdentityTrustworthy')!;
-    expect(cond.unknown).toBe(true);
-    expect(cond.status).toBe('BLOCKED');
+  it('an UNKNOWN (null) blocking condition is a blocker, never assumed OK', () => {
+    for (const key of BLOCKING_KEYS) {
+      const input = fullReady();
+      input[key] = null;
+      const report = evaluateLiveBuyReadiness(input);
+      expect(report.verdict).toBe('NOT_READY');
+      expect(report.blockers).toContain(key);
+      const cond = report.conditions.find((c) => c.id === key)!;
+      expect(cond.unknown).toBe(true);
+      expect(cond.status).toBe('BLOCKED');
+      expect(cond.blocking).toBe(true);
+    }
+  });
+});
+
+describe('liveBuyReadiness — controlled placement without general placement', () => {
+  it('a controlled BUY is eligible with supportsOrderPlacement=false', () => {
+    const guarantees = structuralPlacementGuarantees(
+      { id: 'ndax', capabilities: { supportsOrderPlacement: false } },
+      { liveMaxBaseQuantity: 0.01, liveMaxQuoteNotional: 100 },
+    );
+    expect(guarantees.structuralGeneralPlacementDisabled).toBe(true);
+    expect(guarantees.structuralAdapterHonorsAuthorization).toBe(true);
+    expect(guarantees.structuralAuthorizationCapability).toBe(true);
+
+    const report = evaluateLiveBuyReadiness({ ...fullReady(), ...guarantees });
+    expect(report.liveBuyAllowed).toBe(true);
   });
 
-  it('the NDAX readiness facts fail closed (no verified re-attachment / execution id)', () => {
-    const input = fullReady();
-    Object.assign(input, ndaxLiveBuyFacts());
-    const report = evaluateLiveBuyReadiness(input);
+  it('supportsOrderPlacement=true (general placement advertised) blocks the controlled path', () => {
+    const guarantees = structuralPlacementGuarantees(
+      { id: 'some-exchange', capabilities: { supportsOrderPlacement: true } },
+      { liveMaxBaseQuantity: 0.01, liveMaxQuoteNotional: 100 },
+    );
+    expect(guarantees.structuralGeneralPlacementDisabled).toBe(false);
+    const report = evaluateLiveBuyReadiness({ ...fullReady(), ...guarantees });
     expect(report.verdict).toBe('NOT_READY');
-    expect(report.liveBuyAllowed).toBe(false);
-    // The NDAX blockers that Gate 7.3 documented.
-    expect(report.blockers).toContain('reattachmentTrustworthy');
-    expect(report.blockers).toContain('executionIdentityTrustworthy');
-    expect(report.blockers).toContain('adapterReadyVerified');
-    expect(report.blockers).toContain('noOrderOwnershipConflict');
+    expect(report.blockers).toEqual(['structuralGeneralPlacementDisabled']);
   });
 
-  it('missing snapshot freshness / stale / insufficient funds each block', () => {
-    const stale = evaluateLiveBuyReadiness({ ...fullReady(), snapshotFresh: false });
-    expect(stale.blockers).toContain('snapshotFresh');
-    const noQuote = evaluateLiveBuyReadiness({ ...fullReady(), exchangeQuoteSufficient: false });
-    expect(noQuote.blockers).toContain('exchangeQuoteSufficient');
-    const unknown = evaluateLiveBuyReadiness({ ...fullReady(), reconciliationSafeToTrade: null });
-    expect(unknown.blockers).toContain('reconciliationSafeToTrade');
+  it('invalid controlled-authorization caps block', () => {
+    const guarantees = structuralPlacementGuarantees(
+      { id: 'ndax', capabilities: { supportsOrderPlacement: false } },
+      { liveMaxBaseQuantity: 0, liveMaxQuoteNotional: 100 },
+    );
+    expect(guarantees.structuralCapsPositive).toBe(false);
+    const report = evaluateLiveBuyReadiness({ ...fullReady(), ...guarantees });
+    expect(report.blockers).toContain('structuralCapsPositive');
+  });
+
+  it('structural placement facts are labelled STRUCTURAL_GUARANTEE, not runtime observations', () => {
+    const report = evaluateLiveBuyReadiness(fullReady());
+    const structural = report.conditions.filter((c) => c.category === 'STRUCTURAL_GUARANTEE');
+    expect(structural.length).toBeGreaterThan(0);
+    for (const c of structural) {
+      expect(c.basis).toBe('STRUCTURAL_GUARANTEE');
+      expect(c.blocking).toBe(true);
+    }
+  });
+
+  it('read-only blocking conditions are labelled RUNTIME_OBSERVED', () => {
+    const report = evaluateLiveBuyReadiness(fullReady());
+    const observed = report.conditions.filter((c) => c.category === 'READ_ONLY_VERIFIABLE');
+    expect(observed.length).toBeGreaterThan(0);
+    for (const c of observed) expect(c.basis).toBe('RUNTIME_OBSERVED');
+  });
+});
+
+describe('liveBuyReadiness — impossible guarantees do NOT block', () => {
+  it('does not expose or require an operatorConfirmed field', () => {
+    expect(BLOCKING_KEYS).not.toContain('operatorConfirmed' as never);
+    const report = evaluateLiveBuyReadiness(fullReady());
+    expect(report.conditions.some((c) => c.id === 'operatorConfirmed')).toBe(false);
+  });
+
+  it('the first-controlled-BUY evidence is pending and never blocks', () => {
+    const report = evaluateLiveBuyReadiness(fullReady());
+    const empirical = report.conditions.filter((c) => c.category === 'REQUIRES_CONTROLLED_REAL_BUY');
+    expect(empirical.length).toBeGreaterThan(0);
+    for (const c of empirical) {
+      expect(c.blocking).toBe(false);
+      expect(c.status).toBe('PENDING_FIRST_BUY');
+    }
+    expect(report.liveBuyAllowed).toBe(true);
+  });
+
+  it('provided first-BUY evidence is reported as OBSERVED but still never blocks', () => {
+    const report = evaluateLiveBuyReadiness(fullReady(), {
+      buyLimitAccepted: true,
+      buyExchangeOrderIdReturned: true,
+      buyOrderObservable: true,
+      quoteHoldObserved: true,
+      buyLifecycleObserved: true,
+    });
+    const empirical = report.conditions.filter((c) => c.category === 'REQUIRES_CONTROLLED_REAL_BUY');
+    expect(empirical.every((c) => c.status === 'OBSERVED' && !c.blocking)).toBe(true);
+    expect(report.liveBuyAllowed).toBe(true);
+  });
+
+  it('fundamentally-unprovable properties are compensated and never block', () => {
+    const report = evaluateLiveBuyReadiness(fullReady());
+    const unprovable = report.conditions.filter((c) => c.category === 'FUNDAMENTALLY_UNPROVABLE');
+    expect(unprovable.length).toBe(FUNDAMENTALLY_UNPROVABLE_PROPERTIES.length);
+    for (const c of unprovable) {
+      expect(c.blocking).toBe(false);
+      expect(c.status).toBe('COMPENSATED');
+    }
+    // Every unprovable property names a real compensating control.
+    const controlIds = new Set(SAFETY_COMPENSATIONS.map((c) => c.id));
+    for (const u of FUNDAMENTALLY_UNPROVABLE_PROPERTIES) {
+      expect(controlIds.has(u.compensatingControlId)).toBe(true);
+    }
+  });
+
+  it('the safety compensations are enumerated as ACTIVE, non-blocking controls', () => {
+    const report = evaluateLiveBuyReadiness(fullReady());
+    const compensations = report.conditions.filter((c) => c.category === 'SAFETY_COMPENSATION');
+    expect(compensations.length).toBe(SAFETY_COMPENSATIONS.length);
+    for (const c of compensations) {
+      expect(c.status).toBe('ACTIVE');
+      expect(c.blocking).toBe(false);
+    }
+    const ids = compensations.map((c) => c.id);
+    // The controls that replace the impossible lost-ack / execution guarantees.
+    expect(ids).toContain('createdPersistedBeforeSubmit');
+    expect(ids).toContain('transactionalManagedReservation');
+    expect(ids).toContain('unknownDurableRetainsReservation');
+    expect(ids).toContain('unknownBlocksFurtherPlacement');
+    expect(ids).toContain('noRetryNoRepriceNoHeuristicMatching');
+    expect(ids).toContain('noOpenOrdersAbsenceInference');
+    expect(ids).toContain('noAutomaticReattachmentOperatorResolutionRequired');
+    expect(ids).toContain('accountingFailClosedOperatorAttestationNonProven');
+  });
+});
+
+describe('liveBuyReadiness — read-only verifiable projections', () => {
+  it('stale data, quote mismatch, insufficient managed cash and a current conflict each block', () => {
+    expect(evaluateLiveBuyReadiness({ ...fullReady(), snapshotFresh: false }).blockers).toEqual(['snapshotFresh']);
+    expect(evaluateLiveBuyReadiness({ ...fullReady(), managedCashSufficient: false }).blockers).toEqual(['managedCashSufficient']);
+    expect(evaluateLiveBuyReadiness({ ...fullReady(), exchangeQuoteSufficient: false }).blockers).toEqual(['exchangeQuoteSufficient']);
+    expect(evaluateLiveBuyReadiness({ ...fullReady(), feeCovered: false }).blockers).toEqual(['feeCovered']);
+    expect(evaluateLiveBuyReadiness({ ...fullReady(), currentExchangeOrderConflictClear: false }).blockers).toEqual(['currentExchangeOrderConflictClear']);
+    expect(evaluateLiveBuyReadiness({ ...fullReady(), noUnresolvedLiveOrder: false }).blockers).toEqual(['noUnresolvedLiveOrder']);
+  });
+
+  it('kill switch, wrong mode and missing real-funds acknowledgement each block', () => {
+    expect(evaluateLiveBuyReadiness({ ...fullReady(), killSwitchInactive: false }).blockers).toEqual(['killSwitchInactive']);
+    expect(evaluateLiveBuyReadiness({ ...fullReady(), tradingModeIsLive: false }).blockers).toEqual(['tradingModeIsLive']);
+    expect(evaluateLiveBuyReadiness({ ...fullReady(), realFundsAtRisk: false }).blockers).toEqual(['realFundsAtRisk']);
+  });
+});
+
+describe('liveBuyReadiness — reservation safety is transactional, not a readiness observation', () => {
+  it('no longer exposes a vacuous noConflictingActiveReservation blocking condition', () => {
+    // The reconciliation classifier (`reservationDisposition`) can only return
+    // RELEASE or RETAIN, never AMBIGUOUS, so a readiness check on AMBIGUOUS could
+    // never fire. It was removed rather than reported as an observation.
+    expect(BLOCKING_KEYS).not.toContain('noConflictingActiveReservation' as never);
+    const report = evaluateLiveBuyReadiness(fullReady());
+    expect(report.conditions.some((c) => c.id === 'noConflictingActiveReservation')).toBe(false);
+    expect(report.blockers).not.toContain('noConflictingActiveReservation');
+  });
+
+  it('represents transactional managed-quote reservation as an ACTIVE safety compensation', () => {
+    const report = evaluateLiveBuyReadiness(fullReady());
+    const reservationComp = report.conditions.find((c) => c.id === 'transactionalManagedReservation');
+    expect(reservationComp).toBeDefined();
+    expect(reservationComp!.category).toBe('SAFETY_COMPENSATION');
+    expect(reservationComp!.status).toBe('ACTIVE');
+    expect(reservationComp!.blocking).toBe(false);
+  });
+
+  it('the transactional reservation boundary remains fail-closed (Portfolio.reserveOrder)', () => {
+    // The real enforcement is NOT this evaluator: it is the fresh-state,
+    // in-lock `Portfolio.reserveOrder` used at submission time. Prove it refuses
+    // to over-reserve beyond deployable managed quote.
+    const p = Portfolio.empty(new Map([['CAD', Money.fromString('100')]]));
+    expect(() => p.reserveOrder('live-buy-1', 'CAD', Money.fromString('101'))).toThrow(/exceeds deployable/);
+    const ok = p.reserveOrder('live-buy-1', 'CAD', Money.fromString('100'));
+    expect(ok.orderReservation('live-buy-1')!.status).toBe('ACTIVE');
+    // A second reservation for the SAME order cannot silently double-spend.
+    expect(() => ok.reserveOrder('live-buy-1', 'CAD', Money.fromString('1'))).toThrow(/already has a reservation/);
+    // Once the deployable pool is consumed, another order cannot reserve it again.
+    expect(() => ok.reserveOrder('live-buy-2', 'CAD', Money.fromString('1'))).toThrow(/exceeds deployable/);
   });
 });
 

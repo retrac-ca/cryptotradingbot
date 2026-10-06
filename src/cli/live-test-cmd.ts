@@ -43,6 +43,9 @@ import type { ExchangeAdapter } from '../exchanges/ExchangeAdapter.js';
 import { LiveOrderEngine } from '../execution/LiveExecutionEngine.js';
 import type { PreparedLiveOrder, LiveOrderIntent, ManagedOrderGuard } from '../execution/LiveExecutionEngine.js';
 import { createControlledLiveAuthorization } from '../execution/ControlledLiveAuthorization.js';
+import { evaluateLiveBuyReadiness, structuralPlacementGuarantees } from '../execution/readiness.js';
+import type { LiveBuyReadinessInput, LiveBuyReadinessReport } from '../execution/readiness.js';
+import type { NewOrder } from '../order.js';
 import type { Logger } from '../logging/logger.js';
 import { evaluateFreshness, isValidEpochMs } from '../marketdata/index.js';
 import type { FreshnessPolicy } from '../marketdata/index.js';
@@ -142,6 +145,42 @@ export function parseLiveTestArgs(args: string[]): { ok: true; opts: LiveTestOpt
 }
 
 /**
+ * Options for the supervised one-shot `bot live-test buy` command.
+ *
+ * There is intentionally NO quantity/notional argument: the operator may NOT
+ * inject an arbitrary size. The exact BUY amount is computed by the RiskManager
+ * (bounded by the LIVE caps, managed deployable CAD, and the risk limits) and is
+ * displayed for authorization.
+ */
+export interface LiveBuyOptions {
+  /** Operator acknowledged this is a real live trade. */
+  confirmLive: boolean;
+}
+
+/**
+ * Parse `bot live-test buy [--confirm-live]`. Rejects any quantity/price/size
+ * injection so a caller cannot smuggle an arbitrary order past risk sizing.
+ */
+export function parseLiveTestBuyArgs(args: string[]): { ok: true; opts: LiveBuyOptions } | { ok: false; error: string } {
+  const opts: LiveBuyOptions = { confirmLive: false };
+  let sawBuy = false;
+  for (const arg of args) {
+    if (arg === 'buy') {
+      if (sawBuy) return FAIL('duplicate "buy" subcommand');
+      sawBuy = true;
+      continue;
+    }
+    if (arg === '--confirm-live') {
+      opts.confirmLive = true;
+      continue;
+    }
+    return FAIL(`unknown argument "${arg}". Usage: bot live-test buy [--confirm-live]`);
+  }
+  if (!sawBuy) return FAIL('the "buy" subcommand is required');
+  return { ok: true, opts };
+}
+
+/**
  * Shared gate checks, run BEFORE any exchange contact. Returns the gates that
  * were evaluated; a caller refuses (exit 1) if any fails.
  */
@@ -167,6 +206,16 @@ function err(s: string): void {
   console.error(s);
 }
 
+/**
+ * The ONLY accepted interactive confirmation token. Extracted as a pure
+ * predicate so the exact-match rule is directly testable and cannot be silently
+ * loosened. Anything other than `EXECUTE` (case-insensitive, surrounding
+ * whitespace ignored) refuses the order.
+ */
+export function isExecuteConfirmation(answer: string): boolean {
+  return answer.trim().toUpperCase() === 'EXECUTE';
+}
+
 async function defaultConfirm(message: string): Promise<boolean> {
   if (!process.stdin.isTTY) {
     err('stdin is not a TTY; cannot confirm interactively. Refusing to continue.');
@@ -175,7 +224,7 @@ async function defaultConfirm(message: string): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   const answer = await new Promise<string>((resolve) => rl.question(message, resolve));
   rl.close();
-  return answer.trim().toUpperCase() === 'EXECUTE';
+  return isExecuteConfirmation(answer);
 }
 
 interface SummaryInputs {
@@ -625,12 +674,7 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
   // boundary. It is created before display so the exact order can be prepared
   // and shown, but it has no effect until `placeOrder` is reached inside the
   // locked submission path below. It is never persisted.
-  const controlledAuth = createControlledLiveAuthorization({
-    side: 'SELL',
-    type: 'limit',
-    maxBaseQuantity: Money.fromNumber(cfg.liveMaxBaseQuantity),
-    maxQuoteNotional: Money.fromNumber(cfg.liveMaxQuoteNotional),
-  });
+  const controlledAuth = mintControlledAuthorization('SELL', cfg);
 
   const engine = new LiveOrderEngine(adapter, deps.store, deps.reconcile, deps.riskManager, {
     gate: { tradingMode: 'live', realFundsAtRisk: cfg.realFundsAtRisk },
@@ -792,8 +836,458 @@ export function assertLiveRealmRecoverable(cfg: BotConfig): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Supervised one-shot LIVE BUY (`bot live-test buy`)
+//
+// The ONLY BUY path that can reach `SendOrder`, and only for a single
+// operator-confirmed BUY + LIMIT order. It reuses the SELL workflow's snapshot,
+// risk, reconciliation, authorization, persist-before-submit, mutation-lock,
+// TOCTOU and no-retry machinery, and adds: a BUY-readiness gate (fail closed),
+// a durable managed-CAD reservation, and BUY-specific display.
+// ---------------------------------------------------------------------------
+
+/**
+ * The SINGLE production call site that mints a controlled-live authorization.
+ * Kept as one helper so the boundary stays auditable and there is exactly one
+ * place capable of creating the mutation capability.
+ */
+function mintControlledAuthorization(side: 'SELL' | 'BUY', cfg: BotConfig) {
+  return createControlledLiveAuthorization({
+    side,
+    type: 'limit',
+    maxBaseQuantity: Money.fromNumber(cfg.liveMaxBaseQuantity),
+    maxQuoteNotional: Money.fromNumber(cfg.liveMaxQuoteNotional),
+  });
+}
+
+/** Unresolved (non-terminal) live-prefixed orders currently in the durable ledger. */
+function hasUnresolvedLiveOrder(store: OrderStore): boolean {
+  const unresolved = new Set(['CREATED', 'SUBMITTED', 'OPEN', 'PARTIALLY_FILLED', 'UNKNOWN']);
+  for (const o of store.allOrders().values()) {
+    if (o.clientOrderId.startsWith('live-') && unresolved.has(o.status)) return true;
+  }
+  return false;
+}
+
+/**
+ * Read-only observation: is there NO currently-actionable local/exchange order
+ * conflict that could make THIS controlled BUY unsafe?
+ *
+ * This COMPOSES the existing reconciliation findings (it does not re-implement
+ * reconciliation): a non-confirmed order finding (which includes a local order
+ * that disagrees with an exchange order tied to its owned exchangeOrderId) or an
+ * operator/cross-domain finding blocks. It does NOT attempt to prove a
+ * global/historical absence of every possible conflict, and it never uses
+ * heuristic clientOrderId ownership. Unresolved local live orders are checked
+ * separately by `noUnresolvedLiveOrder`. Reservation conflicts are NOT
+ * preflight-projected here: the current reconciliation classifier cannot produce
+ * an `AMBIGUOUS` reservation disposition, so rather than report a vacuous
+ * observation, reservation safety is enforced transactionally at submission (see
+ * `buildManagedQuoteReservation` + `Portfolio.reserveOrder`), and orphan
+ * reservations are surfaced as operator findings (blocked above via
+ * `reconciliation.operatorFindings`).
+ */
+function observesNoActionableOrderConflict(reconciliation: ReconciliationResult): boolean {
+  const confirmed = reconciliation.orderFindings.every(
+    (o) => o.disposition === 'CONFIRMED' || o.disposition === 'PARTIALLY_CONFIRMED',
+  );
+  if (!confirmed) return false;
+  if (reconciliation.operatorFindings.length > 0) return false;
+  return true;
+}
+
+interface BuyReadinessArgs {
+  deps: LiveTestDeps;
+  snapshot: LiveSnapshot;
+  ctx: RiskContext;
+  decision: RiskDecision;
+  gate: LivePreTradeGateResult;
+  reconciliation: ReconciliationResult;
+}
+
+/**
+ * Assemble the controlled-live BUY-readiness input.
+ *
+ * The STRUCTURAL_GUARANTEE controlled-placement facts come from
+ * `structuralPlacementGuarantees` (true by construction; the enforcement lives at
+ * the authorization/engine/adapter boundary). The READ_ONLY_VERIFIABLE facts come
+ * from the snapshot, risk decision, reconciliation and durable ledger just read.
+ * There is NO fabricated NDAX fact and NO `operatorConfirmed` field: the
+ * interactive EXECUTE confirmation happens AFTER this evaluation. Any unknown
+ * blocking condition fails closed. This runs BEFORE any authorization is minted.
+ */
+function buildBuyReadiness(args: BuyReadinessArgs): LiveBuyReadinessReport {
+  const { deps, snapshot, ctx, decision, gate, reconciliation } = args;
+  const market = snapshot.market;
+  const approved = decision.approved;
+  const quantity = approved ? decision.quantity : Money.zero();
+  const price = approved ? decision.price : null;
+  const deployable = ctx.deployableQuote ?? Money.zero();
+  const notional = price ? quantity.mul(price) : Money.zero();
+  const taker = market.feeInfo?.taker ?? 0;
+  const fee = taker > 0 ? fractionOfMoney(notional, taker) : Money.zero();
+  const required = notional.add(fee);
+
+  const [, quote] = snapshot.symbol.split('/');
+  const exchangeQuoteAvailable = snapshot.balances.find((b) => b.currency === quote)?.available ?? null;
+
+  const input: LiveBuyReadinessInput = {
+    ...structuralPlacementGuarantees(deps.adapter, deps.cfg),
+    tradingModeIsLive: deps.cfg.tradingMode === 'live',
+    realFundsAtRisk: deps.cfg.realFundsAtRisk,
+    killSwitchInactive: !deps.cfg.killSwitch,
+    authenticatedReadsEnabled: deps.cfg.enableAuthenticatedReads,
+    // Reaching this point means the snapshot and reconciliation reads succeeded.
+    authenticatedReadVerified: snapshot.market !== null && reconciliation.readFailures.length === 0,
+    snapshotFresh: snapshot.freshness.fresh,
+    portfolioValuationValid: ctx.portfolioValue !== null && ctx.portfolioExposure !== null,
+    reconciliationGateAllowed: gate.allowed,
+    noUnresolvedLiveOrder: !hasUnresolvedLiveOrder(deps.store),
+    currentExchangeOrderConflictClear: observesNoActionableOrderConflict(reconciliation),
+    riskApproved: approved,
+    orderQuantityValid:
+      approved &&
+      quantity.isPositive() &&
+      quantity.isMultipleOf(market.quantityTick) &&
+      (market.minOrderBase === null || quantity.compareTo(market.minOrderBase) >= 0),
+    referencePriceValid: price !== null && price.isPositive(),
+    exchangeQuoteSufficient:
+      approved && exchangeQuoteAvailable !== null && exchangeQuoteAvailable.compareTo(required) >= 0,
+    managedCashSufficient: approved && deployable.isPositive() && required.compareTo(deployable) <= 0,
+    feeCovered: approved && deployable.compareTo(required) >= 0,
+  };
+  return evaluateLiveBuyReadiness(input);
+}
+
+/**
+ * Build the durable managed-quote reservation hooks used INSIDE the engine's
+ * submission mutation lock (persist-before-submit). The reservation amount is
+ * the exact worst-case cost (limit notional + conservative taker fee). The hooks
+ * NEVER resize/reprice; they only reserve/release exactly the prepared order.
+ */
+export function buildManagedQuoteReservation(args: { live: ManagedStateStore; market: MarketInfo }): {
+  reserve: (order: NewOrder) => string | null;
+  release: (order: NewOrder) => void;
+} {
+  const estimateFee = (order: NewOrder): Money => {
+    const taker = args.market.feeInfo?.taker ?? 0;
+    if (taker <= 0) return Money.zero();
+    const notional = order.quantity.mul(order.price ?? Money.zero());
+    return fractionOfMoney(notional, taker);
+  };
+
+  const reserve = (order: NewOrder): string | null => {
+    const r = args.live.load();
+    if (r.status === 'CORRUPT') return `live managed state is corrupt (${r.reason})`;
+    if (r.status === 'MISSING') return 'live managed state is missing at submission time (unexpected state loss)';
+    const portfolio = args.live.toPortfolio(r.data);
+    if (!portfolio) return 'live managed state could not be reconstructed at submission time';
+    const quote = order.symbol.split('/')[1] ?? '';
+    const cost = order.quantity.mul(order.price ?? Money.zero()).add(estimateFee(order));
+    try {
+      const next = portfolio.reserveOrder(order.clientOrderId, quote, cost);
+      args.live.save(next.stateModel);
+    } catch (e) {
+      return `could not reserve managed ${quote} for ${order.clientOrderId}: ${e instanceof Error ? e.message : String(e)}`;
+    }
+    return null;
+  };
+
+  const release = (order: NewOrder): void => {
+    const r = args.live.load();
+    if (r.status !== 'OK') return;
+    const portfolio = args.live.toPortfolio(r.data);
+    if (!portfolio) return;
+    try {
+      const next = portfolio.releaseOrderReservation(order.clientOrderId);
+      args.live.save(next.stateModel);
+    } catch {
+      // Best-effort idempotent release; a failure leaves the reservation for the
+      // operator/reconciliation path rather than guessing.
+    }
+  };
+
+  return { reserve, release };
+}
+
+interface BuySummaryInputs {
+  symbol: string;
+  ticker: Ticker;
+  market: MarketInfo;
+  balances: Balance[];
+  observedAtMs: number;
+  quoteTs: number | null;
+  freshness: ReturnType<typeof evaluateFreshness>;
+  targetCap: Money;
+  decision: RiskDecision;
+  reconciliation: ReconciliationResult;
+  gate: LivePreTradeGateResult;
+  gates: RefreshGate[];
+  readiness: LiveBuyReadinessReport;
+  managedDeployable: Money | null;
+  prepared?: PreparedLiveOrder | null;
+}
+
+function printBuySummary(i: BuySummaryInputs, riskCfg: SummaryRiskPolicy): void {
+  // eslint-disable-next-line no-console
+  const out = (s: string) => console.log(s);
+  const [base, quote] = i.symbol.split('/');
+  const quoteBal = i.balances.find((b) => b.currency === quote);
+  const baseBal = i.balances.find((b) => b.currency === base);
+
+  out('LIVE TEST BUY — supervised controlled LIMIT (NO order placed unless confirmed below)');
+  out('  SIDE:                     BUY');
+  out('  TYPE:                     LIMIT');
+  out('  SYMBOL:                   ' + i.symbol);
+  out('  Current bid:              ' + money(i.ticker.bid));
+  out('  Current ask:              ' + money(i.ticker.ask));
+  out('  MANAGED/DEPLOYABLE CAD:   ' + money(i.managedDeployable));
+  out('  Exchange quote available: ' + money(quoteBal ? quoteBal.available : null));
+  out('  CURRENT BTC:              ' + money(baseBal ? baseBal.available : null));
+  out('  Max live quote notional:  ' + i.targetCap.toString());
+
+  if (i.decision.approved) {
+    const fee = fractionOfMoney(i.decision.estimatedNotional, i.market.feeInfo?.taker ?? 0);
+    const required = i.decision.estimatedNotional.add(fee);
+    out('  Risk-approved quantity:   ' + i.decision.quantity.toString());
+    out('  Limit price (exact):      ' + money(i.decision.price));
+    out('  NOTIONAL (exact):         ' + money(i.decision.estimatedNotional));
+    out('  ESTIMATED FEE:            ' + money(fee));
+    out('  TOTAL CAD REQUIRED:       ' + money(required));
+    if (i.managedDeployable) {
+      out('  EXPECTED REMAINING CAD:   ' + money(i.managedDeployable.sub(required).isNegative() ? Money.zero() : i.managedDeployable.sub(required)));
+    }
+    if (baseBal) {
+      out('  EXPECTED BTC AFTER BUY:   ' + money(baseBal.available.add(i.decision.quantity)));
+    }
+    if (i.prepared) {
+      const o = i.prepared.order;
+      out('  Exact order to submit:');
+      out('    side:                   ' + o.side);
+      out('    type:                   LIMIT');
+      out('    quantity:               ' + o.quantity.toString() + ' ' + base);
+      out('    limit price:            ' + money(o.price) + ' ' + quote);
+      out('    time in force:          ' + (o.tif ?? 'GTC (default)'));
+    }
+  } else {
+    out('  Risk decision:            REJECTED — ' + i.decision.reason + (i.decision.detail ? ': ' + i.decision.detail : ''));
+  }
+
+  out('  Market-data freshness:    ' + (i.freshness.fresh ? 'FRESH' : `FAILED (${i.freshness.reason})`));
+  out('    chosen quote ts:        ' + (i.quoteTs === null ? 'n/a' : String(i.quoteTs)));
+  out('    observed at ts:         ' + i.observedAtMs);
+  out('    quote age:              ' + (i.quoteTs === null ? 'n/a' : String(Math.max(0, i.observedAtMs - i.quoteTs))) + 'ms (limit ' + riskCfg.marketDataMaxAgeMs + 'ms)');
+  out('  Reconciliation (V1):      ' + i.reconciliation.status + '  pre-trade(BUY): ' + (i.gate.allowed ? 'ALLOWED' : 'BLOCKED'));
+  out('  BUY READINESS:            ' + i.readiness.verdict);
+  for (const c of i.readiness.conditions) {
+    if (c.blocking && c.status !== 'PASS') out('    [block] ' + c.id + ' (' + c.detail + ')');
+  }
+  if (i.readiness.liveBuyAllowed) {
+    out('    [ok] structural guarantees (by construction, not runtime observations): side-scoped LIMIT-only');
+    out('         single-use authorization, positive caps, general placement stays false, adapter honors the exception');
+    out('    [ok] safety compensation active: transactional managed-CAD reservation, persist-before-submit,');
+    out('         UNKNOWN blocks + retains reservation, no retry/reprice');
+    out('    [note] first controlled real BUY evidence is pending until the BUY executes (never blocks)');
+  }
+  for (const b of i.gate.blockers) out('    [block] ' + b);
+  out('  Gates (pre-contact):');
+  for (const g of i.gates) out('    [' + (g.passed ? 'PASS' : 'FAIL') + '] ' + g.label + ' (' + g.detail + ')');
+}
+
+/**
+ * Execute the supervised one-shot LIVE BUY. Returns a process exit code
+ * (0 = clean acknowledged lifecycle; 1 = refused / rejected / ambiguous /
+ * unconfirmed / not ready). Never performs a real order in tests (FakeExchange).
+ */
+export async function executeLiveBuy(deps: LiveTestDeps, opts: LiveBuyOptions): Promise<number> {
+  const cfg = deps.cfg;
+  const adapter = deps.adapter;
+  const now = deps.nowMs ?? Date.now;
+
+  // 1. Pre-contact gates (side-independent). Fails closed before any exchange
+  // call; `targetCad` is unused for BUY (no size injection).
+  const gates = evaluateGates(cfg, { confirmLive: opts.confirmLive, targetCad: 0 }, adapter);
+  for (const g of gates) {
+    if (!g.passed) {
+      err('live-test buy refused: ' + g.label + ' — ' + g.detail);
+      return 1;
+    }
+  }
+
+  const symbol = cfg.tradingPairs[0]!;
+  const [base, quote] = symbol.split('/');
+  const reason = 'live-test BUY (controlled LIMIT, operator-confirmed)';
+  const policy: FreshnessPolicy = {
+    maxQuoteAgeMs: cfg.marketDataMaxAgeMs,
+    maxTransportAgeMs: cfg.marketDataTransportMaxAgeMs,
+    maxAcceptableFutureSkewMs: cfg.maxClockSkewMs,
+  };
+
+  // 2. The ONE market/account snapshot (S1) used for the exact prepared order.
+  let initial: LiveSnapshot;
+  try {
+    initial = await fetchLiveSnapshot({ adapter, nowMs: now, policy }, symbol);
+  } catch (e) {
+    err('live-test buy aborted: ' + (e instanceof Error ? e.message : String(e)));
+    return 1;
+  }
+
+  // 3. Managed-only BUY risk context (deployable quote bounded by the exchange).
+  const displayCtx = buildLiveRiskContext({
+    snapshot: initial,
+    portfolio: deps.portfolio,
+    symbol,
+    side: 'BUY',
+    reason,
+    sellTarget: null,
+    managedValuation: await fetchManagedValuation(adapter, deps.portfolio, symbol, now),
+    freshnessPolicy: policy,
+  });
+  const decision = deps.riskManager.evaluate(displayCtx);
+
+  // 4. Authoritative V1 reconciliation (READ-ONLY) + BUY projection.
+  let reconciliation: ReconciliationResult;
+  try {
+    reconciliation = await reconcile({
+      stateDir: cfg.stateDir ?? dirname(cfg.liveManagedStateFile),
+      orders: deps.store,
+      live: deps.live,
+      manualIntents: deps.manualIntents,
+      adapter,
+      nowMs: now,
+    });
+  } catch (e) {
+    err('live-test buy aborted: reconciliation failed: ' + (e instanceof Error ? e.message : String(e)));
+    return 1;
+  }
+  const quoteCurrencies = new Set(cfg.tradingPairs.map((p) => p.split('/')[1] ?? ''));
+  const managedQuoteDeployable = displayCtx.deployableQuote ?? null;
+  const gate = livePreTradeGate(reconciliation, {
+    side: 'BUY',
+    symbol,
+    quoteCurrencies,
+    ...(managedQuoteDeployable ? { managedQuoteDeployable } : {}),
+  });
+
+  // 5. BUY readiness MUST pass before an authorization is minted. All blocking
+  // conditions are genuinely verifiable; the fundamentally-unprovable NDAX
+  // properties are handled by active compensating controls and never block.
+  const readiness = buildBuyReadiness({ deps, snapshot: initial, ctx: displayCtx, decision, gate, reconciliation });
+  const summary: BuySummaryInputs = {
+    symbol,
+    ticker: initial.ticker,
+    market: initial.market,
+    balances: initial.balances,
+    observedAtMs: initial.observedAtMs,
+    quoteTs: initial.quoteTs,
+    freshness: initial.freshness,
+    targetCap: Money.fromNumber(cfg.liveMaxQuoteNotional),
+    decision,
+    reconciliation,
+    gate,
+    gates,
+    readiness,
+    managedDeployable: managedQuoteDeployable,
+  };
+
+  if (!decision.approved) {
+    printBuySummary(summary, cfg);
+    err('\nlive-test buy refused: risk decision not approved (' + decision.reason + '). No order placed.');
+    return 1;
+  }
+  if (!gate.allowed) {
+    printBuySummary(summary, cfg);
+    err(
+      '\nlive-test buy refused: BUY pre-trade reconciliation blocked this order.\n  ' +
+        gate.blockers.join('\n  ') +
+        '\n  External/unmanaged CAD is NEVER deployed by the bot. Run `bot reconcile` and resolve the blocking findings before any order.',
+    );
+    return 1;
+  }
+  if (!readiness.liveBuyAllowed) {
+    printBuySummary(summary, cfg);
+    err(
+      '\nlive-test buy refused: BUY readiness NOT established (fail closed). Blockers: ' +
+        readiness.blockers.join(', ') +
+        '.\n  Do NOT bypass this gate. Resolve the blocking conditions, then re-run.',
+    );
+    return 1;
+  }
+
+  // 6. Mint the single-use BUY authorization and construct the engine.
+  const reservation = buildManagedQuoteReservation({ live: deps.live, market: initial.market });
+  const engine = new LiveOrderEngine(adapter, deps.store, deps.reconcile, deps.riskManager, {
+    gate: { tradingMode: 'live', realFundsAtRisk: cfg.realFundsAtRisk },
+    killSwitch: cfg.killSwitch,
+    maxLiveQuoteNotional: Money.fromNumber(cfg.liveMaxQuoteNotional),
+    maxLiveBaseQuantity: Money.fromNumber(cfg.liveMaxBaseQuantity),
+    controlledLiveAuthorization: mintControlledAuthorization('BUY', cfg),
+    managedOrderGuard: buildManagedOrderGuard(deps.live),
+    reserveManagedQuote: reservation.reserve,
+    releaseManagedQuote: reservation.release,
+  });
+
+  // 7. Prepare the EXACT immutable order from S1 (ask = hard BUY bound).
+  const intent: LiveOrderIntent = { reason, type: 'limit', price: displayCtx.price ?? undefined };
+  let prepared: PreparedLiveOrder;
+  try {
+    prepared = engine.prepare(displayCtx, intent);
+  } catch (e) {
+    printBuySummary(summary, cfg);
+    err('\nlive-test buy refused: could not prepare the exact order (' + (e instanceof Error ? e.message : String(e)) + '). No order placed.');
+    return 1;
+  }
+  printBuySummary({ ...summary, prepared }, cfg);
+
+  const prompt =
+    '\nThis will submit a LIMIT BUY on the LIVE ' + cfg.exchange.toUpperCase() + ' account:\n' +
+    '  SIDE:          BUY\n' +
+    '  TYPE:          LIMIT\n' +
+    '  symbol:        ' + prepared.order.symbol + '\n' +
+    '  quantity:      ' + prepared.order.quantity.toString() + ' ' + base + '\n' +
+    '  limit price:   ' + money(prepared.order.price) + ' ' + quote + '\n' +
+    '  notional:      ' + money(prepared.approval.estimatedNotional) + ' ' + quote + '\n' +
+    '  time in force: ' + (prepared.order.tif ?? 'GTC (default)') + '\n' +
+    'Type EXECUTE and press Enter to place this EXACT order, or anything else to abort.\n> ';
+  const confirmed = deps.confirm ? await deps.confirm(prompt) : await defaultConfirm(prompt);
+  if (!confirmed) {
+    err('live-test buy aborted: not confirmed. No order was placed.');
+    return 1;
+  }
+
+  // 8. Submit the exact prepared order. Freshness/TOCTOU are re-checked; the
+  // reservation is persisted INSIDE the submission lock before SendOrder.
+  const confirmCtx: RiskContext = { ...displayCtx, nowMs: now() };
+  const result = await engine.placePrepared(confirmCtx, prepared);
+
+  if (result.order.status === 'REJECTED') {
+    err('\nlive-test buy: order rejected by the exchange/live engine: ' + result.message + '\n  No retry. Reservation released. Run `bot reconcile` / `bot trades` if needed.');
+    return 1;
+  }
+  if (result.unknownOutcome || result.order.status === 'UNKNOWN') {
+    err('\nlive-test buy: submission outcome UNKNOWN (' + result.message + ').\n  The order may have been accepted; the managed-CAD reservation REMAINS active. Do NOT retry.\n  Run `bot reconcile` to confirm before anything else.');
+    return 1;
+  }
+
+  // 9. Read-only post-submit observation. ACCEPTED != FILLED.
+  try {
+    const authoritative = await engine.refreshOrder(result.order);
+    await adapter.getOpenOrders(symbol);
+    await deps.reconcile.reconcile();
+    // eslint-disable-next-line no-console
+    console.log('\nlive-test buy: order acknowledged. exchange order id=' + (authoritative.exchangeOrderId ?? 'n/a') + ' authoritative status=' + authoritative.status);
+  } catch (e) {
+    err('\nlive-test buy: order was accepted (no retry) but lifecycle confirmation failed (' + (e instanceof Error ? e.message : String(e)) + ').\n  Run `bot reconcile` to confirm the final state.');
+    return 1;
+  }
+  // eslint-disable-next-line no-console
+  console.log('\nlive-test buy complete. ACCEPTED != FILLED — confirm the final fill via `bot reconcile` / `bot trades`.');
+  return 0;
+}
+
 export const liveTestCommand: CommandHandler = async (args): Promise<number> => {
-  const parsed = parseLiveTestArgs(args);
+  const isBuy = args[0] === 'buy';
+  const parsed = isBuy ? parseLiveTestBuyArgs(args) : parseLiveTestArgs(args);
   if (!parsed.ok) {
     err('live-test: ' + parsed.error);
     return 1;
@@ -834,17 +1328,19 @@ export const liveTestCommand: CommandHandler = async (args): Promise<number> => 
 
   const livePortfolio = loadLiveManagedPortfolio(cfg);
 
-  return executeLiveTest(
-    {
-      cfg,
-      adapter,
-      store,
-      live: liveStore,
-      manualIntents,
-      reconcile: service,
-      riskManager: buildRiskManager(cfg),
-      portfolio: livePortfolio,
-    },
-    opts,
-  );
+  const deps: LiveTestDeps = {
+    cfg,
+    adapter,
+    store,
+    live: liveStore,
+    manualIntents,
+    reconcile: service,
+    riskManager: buildRiskManager(cfg),
+    portfolio: livePortfolio,
+  };
+
+  if (isBuy) {
+    return executeLiveBuy(deps, opts as LiveBuyOptions);
+  }
+  return executeLiveTest(deps, opts as LiveTestOptions);
 };

@@ -115,6 +115,28 @@ export interface LiveExecutionConfig {
    * submission closed.
    */
   managedOrderGuard?: ManagedOrderGuard;
+  /**
+   * Optional BUY-only hook that DURABLY reserves the managed quote required by
+   * this exact order. It runs INSIDE the submission mutation lock, AFTER the
+   * unresolved-order guard, validation, managed-state guard and duplicate check,
+   * and BEFORE the durable `CREATED` persistence and any exchange contact — so
+   * the funds reservation is always persisted before NDAX can receive the order.
+   *
+   * It must return `null` on success, or a fail-closed reason string when the
+   * funds cannot be reserved (nothing is submitted). A thrown error is treated
+   * as a refusal as well. It MUST NOT resize, reprice, replace, or rebuild the
+   * order. When absent, no reservation is performed (SELL does not need one).
+   */
+  reserveManagedQuote?: (order: NewOrder) => string | null;
+  /**
+   * Optional BUY-only hook that RELEASES a reservation made by
+   * {@link reserveManagedQuote} after a DEFINITE failure only: a pre-submission
+   * refusal (validation/guard/duplicate/reserve failure) or a definite exchange
+   * rejection. It is NEVER called for an UNKNOWN/ambiguous outcome — the
+   * reservation must remain ACTIVE until the order's fate is proven. It must be
+   * idempotent (releasing a non-ACTIVE reservation is a safe no-op).
+   */
+  releaseManagedQuote?: (order: NewOrder) => void;
 }
 
 /**
@@ -495,8 +517,40 @@ export class LiveOrderEngine {
           message: 'refused: duplicate clientOrderId',
         };
       }
+
+      // BUY funds reservation (persist-before-submit): reserve the exact managed
+      // quote this order will spend and persist it BEFORE the CREATED record and
+      // before any exchange contact. A reservation failure (or throw) fails the
+      // submission closed with no exchange contact; `CREATED` is only persisted
+      // once the funds are durably committed. SELL orders pass no hook.
+      let reserved = false;
+      if (this.cfg.reserveManagedQuote && order.side === 'BUY') {
+        let block: string | null = null;
+        try {
+          block = this.cfg.reserveManagedQuote(order);
+        } catch (err) {
+          block = `managed-quote reservation failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        if (block) {
+          this.cfg.releaseManagedQuote?.(order);
+          return {
+            order: this.buildRejected(order, block),
+            unknownOutcome: false,
+            message: `refused: ${block}`,
+          };
+        }
+        reserved = true;
+      }
+
       const created = this.buildRecorded(order, 'CREATED');
-      this.store.save(created);
+      try {
+        this.store.save(created);
+      } catch (err) {
+        // Persistence of the durable intent failed AFTER reserving: do not
+        // contact the exchange, and do not leave the funds reserved.
+        if (reserved) this.cfg.releaseManagedQuote?.(order);
+        throw err;
+      }
 
       try {
         const result = await this.withAckTimeout(order, this.adapter.placeOrder(order, this.cfg.controlledLiveAuthorization));
@@ -806,7 +860,10 @@ export class LiveOrderEngine {
       };
     }
     if (err instanceof OrderRejectedError) {
-      // DEFINITE rejection — safe to mark rejected; no retry.
+      // DEFINITE rejection — safe to mark rejected and RELEASE the reserved
+      // managed quote; no retry. (An UNKNOWN outcome above deliberately keeps the
+      // reservation ACTIVE because the order may exist.)
+      if (order.side === 'BUY') this.cfg.releaseManagedQuote?.(order);
       const rejected = this.buildRejected(order, err.message);
       this.store.save(rejected);
       return { order: rejected, unknownOutcome: false, message: `order rejected: ${err.message}` };

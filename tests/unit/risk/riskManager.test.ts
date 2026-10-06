@@ -756,6 +756,31 @@ describe('RiskManager — maxOpenPositions', () => {
     expect(d.approved).toBe(true);
   });
 
+  it('allows a BUY that ADDS to an already-managed symbol at max open positions', () => {
+    // Same symbol already managed (positive position): this is not a NEW position.
+    // Still bounded by the position cap (10% of 100k = 0.25 BTC; held 0.125 -> 0.125).
+    const d = mk().evaluate(
+      ctx('BUY', { openManagedPositionCount: 1, currentPosition: Money.fromString('0.125') }),
+    );
+    expect(d.approved).toBe(true);
+    if (d.approved) expect(d.quantity.toFixed(8)).toBe('0.12500000');
+  });
+
+  it('allows adding to a managed symbol even when the count is over the limit', () => {
+    const d = mk().evaluate(
+      ctx('BUY', { openManagedPositionCount: 5, currentPosition: Money.fromString('0.01') }),
+    );
+    expect(d.approved).toBe(true);
+  });
+
+  it('still rejects a BUY that would OPEN a new symbol at max open positions', () => {
+    const d = mk().evaluate(
+      ctx('BUY', { openManagedPositionCount: 1, currentPosition: Money.zero(), externalPosition: Money.fromString('1') }),
+    );
+    expect(d.approved).toBe(false);
+    if (!d.approved) expect(d.reason).toBe('MAX_OPEN_POSITIONS');
+  });
+
   it('still permits a risk-reducing SELL at max open positions', () => {
     const d = mk().evaluate(
       ctx('SELL', { currentPosition: Money.fromString('0.25'), openManagedPositionCount: 1 }),

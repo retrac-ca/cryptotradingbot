@@ -234,6 +234,31 @@ describe('P2-2 — SUBMITTED + null exchangeOrderId is fail-closed and operator-
   });
 });
 
+describe('P2-2 — UNKNOWN + null exchangeOrderId is fail-closed and operator-resolved only', () => {
+  it('a durable UNKNOWN live order with null exchangeOrderId blocks new LIVE placement', async () => {
+    const ledger = statePath('p22-unknown-guard', 'ledger.json');
+    const fake = new FakeExchange({ balances: { CAD: '100000' }, markets: { [SYMBOL]: market } });
+    const engine = buildEngine(fake, ledger);
+    new OrderStore(ledger).save(order({ status: 'UNKNOWN', exchangeOrderId: null }));
+
+    await expect(
+      engine.place(riskContext(), { reason: 'blocked', type: 'limit', price: Money.fromString('40000') }),
+    ).rejects.toThrow(/unresolved LIVE order/);
+    expect(fake.submittedOrders).toHaveLength(0);
+  });
+
+  it('recoverOrder cannot auto-resolve an UNKNOWN + null order (stays, no retry)', async () => {
+    const ledger = statePath('p22-unknown-recover', 'ledger.json');
+    const fake = new FakeExchange({ balances: { CAD: '100000' }, markets: { [SYMBOL]: market } });
+    const engine = buildEngine(fake, ledger);
+    const res = await engine.recoverOrder(order({ status: 'UNKNOWN', exchangeOrderId: null }));
+    expect(res.outcome).toBe('UNRESOLVED');
+    expect(res.order.status).toBe('UNKNOWN');
+    expect(res.order.exchangeOrderId).toBeNull();
+    expect(fake.submittedOrders).toHaveLength(0);
+  });
+});
+
 describe('P2-2 — ABANDONED is terminal and durable', () => {
   it('recoverState treats an ABANDONED order as terminal (READY, not unresolved)', () => {
     const ledger = statePath('p22-abandon', 'ledger.json');
