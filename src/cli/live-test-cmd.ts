@@ -155,14 +155,26 @@ export function parseLiveTestArgs(args: string[]): { ok: true; opts: LiveTestOpt
 export interface LiveBuyOptions {
   /** Operator acknowledged this is a real live trade. */
   confirmLive: boolean;
+  /**
+   * READ-ONLY preflight mode. When true the command runs the SAME BUY preflight
+   * (pre-contact gates, snapshot, managed-only risk context, reconciliation,
+   * action-aware pre-trade gate, BUY readiness) and prints
+   * `BUY PREFLIGHT: READY|BLOCKED`, but stops BEFORE minting a controlled-live
+   * authorization, preparing/serializing an order, prompting for `EXECUTE`,
+   * reserving funds, persisting an order/reservation, or contacting order
+   * placement. It may perform the same authenticated READ-ONLY exchange reads
+   * the real BUY does. `--check` does NOT require `--confirm-live`.
+   */
+  check?: boolean;
 }
 
 /**
- * Parse `bot live-test buy [--confirm-live]`. Rejects any quantity/price/size
- * injection so a caller cannot smuggle an arbitrary order past risk sizing.
+ * Parse `bot live-test buy [--check] [--confirm-live]`. Rejects any
+ * quantity/price/size injection so a caller cannot smuggle an arbitrary order
+ * past risk sizing.
  */
 export function parseLiveTestBuyArgs(args: string[]): { ok: true; opts: LiveBuyOptions } | { ok: false; error: string } {
-  const opts: LiveBuyOptions = { confirmLive: false };
+  const opts: LiveBuyOptions = { confirmLive: false, check: false };
   let sawBuy = false;
   for (const arg of args) {
     if (arg === 'buy') {
@@ -174,7 +186,11 @@ export function parseLiveTestBuyArgs(args: string[]): { ok: true; opts: LiveBuyO
       opts.confirmLive = true;
       continue;
     }
-    return FAIL(`unknown argument "${arg}". Usage: bot live-test buy [--confirm-live]`);
+    if (arg === '--check') {
+      opts.check = true;
+      continue;
+    }
+    return FAIL(`unknown argument "${arg}". Usage: bot live-test buy [--check] [--confirm-live]`);
   }
   if (!sawBuy) return FAIL('the "buy" subcommand is required');
   return { ok: true, opts };
@@ -183,13 +199,25 @@ export function parseLiveTestBuyArgs(args: string[]): { ok: true; opts: LiveBuyO
 /**
  * Shared gate checks, run BEFORE any exchange contact. Returns the gates that
  * were evaluated; a caller refuses (exit 1) if any fails.
+ *
+ * `requireConfirmLive` defaults to true. The READ-ONLY `live-test buy --check`
+ * preflight passes false: the interactive `--confirm-live` acknowledgement is a
+ * later human step of the real BUY and is never performed by `--check`, so it
+ * must not be a preflight blocker (it is reported as informational instead).
  */
-function evaluateGates(cfg: BotConfig, opts: LiveTestOptions, adapter: ExchangeAdapter): RefreshGate[] {
+function evaluateGates(
+  cfg: BotConfig,
+  opts: LiveTestOptions,
+  adapter: ExchangeAdapter,
+  requireConfirmLive = true,
+): RefreshGate[] {
   return [
     { label: 'trading mode is "live"', passed: cfg.tradingMode === 'live', detail: `mode=${cfg.tradingMode}` },
     { label: 'REAL_FUNDS_AT_RISK acknowledged', passed: cfg.realFundsAtRisk, detail: 'must be true' },
     { label: 'kill switch OFF', passed: !cfg.killSwitch, detail: 'must be false' },
-    { label: '--confirm-live given', passed: opts.confirmLive, detail: 'required flag' },
+    ...(requireConfirmLive
+      ? [{ label: '--confirm-live given', passed: opts.confirmLive, detail: 'required flag' }]
+      : []),
     { label: 'authenticated reads enabled', passed: cfg.enableAuthenticatedReads, detail: 'must be true' },
     { label: 'exactly one trading pair', passed: cfg.tradingPairs.length === 1, detail: `pairs=${cfg.tradingPairs.length}` },
     {
@@ -1094,23 +1122,107 @@ function printBuySummary(i: BuySummaryInputs, riskCfg: SummaryRiskPolicy): void 
   for (const g of i.gates) out('    [' + (g.passed ? 'PASS' : 'FAIL') + '] ' + g.label + ' (' + g.detail + ')');
 }
 
+interface BuyCheckInputs {
+  checkReady: boolean;
+  decision: RiskDecision;
+  gate: LivePreTradeGateResult;
+  readiness: LiveBuyReadinessReport;
+  reconciliation: ReconciliationResult;
+  gates: RefreshGate[];
+}
+
+/**
+ * Print the READ-ONLY `live-test buy --check` verdict, explicitly separating
+ * BLOCKING failures from informational findings and from the compensating
+ * controls / permanent limitations. The final line is exactly
+ * `BUY PREFLIGHT: READY` or `BUY PREFLIGHT: BLOCKED`. This is presentation
+ * only: no authorization is minted, nothing is prepared/reserved/persisted, and
+ * the caller returns before confirmation/submission.
+ */
+function printCheckVerdict(ready: boolean): void {
+  // eslint-disable-next-line no-console
+  console.log('BUY PREFLIGHT: ' + (ready ? 'READY' : 'BLOCKED'));
+}
+
+function printBuyCheck(i: BuyCheckInputs): void {
+  // eslint-disable-next-line no-console
+  const out = (s: string) => console.log(s);
+  out('');
+  out('BUY PREFLIGHT (read-only --check)');
+
+  const blocks: string[] = [];
+  if (!i.decision.approved) {
+    blocks.push('risk decision not approved: ' + i.decision.reason + (i.decision.detail ? ': ' + i.decision.detail : ''));
+  }
+  for (const b of i.gate.blockers) blocks.push('reconciliation: ' + b);
+  for (const c of i.readiness.conditions) {
+    if (c.blocking && c.status !== 'PASS') blocks.push('readiness ' + c.id + ': ' + c.detail);
+  }
+  for (const g of i.gates) {
+    if (!g.passed) blocks.push('pre-contact gate ' + g.label + ' (' + g.detail + ')');
+  }
+
+  out('  BLOCKING failures:');
+  if (blocks.length === 0) out('    [none]');
+  else for (const b of blocks) out('    [block] ' + b);
+
+  const uncorrelated = i.reconciliation.executionFindings.filter((e) => e.correlation === 'UNCORRELATED').length;
+  const ambiguous = i.reconciliation.executionFindings.filter(
+    (e) => e.correlation === 'AMBIGUOUS' || e.correlation === 'STRONG_BUT_NOT_PROVEN',
+  ).length;
+  out('  Informational findings:');
+  out('    [info] reconciliation status: ' + i.reconciliation.status);
+  out('    [info] historical UNCORRELATED executions: ' + uncorrelated + ' (informational; do NOT block BUY/SELL)');
+  out('    [info] unresolved/ambiguous executions (blocking if present): ' + ambiguous);
+  out('    [info] operator interactive EXECUTE confirmation is required for the real BUY and is intentionally not performed by --check');
+
+  out('  Compensating controls / permanent limitations (never block):');
+  for (const c of i.readiness.conditions) {
+    if (c.category === 'SAFETY_COMPENSATION' || c.category === 'FUNDAMENTALLY_UNPROVABLE') {
+      out('    [' + c.status + '] ' + c.id);
+    }
+  }
+  out('    [note] a documented real BUY lifecycle (fold/fill observation) remains pending until the first BUY executes');
+
+  out('');
+  printCheckVerdict(i.checkReady);
+}
+
 /**
  * Execute the supervised one-shot LIVE BUY. Returns a process exit code
  * (0 = clean acknowledged lifecycle; 1 = refused / rejected / ambiguous /
  * unconfirmed / not ready). Never performs a real order in tests (FakeExchange).
+ *
+ * With `opts.check === true` this instead runs ONLY the READ-ONLY preflight and
+ * returns 0 (READY) / 1 (BLOCKED) before minting an authorization, preparing an
+ * order, prompting for EXECUTE, reserving funds, persisting anything, or
+ * contacting order placement.
  */
 export async function executeLiveBuy(deps: LiveTestDeps, opts: LiveBuyOptions): Promise<number> {
   const cfg = deps.cfg;
   const adapter = deps.adapter;
   const now = deps.nowMs ?? Date.now;
+  const check = opts.check === true;
 
   // 1. Pre-contact gates (side-independent). Fails closed before any exchange
-  // call; `targetCad` is unused for BUY (no size injection).
-  const gates = evaluateGates(cfg, { confirmLive: opts.confirmLive, targetCad: 0 }, adapter);
-  for (const g of gates) {
-    if (!g.passed) {
-      err('live-test buy refused: ' + g.label + ' — ' + g.detail);
+  // call; `targetCad` is unused for BUY (no size injection). In --check mode the
+  // interactive `--confirm-live` gate is intentionally NOT required: --check is a
+  // read-only preflight that never submits, and confirmation is a later human
+  // step of the real BUY.
+  const gates = evaluateGates(cfg, { confirmLive: opts.confirmLive, targetCad: 0 }, adapter, !check);
+  if (check) {
+    const failedGates = gates.filter((g) => !g.passed);
+    if (failedGates.length > 0) {
+      for (const g of failedGates) err('[block] pre-contact gate: ' + g.label + ' (' + g.detail + ')');
+      printCheckVerdict(false);
       return 1;
+    }
+  } else {
+    for (const g of gates) {
+      if (!g.passed) {
+        err('live-test buy refused: ' + g.label + ' — ' + g.detail);
+        return 1;
+      }
     }
   }
 
@@ -1128,7 +1240,13 @@ export async function executeLiveBuy(deps: LiveTestDeps, opts: LiveBuyOptions): 
   try {
     initial = await fetchLiveSnapshot({ adapter, nowMs: now, policy }, symbol);
   } catch (e) {
-    err('live-test buy aborted: ' + (e instanceof Error ? e.message : String(e)));
+    const message = e instanceof Error ? e.message : String(e);
+    if (check) {
+      err('[block] snapshot: ' + message);
+      printCheckVerdict(false);
+      return 1;
+    }
+    err('live-test buy aborted: ' + message);
     return 1;
   }
 
@@ -1157,7 +1275,13 @@ export async function executeLiveBuy(deps: LiveTestDeps, opts: LiveBuyOptions): 
       nowMs: now,
     });
   } catch (e) {
-    err('live-test buy aborted: reconciliation failed: ' + (e instanceof Error ? e.message : String(e)));
+    const message = e instanceof Error ? e.message : String(e);
+    if (check) {
+      err('[block] reconciliation: ' + message);
+      printCheckVerdict(false);
+      return 1;
+    }
+    err('live-test buy aborted: reconciliation failed: ' + message);
     return 1;
   }
   const quoteCurrencies = new Set(cfg.tradingPairs.map((p) => p.split('/')[1] ?? ''));
@@ -1189,6 +1313,18 @@ export async function executeLiveBuy(deps: LiveTestDeps, opts: LiveBuyOptions): 
     readiness,
     managedDeployable: managedQuoteDeployable,
   };
+
+  // READ-ONLY --check: the SAME preflight has now run (gates, snapshot,
+  // managed-only risk context, reconciliation, action-aware gate, readiness).
+  // Stop here — before minting an authorization, constructing the engine,
+  // preparing/reserving/persisting an order, prompting for EXECUTE, or any
+  // order-placement contact.
+  if (check) {
+    const checkReady = decision.approved && gate.allowed && readiness.liveBuyAllowed;
+    printBuySummary(summary, cfg);
+    printBuyCheck({ checkReady, decision, gate, readiness, reconciliation, gates });
+    return checkReady ? 0 : 1;
+  }
 
   if (!decision.approved) {
     printBuySummary(summary, cfg);

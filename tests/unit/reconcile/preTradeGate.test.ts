@@ -1,5 +1,5 @@
 /**
- * P2-1 — action-aware pre-trade gate projection.
+ * P2-1 / B1 — action-aware pre-trade gate projection.
  *
  * These tests exercise the PURE `livePreTradeGate` against the real V1
  * `ReconciliationResult` type. They prove the action-aware semantics:
@@ -7,7 +7,12 @@
  *     unrelated-asset drift, but blocked on the sold base asset;
  *   - all global unresolved findings (orders/executions/reservations/operator/
  *     cross-domain/read-failure/HALTED) block;
- *   - a BUY never treats the exchange quote total as managed cash.
+ *   - UNCORRELATED (historical/external) executions are informational and block
+ *     NEITHER side (B1, side-independent): a BUY is allowed when UNCORRELATED is
+ *     the only attribution finding, while AMBIGUOUS / STRONG_BUT_NOT_PROVEN /
+ *     unsafe-fee PROVEN executions still block;
+ *   - a BUY never treats the exchange quote total as managed cash and still
+ *     requires strict managed-CAD protection (quote mismatch / zero deployable).
  */
 
 import { describe, expect, it } from 'vitest';
@@ -220,7 +225,7 @@ describe('P2-1 livePreTradeGate — global hard blocks', () => {
   });
 });
 
-describe('P2-1 livePreTradeGate — BUY semantics (not reachable; must stay safe)', () => {
+describe('P2-1 livePreTradeGate — BUY managed-CAD semantics', () => {
   it('14. BUY never treats the exchange quote total as managed cash', () => {
     // Managed CAD 11.97 vs exchange CAD 37.99 -> quote mismatch. No managed
     // deployable supplied -> must block.
@@ -341,11 +346,11 @@ describe('P2-1 execution attribution scope — SELL vs BUY', () => {
     expect(gate.blockers).toEqual([]);
   });
 
-  it('9. BUY remains conservative: an UNCORRELATED execution still blocks', () => {
+  it('9. BUY is allowed when UNCORRELATED is the only attribution finding (B1)', () => {
     const result = baseResult({ executionFindings: [execution({ correlation: 'UNCORRELATED' })] });
-    const gate = livePreTradeGate(result, BUY);
-    expect(gate.allowed).toBe(false);
-    expect(gate.blockers.join(' ')).toMatch(/not proven\+quote/);
+    const gate = livePreTradeGate(result, { ...BUY, managedQuoteDeployable: Money.fromString('100') });
+    expect(gate.allowed).toBe(true);
+    expect(gate.blockers).toEqual([]);
   });
 
   it('11. an UNCORRELATED execution with an unsafe fee does not block, but PROVEN does', () => {
@@ -373,5 +378,82 @@ describe('P2-1 execution attribution scope — SELL vs BUY', () => {
     expect(result.executionFindings).toEqual([finding]);
     expect(result.orderFindings).toEqual([orderFinding]);
     expect(Object.prototype.hasOwnProperty.call(result, 'blockers')).toBe(false);
+  });
+});
+
+describe('B1 livePreTradeGate — BUY backstops (side-independent UNCORRELATED scoping)', () => {
+  /** A BUY with positive managed deployable CAD so only the tested finding blocks. */
+  const BUY_WITH_CAD = { ...BUY, managedQuoteDeployable: Money.fromString('100') };
+
+  it('1. AMBIGUOUS attribution blocks a BUY', () => {
+    const result = baseResult({ executionFindings: [execution({ correlation: 'AMBIGUOUS' })] });
+    const gate = livePreTradeGate(result, BUY_WITH_CAD);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blockers.join(' ')).toMatch(/AMBIGUOUS/);
+  });
+
+  it('2. STRONG_BUT_NOT_PROVEN attribution blocks a BUY', () => {
+    const result = baseResult({ executionFindings: [execution({ correlation: 'STRONG_BUT_NOT_PROVEN' })] });
+    const gate = livePreTradeGate(result, BUY_WITH_CAD);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blockers.join(' ')).toMatch(/not proven\+quote/);
+  });
+
+  it('3. a PROVEN execution with an unsafe/non-QUOTE fee blocks a BUY', () => {
+    for (const feeDisposition of ['BASE', 'UNKNOWN', 'MALFORMED'] as const) {
+      const result = baseResult({ executionFindings: [execution({ correlation: 'PROVEN', feeDisposition })] });
+      const gate = livePreTradeGate(result, BUY_WITH_CAD);
+      expect(gate.allowed).toBe(false);
+      expect(gate.blockers.join(' ')).toMatch(/not proven\+quote/);
+    }
+  });
+
+  it('4. a managed CAD mismatch blocks a BUY even with positive managed deployable', () => {
+    const result = baseResult({ balanceFindings: [balance('CAD')] });
+    const gate = livePreTradeGate(result, BUY_WITH_CAD);
+    expect(gate.allowed).toBe(false);
+    expect(gate.blockers.join(' ')).toMatch(/BUY quote CAD/);
+  });
+
+  it('5. zero/absent managed deployable CAD blocks a BUY', () => {
+    const result = baseResult({ balanceFindings: [balance('CAD', false)] });
+    const zero = livePreTradeGate(result, { ...BUY, managedQuoteDeployable: Money.zero() });
+    expect(zero.allowed).toBe(false);
+    expect(zero.blockers.join(' ')).toMatch(/MANAGED deployable quote/);
+
+    const absent = livePreTradeGate(result, BUY);
+    expect(absent.allowed).toBe(false);
+    expect(absent.blockers.join(' ')).toMatch(/MANAGED deployable quote/);
+  });
+
+  it('6. unresolved order / reservation / operator findings still block a BUY', () => {
+    const orderBlocked = baseResult({ orderFindings: [order()] });
+    expect(livePreTradeGate(orderBlocked, BUY_WITH_CAD).allowed).toBe(false);
+
+    const reservationBlocked = baseResult({ reservationFindings: [reservation()] });
+    expect(livePreTradeGate(reservationBlocked, BUY_WITH_CAD).allowed).toBe(false);
+
+    const operatorBlocked = baseResult({ operatorFindings: [operator()] });
+    expect(livePreTradeGate(operatorBlocked, BUY_WITH_CAD).allowed).toBe(false);
+  });
+
+  it('7. historical UNCORRELATED-only activity allows the BUY (B1)', () => {
+    const historical = (i: number): ExecutionFinding =>
+      execution({
+        executionId: `hist-${i}`,
+        orderId: `700000${i}`,
+        symbol: 'BTC/CAD',
+        correlation: 'UNCORRELATED',
+        matchedClientOrderId: null,
+        feeDisposition: i % 2 === 0 ? 'BASE' : 'UNKNOWN',
+      });
+    const result = baseResult({
+      status: 'RECONCILIATION_REQUIRED',
+      executionFindings: [historical(0), historical(1), historical(2)],
+      balanceFindings: [balance('CAD', false)],
+    });
+    const gate = livePreTradeGate(result, BUY_WITH_CAD);
+    expect(gate.allowed).toBe(true);
+    expect(gate.blockers).toEqual([]);
   });
 });

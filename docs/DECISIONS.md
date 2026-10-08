@@ -1743,3 +1743,78 @@ stop conditions for the first BUY. The CLI help now names `live-test buy`.
 LIMIT-only controlled authorization and `supportsOrderPlacement=false` are
 unchanged; BUY remains the only operator-confirmed production placement path; the
 first real BUY is still a separate operator action.
+
+## 43. B1 — side-independent UNCORRELATED reconciliation scoping + `buy --check` (2026-10-07)
+
+**Decision (B1):** Historical, non-bot `UNCORRELATED` exchange executions are
+**informational for pre-trade gating** and do **not**, by themselves, block a
+`bot live-test buy` or `bot live-test sell`. The action-aware `livePreTradeGate`
+now scopes execution attribution **side-independently** (previously the
+`UNCORRELATED` exception applied only to a SELL). This supersedes the stale
+assumption (§41/§P2-1) that a BUY must block on every non-`PROVEN+QUOTE`
+execution.
+
+**Timing evidence (read-only, from the live account).** The account history shows
+**36 total account trades**:
+
+- **3 `PROVEN` executions** — exactly the bot's 3 prior controlled LIVE SELLs:
+  `26177556994` (2026-09-09), `26202538671` (2026-09-14), `26247815657`
+  (2026-09-24).
+- **33 `UNCORRELATED` executions** — earliest `2021-09-15`, latest `2025-10-24`.
+- **First bot LIVE order:** 2026-09-09.
+- **`UNCORRELATED` executions after the first bot LIVE order: 0.**
+
+Every historical `UNCORRELATED` execution predates the bot's first live order and
+matches the pre-existing external inventory. None can be bot activity.
+
+**Why B1 is justified.** `UNCORRELATED` means "no local bot order attribution
+exists"; the bot does not and must not account these executions. Treating them as
+a pre-trade blocker for a BUY conflated *external/historical* activity with
+*bot-owned ambiguity*, permanently over-blocking the controlled BUY while adding
+no safety. The evidence above proves there is no bot-origin ambiguity hiding in
+the 33 historical executions.
+
+**Why B1 does NOT remove the other backstops.** B1 is scoped narrowly to
+`UNCORRELATED`. All actionable findings still block **both** sides:
+
+- `AMBIGUOUS` and `STRONG_BUT_NOT_PROVEN` execution attribution (fail closed);
+- a `PROVEN` execution whose fee is not `QUOTE` (unsafe fee disposition);
+- unresolved `[order]` findings, unresolved/ambiguous `[res]` reservations, and
+  `[operator]` / cross-domain findings;
+- exchange read failures / `HALTED`;
+- for a BUY, a managed-CAD `[bal]` mismatch and a zero/absent **managed**
+  deployable quote. BUY still requires **strict managed-CAD protection**: the
+  exchange quote total is never deployable, and external/unmanaged CAD is never
+  spent. The balance rules remain action-aware (SELL blocks on the sold base
+  asset; BUY blocks on the quote currency).
+
+Global `bot reconcile` remains strict: external/unmanaged CAD still produces
+`RECONCILIATION_REQUIRED`. B1 changes only the *action-aware projection*, not the
+global status semantics.
+
+**Why no epoch mechanism was added.** An epoch/timestamp cutoff would introduce a
+new mutable state dimension whose correctness cannot be proven, and would only
+re-encode the same evidence. The action-scoping decision ("`UNCORRELATED` is not
+bot-owned") is the correct, stateless boundary; historical evidence independently
+confirms there is no bot activity before the first live order. B1 is the approved
+design.
+
+**Read-only preflight `bot live-test buy --check`.** A new `--check` mode runs the
+**same** BUY preflight (pre-contact gates, snapshot, managed-only risk context,
+reconciliation, the action-aware gate, BUY readiness) and stops **before**
+authorization/execution. It prints blocking failures, informational findings,
+compensating controls/permanent limitations, and a final
+`BUY PREFLIGHT: READY|BLOCKED`, exiting non-zero on any blocker. It cannot mint a
+usable authorization, create/reserve/persist an order or reservation, call
+`placeOrder`/NDAX `SendOrder`, prompt for `EXECUTE`, or mutate `.state`; it may
+perform the same authenticated read-only exchange reads the real BUY does. This
+lets an operator review the exact preflight without any submission possibility.
+`--check` does not require `--confirm-live` (confirmation remains the later human
+step of the real BUY).
+
+**Consequences.** `livePreTradeGate` is side-independent for `UNCORRELATED`; the
+BUY still requires positive managed deployable CAD. No epoch mechanism was added.
+`supportsOrderPlacement` remains `false`; no SendOrder/CancelOrder path was
+invoked; no `.env`/`.state` change; reservation enforcement, UNKNOWN/lost-ack
+handling, and managed-CAD reconciliation are untouched. The first real BUY is
+still a separate, explicitly-approved operator action.

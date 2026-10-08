@@ -21,21 +21,24 @@
  *     accounting (PROVEN with an unsafe/non-QUOTE fee, AMBIGUOUS, or
  *     STRONG_BUT_NOT_PROVEN), any ambiguous reservation, and any
  *     operator/cross-domain finding.
- *   - Execution attribution scope:
- *       For a SELL, UNCORRELATED executions (no local bot order attribution)
- *       do NOT independently block; they are outside managed
- *       execution-attribution scope. This is an ATTRIBUTION-SCOPING decision,
- *       NOT a claim that those executions are proven external. BUY does NOT
- *       apply this exception and remains conservative. See the execution loop
- *       below for the precise rationale and backstops.
+ *   - Execution attribution scope (SIDE-INDEPENDENT, B1):
+ *       UNCORRELATED executions (no local bot order attribution) are
+ *       INFORMATIONAL for pre-trade gating and do NOT independently block a
+ *       BUY or a SELL. They do NOT establish ownership by this bot — the bot
+ *       never accounts uncorrelated executions. This is an ATTRIBUTION-SCOPING
+ *       decision, NOT a claim that those executions are proven external.
+ *       Bot-owned ambiguity remains blocking through the existing
+ *       order/reservation/reconciliation controls: a PROVEN execution with an
+ *       unsafe/non-QUOTE fee, an AMBIGUOUS execution, and a
+ *       STRONG_BUT_NOT_PROVEN execution still block. See the execution loop
+ *       below for the precise backstops.
  *   - Balance rules:
  *       SELL: a mismatch on the BASE asset being sold blocks (its ownership is
  *             what the SELL consumes). A quote-currency mismatch (e.g.
  *             external/unmanaged CAD) or unrelated-asset drift does NOT block.
  *       BUY:  a quote-currency mismatch blocks, and a positive MANAGED deployable
  *             quote is required. The exchange quote total is NEVER treated as
- *             managed cash. (BUY is not implemented/reachable; this keeps the
- *             helper semantically safe if reused.)
+ *             managed cash. BUY still requires strict managed-CAD protection.
  *
  * Global `bot reconcile` remains strict: external/unmanaged CAD still produces
  * `RECONCILIATION_REQUIRED`. This projection does not "make reconciliation green".
@@ -108,15 +111,16 @@ export function livePreTradeGate(
   //   - AMBIGUOUS / STRONG_BUT_NOT_PROVEN: attribution is indeterminate (could be
   //     the bot's) => block, fail closed.
   //   - UNCORRELATED: no local bot order attribution exists. The bot does NOT
-  //     account uncorrelated executions, so for a SELL they are outside managed
-  //     execution-attribution scope and must not independently block. This is an
-  //     ATTRIBUTION-SCOPING decision, NOT a claim that the execution is "proven
-  //     external". The bot's OWN unresolved orders/reservations are separately
-  //     blocked above, and the sold-base balance rule below remains the SELL
-  //     backstop for external activity that changes the managed asset. BUY stays
-  //     conservative: it does NOT skip UNCORRELATED executions.
+  //     account uncorrelated executions, so they are informational for pre-trade
+  //     gating and must not independently block EITHER side (B1, side-independent).
+  //     This is an ATTRIBUTION-SCOPING decision, NOT a claim that the execution is
+  //     "proven external". The bot's OWN unresolved orders/reservations are
+  //     separately blocked above, and the action-aware balance rules below remain
+  //     the backstop for external activity that changes the managed asset being
+  //     consumed (sold base for SELL; quote for BUY, where strict managed-CAD
+  //     protection still applies).
   for (const e of result.executionFindings) {
-    if (action.side === 'SELL' && e.correlation === 'UNCORRELATED') {
+    if (e.correlation === 'UNCORRELATED') {
       continue;
     }
 

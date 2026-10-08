@@ -7,7 +7,7 @@
  * let production readiness evaluate. No real order is ever placed.
  */
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { Money } from '../../../src/money/Money.js';
@@ -201,6 +201,15 @@ describe('parseLiveTestBuyArgs', () => {
   it('rejects quantity/price/size injection and unknown flags', () => {
     for (const args of [['buy', '--quantity', '1'], ['buy', '--target-cad', '5'], ['buy', '--price', '1'], ['buy', '--bogus']]) {
       expect(parseLiveTestBuyArgs(args).ok).toBe(false);
+    }
+  });
+
+  it('parses --check as a read-only preflight that does not require --confirm-live', () => {
+    const r = parseLiveTestBuyArgs(['buy', '--check']);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.opts.check).toBe(true);
+      expect(r.opts.confirmLive).toBe(false);
     }
   });
 });
@@ -398,6 +407,87 @@ describe('executeLiveBuy — happy path (fake exchange)', () => {
     // No CREATED order and no reservation were persisted.
     expect(deps.store.allOrders().size).toBe(0);
     expect(loadManaged(deps.live).orderReservationsView().size).toBe(0);
+  });
+});
+
+describe('executeLiveBuy --check — read-only BUY preflight', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function captureLogs(): () => string {
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    return () => spy.mock.calls.map((c) => c.join(' ')).join('\n');
+  }
+
+  it('reaches the preflight and returns 0 (READY) without any mutation or prompt', async () => {
+    const confirm = vi.fn(async () => true);
+    const deps = buildDeps({ confirm });
+    const output = captureLogs();
+
+    const led = await executeLiveBuy(deps, { confirmLive: false, check: true });
+
+    expect(led).toBe(0);
+    const text = output();
+    expect(text).toContain('BUY PREFLIGHT: READY');
+    expect(text).toContain('Informational findings:');
+    expect(text).toContain('Compensating controls');
+    // Never prompts for EXECUTE.
+    expect(confirm).not.toHaveBeenCalled();
+    // Never calls placeOrder.
+    expect(deps.adapter.submittedOrders).toHaveLength(0);
+    // Never persists an order.
+    expect(deps.store.allOrders().size).toBe(0);
+    // Never creates a reservation.
+    expect(loadManaged(deps.live).orderReservationsView().size).toBe(0);
+  });
+
+  it('returns non-zero (BLOCKED) when the BUY would be blocked, still mutating nothing', async () => {
+    // External/unmanaged CAD makes the BUY quote reconcile mismatch -> blocked.
+    const deps = buildDeps({ adapter: (e) => e.setBalance('CAD', '2000') });
+    const output = captureLogs();
+
+    const led = await executeLiveBuy(deps, { confirmLive: false, check: true });
+
+    expect(led).toBe(1);
+    expect(output()).toContain('BUY PREFLIGHT: BLOCKED');
+    expect(deps.adapter.submittedOrders).toHaveLength(0);
+    expect(deps.store.allOrders().size).toBe(0);
+    expect(loadManaged(deps.live).orderReservationsView().size).toBe(0);
+  });
+
+  it('does not require --confirm-live and never prompts even with no confirm handler', async () => {
+    const deps = buildDeps({ omitConfirm: true });
+    captureLogs();
+    const led = await executeLiveBuy(deps, { confirmLive: false, check: true });
+    expect(led).toBe(0);
+    expect(deps.adapter.submittedOrders).toHaveLength(0);
+  });
+
+  it('does not mint a usable live authorization (a hard placeOrder failure is never reached)', async () => {
+    // If --check reached submission it would call placeOrder, which is made to
+    // fail loudly here. No submission, no persisted order, no reservation.
+    const deps = buildDeps({ adapter: (e) => e.setFailures({ placeOrder: { kind: 'network' } }) });
+    captureLogs();
+
+    const led = await executeLiveBuy(deps, { confirmLive: false, check: true });
+
+    expect(led).toBe(0);
+    expect(deps.adapter.submittedOrders).toHaveLength(0);
+    expect(deps.store.allOrders().size).toBe(0);
+    expect(loadManaged(deps.live).orderReservationsView().size).toBe(0);
+  });
+
+  it('blocks on a pre-contact gate (kill switch) and never contacts order placement', async () => {
+    const deps = buildDeps({ cfg: { killSwitch: true } });
+    const output = captureLogs();
+
+    const led = await executeLiveBuy(deps, { confirmLive: false, check: true });
+
+    expect(led).toBe(1);
+    expect(output()).toContain('BUY PREFLIGHT: BLOCKED');
+    expect(deps.adapter.submittedOrders).toHaveLength(0);
+    expect(deps.store.allOrders().size).toBe(0);
   });
 });
 

@@ -65,8 +65,19 @@ workaround).
 - [ ] `.env`: `ENABLE_AUTHENTICATED_READS=true`; note `MAX_OPEN_POSITIONS`,
       `MAX_POSITION_SIZE_FRACTION`, `MAX_TRADE_AMOUNT`, the LIVE caps.
 - [ ] `npm run dev -- trades --open` → no unresolved live orders.
-- [ ] `npm run dev -- reconcile` → `READY`, `Proven to commit: 0`, no
-      `[order]`/`[res]`/`[operator]` findings, no CAD `[bal]` mismatch.
+- [ ] `npm run dev -- live-test buy --check` → reviews the live BUY preflight
+      read-only and ends with `BUY PREFLIGHT: READY` (see §3.2). This is the
+      authoritative BUY preflight; it never places an order.
+- [ ] `npm run dev -- reconcile` (read-only) → no **actionable** findings: no
+      unresolved `[order]` / `[res]` / `[operator]`, no managed-CAD `[bal]`
+      mismatch, no `AMBIGUOUS` / `STRONG_BUT_NOT_PROVEN` attribution, and no
+      unsafe (non-`QUOTE`) fee on a `PROVEN` execution. Historical/external
+      `UNCORRELATED` executions are informational and do NOT block a BUY (§3.1),
+      so the global status may legitimately read `RECONCILIATION_REQUIRED` for
+      that reason alone. BUY is gated by the action-aware pre-trade gate, not by
+      the global `READY` string.
+- [ ] `Proven to commit: 0` unless you have a separately reviewed reason to
+      commit (never commit to force ambiguous accounting — see §5).
 - [ ] Read-only NDAX probe (never places orders): `npm run verify:ndax` → all
       checks pass and market metadata loads for BTC/CAD (confirms connectivity
       and the exchange's min-order/tick constraints before the BUY).
@@ -74,6 +85,64 @@ workaround).
 - [ ] Number of managed open positions < `MAX_OPEN_POSITIONS` (a BUY that ADDS to
       an already-managed symbol is not counted as a new position).
 - [ ] The derived size will be above the exchange minimum (review the caps).
+
+### 3.1 Action-aware BUY gating — what blocks and what does not
+
+For BUY, the pre-trade projection (`livePreTradeGate`) is **action-aware**: it
+does not require the *global* reconcile status to be `READY`, but it still blocks
+every actionable finding.
+
+**Acceptable (informational — do NOT block BUY):**
+
+- `UNCORRELATED` historical executions (no local bot order attribution to a bot
+  order). These are external/historical activity the bot does not account and
+  does not own; they are not, by themselves, a BUY or SELL blocker.
+- External-asset findings that do not represent managed-CAD spend.
+
+**Blocking (any one = STOP):**
+
+- unresolved `[order]` (any disposition other than `CONFIRMED` /
+  `PARTIALLY_CONFIRMED`);
+- unresolved `[res]` (ambiguous reservation), or any orphan reservation;
+- unresolved `[operator]` / cross-domain finding;
+- managed CAD `[bal]` mismatch;
+- `AMBIGUOUS` execution attribution;
+- `STRONG_BUT_NOT_PROVEN` execution attribution;
+- a `PROVEN` execution whose fee disposition is not `QUOTE` (unsafe / `BASE` /
+  `UNKNOWN` / `MALFORMED`) where accounting cannot safely proceed;
+- any BUY readiness blocker (mode/funds/kill switch/auth reads/freshness/
+  valuation/risk/quantity/price/exchange-quote/managed-CAD/fee), or an
+  unresolved live order;
+- zero or absent **MANAGED** deployable CAD. The exchange CAD total is never
+  treated as deployable; external/unmanaged CAD is never deployed.
+
+### 3.2 Read-only preflight: `npm run dev -- live-test buy --check`
+
+```bash
+npm run dev -- live-test buy --check
+```
+
+`--check` runs the **same** BUY preflight as the real command — pre-contact
+gates, the live market/account snapshot, managed-only risk context, V1
+reconciliation, the action-aware pre-trade gate, and BUY readiness — and then
+**stops before authorization/execution**. It prints the summary plus a
+categorised verdict separating **blocking failures**, **informational findings**,
+and **compensating controls / permanent limitations**, ending in exactly
+`BUY PREFLIGHT: READY` or `BUY PREFLIGHT: BLOCKED`. It exits `0` only when the
+BUY is genuinely ready and non-zero otherwise.
+
+`--check` does **not** require `--confirm-live` (confirmation is a later human
+step of the real BUY). `--check` **cannot**:
+
+- mint a usable controlled-live authorization;
+- create, prepare, reserve, or persist an order/reservation;
+- call `placeOrder` or NDAX `SendOrder`;
+- prompt for `EXECUTE`; or
+- mutate `.state`.
+
+It may perform the same authenticated **read-only** exchange reads the real BUY
+does. It is the safe way to review the preflight end-to-end without any
+possibility of submitting.
 
 ## 4. Confirmation
 
@@ -118,6 +187,25 @@ correlation fails closed and requires operator attestation:
 npm run dev -- resolve-live-order <clientOrderId> --order-id <exchangeOrderId> \
   --operator <name> --accounting-authority operator_attestation --confirm
 ```
+
+### 5.1 Accounting language (proven vs attested)
+
+- `PROVEN` execution evidence may already exist for prior/attested activity
+  (for example, the three prior controlled LIVE SELLs). A `PROVEN` finding means
+  the account trade correlates to a local bot order with a valid QUOTE fee — it
+  is the only auto-accountable case.
+- An **operator-attested** order is **not** automatically equivalent to fully
+  proven execution provenance. An attestation records who asserted the
+  OrderId/fill (`provenanceProof` is always `false`) and resolves only that
+  specific order; it never upgrades to exchange-proven provenance.
+- `commitProven` **must not double-account** an execution already represented by
+  an attested resolution. The orchestrator enforces this: if an order already
+  carries an operator attestation it refuses to also commit a PROVEN execution
+  for the same order (fail closed).
+- **Never** use `reconcile --commit` as a way to force ambiguous accounting.
+  Commit applies only deterministic, PROVEN + QUOTE executions and safe
+  reservation releases; `AMBIGUOUS` / `RECONCILIATION_REQUIRED` states are never
+  forced into accounting by committing.
 
 ## 6. UNKNOWN / lost acknowledgement — DO NOT RETRY
 
