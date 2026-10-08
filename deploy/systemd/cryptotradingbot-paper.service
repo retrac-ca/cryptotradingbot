@@ -1,0 +1,65 @@
+# Cryptotradingbot PAPER engine — systemd USER unit.
+#
+# Runs ONLY `bot paper` (the simulated end-to-end engine: market data ->
+# strategy -> risk -> paper execution -> portfolio -> persistence). It NEVER
+# places, cancels, resolves, or accounts for a real exchange order, and it
+# never enables live trading. `bot paper` forces PAPER mode regardless of
+# TRADING_MODE.
+#
+# Install (as the login user; never done automatically by this repo):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/cryptotradingbot-paper.service ~/.config/systemd/user/
+#   npm run build                     # produces dist/index.js
+#   systemctl --user daemon-reload
+#   systemd-analyze --user verify ~/.config/systemd/user/cryptotradingbot-paper.service
+#   systemctl --user enable cryptotradingbot-paper.service
+#   systemctl --user start  cryptotradingbot-paper.service
+#
+# Optional persistence after logout (host-level, explicit operator opt-in):
+#   loginctl enable-linger "$USER"
+#
+# The dashboard (`cryptotradingbot-dashboard.service`) is a separate unit and
+# may run concurrently; the two processes share only the state directory and
+# never the same state file.
+
+[Unit]
+Description=Cryptotradingbot PAPER trading engine (simulated; never places real orders)
+Documentation=file:%h/code/cryptotradingbot/README.md
+After=network-online.target
+Wants=network-online.target
+# Fail fast (and cleanly) if the bot has not been built yet.
+AssertPathExists=%h/code/cryptotradingbot/dist/index.js
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/cryptotradingbot
+ExecStart=/usr/bin/node %h/code/cryptotradingbot/dist/index.js paper
+Restart=on-failure
+RestartSec=10
+
+# Emit structured JSON logs (pino). NODE_ENV here only skips the pino-pretty
+# transport used in local development; it does NOT change trading, accounting,
+# authorization, or reconciliation behavior.
+Environment=NODE_ENV=production
+
+# The application loads its own .env from WorkingDirectory. Do NOT put secrets
+# in this unit.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Contain the write-capable paper process: the entire home directory is
+# READ-ONLY; the ONLY writable path is the repository's state directory, where
+# the paper portfolio and initialization marker live. It cannot modify the
+# repository, .env, source, dist/, or anything else under $HOME.
+ProtectHome=read-only
+ReadWritePaths=%h/code/cryptotradingbot/.state
+
+[Install]
+WantedBy=default.target
