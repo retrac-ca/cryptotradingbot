@@ -1818,3 +1818,62 @@ BUY still requires positive managed deployable CAD. No epoch mechanism was added
 invoked; no `.env`/`.state` change; reservation enforcement, UNKNOWN/lost-ack
 handling, and managed-CAD reconciliation are untouched. The first real BUY is
 still a separate, explicitly-approved operator action.
+
+## 44. F-11 — sanctioned external quote-cash adoption (`bot live-adopt-external-cash`) (2026-10-08)
+
+**Context.** The controlled-LIVE account holds pre-existing **external CAD** that
+predates the bot. Since quote is never snapshotted as external and global
+`reconcile` is strict, that CAD produced a permanent managed-CAD `[bal]` mismatch
+→ `RECONCILIATION_REQUIRED`, which blocks `bot live-test buy` (the BUY quote rule).
+The bot's ownership invariant correctly refuses to *auto-adopt* external money,
+and `FIRST_LIVE_BUY.md` §7 forbids hand-editing `.state` to force a pass. There
+was therefore no sanctioned way for the operator to make an ownership decision
+about that cash.
+
+**Decision.** Add an explicit, operator-gated **ownership adoption** command
+`bot live-adopt-external-cash` plus the `Portfolio.adoptExternalCash(currency,
+amount)` primitive. It reclassifies exactly `exchange available − managed cash`
+(pre-existing external quote) as **bot-managed, DEPLOYABLE** capital.
+
+**Safety model (mirrors `live-onboard-external`):**
+- LOCAL ONLY: it mutates only the live managed portfolio; it never contacts an
+  exchange write. The adapter is wrapped in the existing read-only proxy
+  (`placeOrder`/`cancelOrder` throw). `supportsOrderPlacement` stays `false`.
+- LIVE realm only; `ENABLE_AUTHENTICATED_READS=true`; kill switch OFF; exactly
+  one configured trading pair; the quote must be that pair's quote currency.
+- FULL-RESIDUAL: adopts the whole external residual and never more than the
+  verified exchange available balance.
+- TOCTOU: re-reads immediately before applying and fails closed if the residual
+  changed since confirmation.
+- Interactive `ADOPT` attestation; no `--yes`/`--force`/args and no config/env
+  field can authorize it unattended.
+- Idempotent: after adoption the residual is zero, so a re-run refuses.
+- Accounting: it is a capital injection — **not** a fill, not a position, not
+  P&L. It only raises the managed cash balance (and the drawdown peak-equity
+  baseline). It creates no reservation/execution/settlement.
+
+**Why this is safe and not a "green-by-force" mechanism.** Adoption is a
+deliberate human ownership decision about real funds: the amount becomes
+deployable and is explicitly displayed as real funds at risk before `ADOPT`. It
+does not weaken any hard block (unresolved orders/executions, ambiguous
+reservations, operator/cross-domain findings, read failures, unrelated external
+*asset* drift all still block or report). It does not auto-adopt anything — the
+operator must run it. Unrelated external assets (e.g. pre-existing ETH/ADA/…) are
+unchanged and remain informational for the action-aware pre-trade gate.
+
+**Alternatives rejected:** (a) hand-editing `.state` — rejected, forbidden by the
+runbook and bypasses validation; (b) fixing `expectedBalances()` to treat
+external quote as external — rejected for this decision because the operator
+chose to make the cash *deployable*, not merely acknowledged; (c) auto-adopting
+exchange quote — rejected, violates the ownership invariant and would expose
+funds without consent; (d) making the pre-trade gate ignore quote mismatches —
+rejected, that would deploy against an untrusted managed-CAD figure.
+
+**Validation.** New `tests/unit/cli/live-adopt-external-cash-cmd.test.ts` (gates,
+exact-residual adoption, no-residual refusal, confirmation, idempotency, TOCTOU,
+no order placement, no-bypass) and
+`tests/unit/portfolio/adoptExternalCash.test.ts` (primitive: immutable add,
+peak-equity, no position/P&L, rejects non-positive). `npm test` → 117 files /
+1613 passed; `npm run typecheck`, `npm run lint`, `npm run build` all clean.
+`supportsOrderPlacement` remains `false`; no SendOrder/CancelOrder.
+

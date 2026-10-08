@@ -201,6 +201,38 @@ export class Portfolio {
     return new Portfolio(state);
   }
 
+  /**
+   * Adopt pre-existing external exchange quote cash as BOT-managed capital.
+   *
+   * This is an EXPLICIT operator ownership decision, not a fill and not P&L:
+   * quote the exchange already holds (but the bot does not yet manage) is
+   * reclassified as bot-managed DEPLOYABLE cash. It creates no position, changes
+   * no realized P&L, and only increases the managed cash balance (raising the
+   * drawdown peak-equity baseline accordingly).
+   *
+   * Safety:
+   *   - Only a strictly-positive amount may be adopted (never zero/negative).
+   *   - There is no exchange contact here; this is a LOCAL accounting change. The
+   *     caller is responsible for verifying the amount against an authoritative
+   *     exchange read and for idempotency (recompute the external residual
+   *     `exchange available - managed cash` before each adoption; once adopted the
+   *     residual is zero and a repeat must refuse).
+   *
+   * @throws on a non-positive amount.
+   */
+  adoptExternalCash(currency: string, amount: Money): Portfolio {
+    if (!amount.isPositive()) {
+      throw new Error(`Portfolio.adoptExternalCash: amount must be positive (got ${amount}) for ${currency}`);
+    }
+    const state = this.cloneState();
+    state.cash.set(currency, this.cash(currency).add(amount));
+    const equity = Portfolio.equityOf(state);
+    if (equity.compareTo(state.peakEquity) > 0) {
+      state.peakEquity = equity;
+    }
+    return new Portfolio(state);
+  }
+
   // --- Reserved / deployable quote ---
 
   /** Quote reserved by in-flight bot BUY orders (not yet filled). */

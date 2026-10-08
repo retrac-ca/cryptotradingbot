@@ -13,6 +13,7 @@ import { backtestCommand } from './backtest-cmd.js';
 import { configureCommand } from './config-cmd.js';
 import { dashboardCommand } from './dashboard-cmd.js';
 import { fetchCandlesCommand } from './fetch-candles-cmd.js';
+import { liveAdoptExternalCashCommand } from './live-adopt-external-cash-cmd.js';
 import { liveMonitorCommand } from './live-monitor-cmd.js';
 import { liveOnboardExternalCommand } from './live-onboard-external-cmd.js';
 import { liveTestCommand } from './live-test-cmd.js';
@@ -40,6 +41,7 @@ export const COMMANDS = {
   'live-test': liveTestCommand,
   'live-monitor': liveMonitorCommand,
   'live-onboard-external': liveOnboardExternalCommand,
+  'live-adopt-external-cash': liveAdoptExternalCashCommand,
   manual: manualCommand,
   'resolve-live-order': resolveLiveOrderCommand,
   'resolve-created-order': resolveCreatedOrderCommand,
@@ -65,6 +67,7 @@ Commands:
   live-test One-shot operator-gated LIVE order: "sell" (risk-reducing) or "buy" (controlled LIMIT, managed CAD; "buy --check" is a read-only preflight)
   live-monitor READ-ONLY lifecycle observer for unresolved LIVE orders (never submits/cancels)
   live-onboard-external Authorize existing EXTERNAL exchange inventory as bot-managed (local ownership only; NOT trading)
+  live-adopt-external-cash Adopt pre-existing EXTERNAL quote cash as bot-managed deployable capital (local ownership only; NOT trading)
   manual    Constrained MANUAL EXECUTION BRIDGE (operator interface; never places/cancels an exchange order)
   resolve-live-order Operator-attested resolution of an ambiguous FILLED live order (never submits/cancels)
   resolve-created-order Operator-only ATTACH/ABANDON resolution of an unidentified live order (CREATED / SUBMITTED / UNKNOWN without an exchangeOrderId; never submits/cancels)

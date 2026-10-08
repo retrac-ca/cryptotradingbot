@@ -15,9 +15,30 @@ until the pre-flight is green.
   derived by the RiskManager and the market snapshot.
 - No cancel command for the controlled live path. A resting live LIMIT cannot be
   cancelled by the bot.
-- No managed-CAD onboarding command. Managed CAD comes from a prior controlled
-  SELL settlement (or manual settlement). `bot live-onboard-external` authorizes
-  **base** inventory only.
+- Managed CAD comes from a prior controlled SELL settlement (or manual
+  settlement), or from an explicit ownership adoption of pre-existing external
+  quote cash via `bot live-adopt-external-cash` (see §0.1). `bot
+  live-onboard-external` authorizes **base** inventory only.
+
+### 0.1 Adopting pre-existing external CAD as managed capital
+
+If the exchange holds quote cash the bot does not yet manage (e.g. CAD that
+predated the bot), the global `reconcile` reports a managed-CAD mismatch, which
+blocks a BUY. To resolve it legitimately, the operator may adopt that external
+cash as bot-managed deployable capital:
+
+```bash
+# LIVE realm + ENABLE_AUTHENTICATED_READS; read-only exchange verification +
+# interactive `ADOPT`; local ownership change only (never places/cancels).
+npm run dev -- live-adopt-external-cash
+```
+
+It adopts exactly `exchange available − managed cash` (`ADOPT` attestation,
+TOCTOU re-read), never more than the verified exchange balance. **This makes
+that quote DEPLOYABLE real capital at risk** — a deliberate ownership decision,
+not a way to "force" reconciliation green. After it, `bot reconcile` shows no
+managed-CAD mismatch (unrelated external *assets* may still be informational).
+
 
 ## 1. Command syntax
 
