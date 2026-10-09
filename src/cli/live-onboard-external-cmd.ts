@@ -53,13 +53,34 @@ export interface LiveOnboardExternalDeps {
   logger?: Logger;
 }
 
-/** No arguments are accepted: there is no quantity, no --yes, no --force. */
-export function parseLiveOnboardExternalArgs(args: string[]): { ok: true } | { ok: false; error: string } {
-  if (args.length === 0) return { ok: true };
-  return {
-    ok: false,
-    error: `unexpected argument "${args[0]}". Usage: bot live-onboard-external`,
-  };
+/**
+ * Parse `bot live-onboard-external [--symbol BASE/QUOTE]`.
+ *
+ * An optional explicit `--symbol` selects WHICH external base asset to
+ * authorize. When omitted, the single configured trading pair's base is used
+ * (the original behavior). There is STILL no quantity/--yes/--force flag: the
+ * amount is always derived from the verified exchange balance and requires the
+ * interactive `AUTHORIZE` attestation.
+ */
+export function parseLiveOnboardExternalArgs(
+  args: string[],
+): { ok: true; symbol: string | null } | { ok: false; error: string } {
+  let symbol: string | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === '--symbol') {
+      const value = args[++i];
+      if (!value) return { ok: false, error: 'missing value for --symbol (expected BASE/QUOTE)' };
+      if (symbol !== null) return { ok: false, error: '--symbol may be specified only once' };
+      symbol = value;
+      continue;
+    }
+    return {
+      ok: false,
+      error: `unexpected argument "${arg}". Usage: bot live-onboard-external [--symbol BASE/QUOTE]`,
+    };
+  }
+  return { ok: true, symbol };
 }
 
 function err(s: string): void {
@@ -103,8 +124,14 @@ function externalQuantity(exchangeBase: Money, managed: Money): Money {
  *   0 = inventory authorized and persisted;
  *   1 = refused (config/recovery/read failure, nothing to authorize, not confirmed,
  *       TOCTOU mismatch).
+ *
+ * `opts.symbol` optionally selects which external base asset to authorize
+ * (BASE/QUOTE). When absent, the single configured trading pair's base is used.
  */
-export async function executeLiveOnboardExternal(deps: LiveOnboardExternalDeps): Promise<number> {
+export async function executeLiveOnboardExternal(
+  deps: LiveOnboardExternalDeps,
+  opts: { symbol?: string } = {},
+): Promise<number> {
   const cfg = deps.cfg;
   const adapter = deps.adapter;
   const now = deps.nowMs ?? Date.now;
@@ -130,9 +157,9 @@ export async function executeLiveOnboardExternal(deps: LiveOnboardExternalDeps):
     return 1;
   }
 
-  const symbol = cfg.tradingPairs[0]!;
-  const base = symbol.split('/')[0];
-  if (!base) {
+  const symbol = opts.symbol ?? cfg.tradingPairs[0]!;
+  const [base, quote] = symbol.split('/');
+  if (!base || !quote) {
     err(`live-onboard-external refuses: malformed symbol "${symbol}" (expected BASE/QUOTE).`);
     return 1;
   }
@@ -287,14 +314,17 @@ export const liveOnboardExternalCommand: CommandHandler = async (args, ctx): Pro
     return 1;
   }
 
-  return executeLiveOnboardExternal({
-    cfg,
-    adapter: readOnly,
-    getPortfolio: () => managed,
-    savePortfolio: (p) => {
-      managed = p;
-      liveStore.save(p.stateModel);
+  return executeLiveOnboardExternal(
+    {
+      cfg,
+      adapter: readOnly,
+      getPortfolio: () => managed,
+      savePortfolio: (p) => {
+        managed = p;
+        liveStore.save(p.stateModel);
+      },
+      logger: ctx.logger,
     },
-    logger: ctx.logger,
-  });
+    parsed.symbol ? { symbol: parsed.symbol } : {},
+  );
 };

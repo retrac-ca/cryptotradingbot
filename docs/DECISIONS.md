@@ -1877,3 +1877,47 @@ peak-equity, no position/P&L, rejects non-positive). `npm test` → 117 files /
 1613 passed; `npm run typecheck`, `npm run lint`, `npm run build` all clean.
 `supportsOrderPlacement` remains `false`; no SendOrder/CancelOrder.
 
+## 45. F-12 — `live-onboard-external --symbol` (authorize any external base asset) (2026-10-08)
+
+**Context.** The controlled-LIVE account holds pre-existing external crypto
+(ETH, ADA, DOT, SHIB, TLM, ATOM). `bot reconcile` reports each as an
+unexplained external balance, keeping the global status
+`RECONCILIATION_REQUIRED`. The existing `live-onboard-external` could only
+authorize the SINGLE configured trading pair's base (BTC), so there was no
+sanctioned way to bring the other assets under bot management/tracking.
+
+**Decision.** Extend `live-onboard-external` with an OPTIONAL
+`--symbol BASE/QUOTE` selector. When omitted, behavior is unchanged (the
+configured pair's base). When given, it authorizes that asset's pre-existing
+external inventory as bot-managed `EXTERNAL_AUTHORIZED` (zero cost basis), using
+the SAME verified-exchange-quantity, TOCTOU, and interactive `AUTHORIZE`
+machinery. No quantity, `--yes`, or `--force` flag is introduced; the amount is
+still derived solely from the authoritative exchange read.
+
+**Why this is safe.** The change is a SELECTOR, not a bypass: the LIVE-realm,
+authenticated-read, kill-switch, full-quantity, TOCTOU and attestation gates are
+untouched. An asset with no verifiable external balance (or already authorized)
+still fails closed. Asset symbols are still `BASE/QUOTE`; the base drives the
+balance read and the position key. `supportsOrderPlacement` remains `false`; no
+order path is touched.
+
+**Risk/pricing note.** Every managed position is valued at BUY time via
+`adapter.getTicker(symbol)` (F-2/F-8); a managed asset with no priceable market
+would make portfolio valuation UNKNOWN and fail the BUY **closed** (never open).
+All six assets above have live `*/CAD` markets and tickers, so authorizing them
+does not block the controlled BUY preflight. Authorizing an asset also counts
+toward `MAX_OPEN_POSITIONS` (distinct managed symbols); adding to an already-managed
+symbol is exempt (§42).
+
+**Alternatives rejected:** (a) looping by rewriting `TRADING_PAIRS` — rejected,
+error-prone config churn; (b) a separate one-off script — rejected, no auditable
+command/attestation; (c) auto-onboarding every external balance — rejected, each
+ownership change must be an explicit operator decision.
+
+**Validation.** `tests/unit/cli/live-onboard-external-cmd.test.ts` extended:
+explicit `--symbol` authorizes the named asset without touching the configured
+pair; malformed `--symbol` fails closed; `--symbol` parsing is single-use and
+value-required; `--yes`/`--force` still rejected. `npm run typecheck`,
+`npm run lint` clean.
+
+

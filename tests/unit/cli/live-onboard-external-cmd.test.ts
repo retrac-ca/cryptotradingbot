@@ -280,12 +280,56 @@ describe('live-onboard-external — no mutation path', () => {
   });
 });
 
+describe('live-onboard-external — explicit symbol', () => {
+  it('authorizes the named external asset (not only the configured pair)', async () => {
+    const c = cfg();
+    const exchange = new FakeExchange({
+      balances: { ETH: '0.50000000', CAD: '100000' },
+      markets: { 'ETH/CAD': market },
+    });
+    let portfolio = makePortfolio();
+    const saved: Portfolio[] = [];
+    const deps = {
+      cfg: c,
+      adapter: exchange,
+      getPortfolio: () => portfolio,
+      savePortfolio: (p: Portfolio) => {
+        portfolio = p;
+        saved.push(p);
+      },
+      confirm: async () => true,
+      nowMs: () => 1_000_000,
+    };
+    expect(await executeLiveOnboardExternal(deps, { symbol: 'ETH/CAD' })).toBe(0);
+    const pos = portfolio.position('ETH/CAD')!;
+    expect(pos.quantity.toFixed(8)).toBe('0.50000000');
+    expect(pos.source).toBe('EXTERNAL_AUTHORIZED');
+    // The configured pair's asset is untouched.
+    expect(portfolio.position(SYMBOL)).toBeNull();
+    expect(portfolio.isAuthorizedExternal('ETH/CAD')).toBe(true);
+    expect(portfolio.isAuthorizedExternal(SYMBOL)).toBe(false);
+  });
+
+  it('refuses a malformed --symbol', async () => {
+    const { deps } = buildDeps();
+    expect(await executeLiveOnboardExternal(deps, { symbol: 'ETH' })).toBe(1);
+  });
+});
+
 describe('live-onboard-external — no bypass', () => {
-  it('rejects --yes / --force and any arguments (no bypass)', () => {
+  it('rejects --yes / --force and any bypass flag (no bypass)', () => {
     expect(parseLiveOnboardExternalArgs(['--yes']).ok).toBe(false);
     expect(parseLiveOnboardExternalArgs(['--force']).ok).toBe(false);
     expect(parseLiveOnboardExternalArgs(['--confirm']).ok).toBe(false);
     expect(parseLiveOnboardExternalArgs([]).ok).toBe(true);
+  });
+
+  it('accepts --symbol BASE/QUOTE only once and with a value', () => {
+    const r = parseLiveOnboardExternalArgs(['--symbol', 'ETH/CAD']);
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.symbol).toBe('ETH/CAD');
+    expect(parseLiveOnboardExternalArgs(['--symbol']).ok).toBe(false);
+    expect(parseLiveOnboardExternalArgs(['--symbol', 'ETH/CAD', '--symbol', 'ADA/CAD']).ok).toBe(false);
   });
 
   it('no config/env schema field can authorize inventory unattended', () => {

@@ -66,7 +66,7 @@ Commands:
   reconcile Reconcile the order ledger against the exchange (read-only)
   live-test One-shot operator-gated LIVE order: "sell" (risk-reducing) or "buy" (controlled LIMIT, managed CAD; "buy --check" is a read-only preflight)
   live-monitor READ-ONLY lifecycle observer for unresolved LIVE orders (never submits/cancels)
-  live-onboard-external Authorize existing EXTERNAL exchange inventory as bot-managed (local ownership only; NOT trading)
+  live-onboard-external Authorize existing EXTERNAL exchange inventory as bot-managed [--symbol BASE/QUOTE] (local ownership only; NOT trading)
   live-adopt-external-cash Adopt pre-existing EXTERNAL quote cash as bot-managed deployable capital (local ownership only; NOT trading)
   manual    Constrained MANUAL EXECUTION BRIDGE (operator interface; never places/cancels an exchange order)
   resolve-live-order Operator-attested resolution of an ambiguous FILLED live order (never submits/cancels)

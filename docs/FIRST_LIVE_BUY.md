@@ -39,6 +39,23 @@ that quote DEPLOYABLE real capital at risk** — a deliberate ownership decision
 not a way to "force" reconciliation green. After it, `bot reconcile` shows no
 managed-CAD mismatch (unrelated external *assets* may still be informational).
 
+### 0.2 Authorizing other external base assets
+
+Pre-existing external crypto (e.g. ETH/ADA/DOT/…) can be brought under bot
+management/tracking — clearing their informational reconcile findings — with the
+same verified-quantity + interactive `AUTHORIZE` machinery:
+
+```bash
+npm run dev -- live-onboard-external --symbol ETH/CAD
+```
+
+`--symbol` selects the asset; omit it to onboard the configured pair's base
+(original behavior). The amount is always derived from the authoritative
+exchange balance (no quantity/`--yes`/`--force`), and each asset is a separate
+explicit operator decision. Authorized assets become `EXTERNAL_AUTHORIZED`
+(zero cost basis) and are valued at BUY time via `getTicker`; every asset must
+have a live `*/CAD` market or the BUY valuation fails **closed**.
+
 
 ## 1. Command syntax
 
