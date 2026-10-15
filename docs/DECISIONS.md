@@ -1635,7 +1635,8 @@ limitations, not defects, and do **not** invalidate the PAPER-first V1:
   live-test/live-engine paths. Behavioral difference: V1 **surfaces** unexpected
   external exchange balances; V0 iterates only expected currencies and does not
   surface them (neither auto-adopts). Known coexistence/observability limitation;
-  unification is future work, not required for V1.
+  unification is future work, not required for V1. **Resolved** by §48 (the V0 path
+  was removed; a single V1 path remains).
 
 **Remediation applied (read-only review → F1–F3):** F1 closes the
 `analyzeCompleteness` fail-open edge (a non-positive exchange executed quantity
@@ -2033,3 +2034,37 @@ root owns the paths. Paper-only change; no LIVE safety path is touched.
 start/stop/cycle) and `tests/unit/engine/buildEngineHeartbeat.test.ts` (the paper
 heartbeat + equity sample are written). `npm test` → 126 files / 1657 passed;
 typecheck, lint, build clean.
+
+## 48. Single reconciliation path — remove legacy V0 (2026-10-15)
+
+**Context.** Two reconciliation implementations coexisted (§19, §40): V1
+(`reconcile()`/`commitProven()` + classifiers) and the legacy V0
+(`Reconciler`/`ReconcileService` + `reconcile/types.ts`). §40 flagged the
+coexistence and the V0 observability gap (V0's balance check iterated only
+expected currencies and did not surface unexpected external balances). The scoped
+usage map (`docs/RECONCILIATION_UNIFICATION.md`) showed V0 was **vestigial in
+production**: its `LiveOrderEngine.reconcile()` passthrough was uncalled in
+production, and its only live effect was two post-submit `live-test` reads whose
+result was discarded. The placement gate is V1 (`livePreTradeGate`).
+
+**Decision.** Remove V0 and keep a single V1 path:
+- Deleted `src/reconcile/Reconciler.ts`, `ReconcileService.ts`, `types.ts` and
+  their barrel exports.
+- Dropped the `ReconcileService` constructor parameter and the `reconcile()`
+  passthrough from `LiveOrderEngine`; updated `buildLiveEngine` and `live-test-cmd`
+  call sites.
+- Replaced the two post-submit `live-test` diagnostics with the V1 `reconcile()`
+  (same read-only observation, now surfacing unexpected balances).
+- Retargeted the V0 tests: deleted the V0-only suites
+  (`reconciler.test.ts`, `reconcileService.test.ts`); rewrote
+  `ownership-reconcile.test.ts` and the balance-mismatch assertions in
+  `externalSnapshot-f10.test.ts` against the V1 `reconcileBalances`, preserving the
+  ownership invariant (detect, never adopt).
+
+**Safety.** The change is behavior-neutral for order placement: no V0 result
+gated any submission. Ownership/adoption, the manual bridge, live accounting, and
+`supportsOrderPlacement=false` are unchanged.
+
+**Validation.** `npm run typecheck`, `npm run lint`, `npm test`
+(125 files / 1643 passed), `npm run build` all clean. `grep` confirms no
+`Reconciler`/`ReconcileService` symbol remains in `src/` or `tests/`.

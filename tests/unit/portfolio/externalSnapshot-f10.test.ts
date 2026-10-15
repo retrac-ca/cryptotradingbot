@@ -12,8 +12,7 @@ import { describe, expect, it } from 'vitest';
 import { Money } from '../../../src/money/Money.js';
 import { Portfolio } from '../../../src/portfolio/Portfolio.js';
 import { serializePortfolio, deserializePortfolio, type PortfolioJsonV2 } from '../../../src/portfolio/serialization.js';
-import { Reconciler } from '../../../src/reconcile/index.js';
-import type { ExchangeAccountSnapshot, LocalOrderLedger } from '../../../src/reconcile/types.js';
+import { reconcileBalances } from '../../../src/reconcile/index.js';
 import { RiskManager } from '../../../src/risk/RiskManager.js';
 import type { RiskConfig } from '../../../src/risk/RiskConfig.js';
 import type { RiskContext } from '../../../src/risk/RiskContext.js';
@@ -44,18 +43,12 @@ const marketInfo: MarketInfo = {
   minOrderBase: Money.fromString('0.0001'), minOrderQuote: null, supportsMarketOrders: true, feeInfo: null,
 };
 
-const EMPTY_LOCAL: LocalOrderLedger = { orders: new Map(), openLocalOrderIds: [] };
-
 function cashPortfolio(cash: string): Portfolio {
   return Portfolio.empty(new Map([['CAD', Money.fromString(cash)]]));
 }
 
 function bal(currency: string, amount: string): Balance {
   return { currency, total: Money.fromString(amount), available: Money.fromString(amount), held: Money.zero() };
-}
-
-function snapshot(balances: Balance[]): ExchangeAccountSnapshot {
-  return { balances, openOrders: [], orderHistory: [], fetchedAtMs: NOW };
 }
 
 function ctx(signalType: 'BUY' | 'SELL' | 'HOLD', over: Partial<RiskContext> = {}): RiskContext {
@@ -132,10 +125,8 @@ describe('F-10 — snapshot increases never create BOT ownership', () => {
       .authorizeExternal(B);
     const botBefore = p.position(B)!.sourceQuantities.BOT.toFixed(8);
     const extBefore = p.position(B)!.sourceQuantities.EXTERNAL_AUTHORIZED.toFixed(8);
-    const r = new Reconciler();
-    const report = r.reconcile(EMPTY_LOCAL, snapshot([bal('BTC', '0.60')]), { expectedBalances: p.expectedAssetBalances() });
-    expect(report.safeToTrade).toBe(false);
-    expect(report.discrepancies.some((d) => d.kind === 'BALANCE_MISMATCH')).toBe(true);
+    const findings = reconcileBalances(p.expectedAssetBalances(), [bal('BTC', '0.60')]);
+    expect(findings.some((f) => f.mismatch)).toBe(true);
     // Provenance (and quantity) unchanged after reconcile.
     expect(p.position(B)!.sourceQuantities.BOT.toFixed(8)).toBe(botBefore);
     expect(p.position(B)!.sourceQuantities.EXTERNAL_AUTHORIZED.toFixed(8)).toBe(extBefore);
@@ -144,8 +135,7 @@ describe('F-10 — snapshot increases never create BOT ownership', () => {
   it('reconciliation NEVER mutates the portfolio (read-only detection)', () => {
     const p = cashPortfolio('1000').applyFill(B, 'BUY', Money.fromString('0.1'), Money.fromString('40000'), Money.zero());
     const before = p.stateModel;
-    const r = new Reconciler();
-    r.reconcile(EMPTY_LOCAL, snapshot([bal('BTC', '0.40')]), { expectedBalances: p.expectedAssetBalances() });
+    reconcileBalances(p.expectedAssetBalances(), [bal('BTC', '0.40')]);
     expect(p.stateModel).toEqual(before); // no adoption, no mutation, no new BOT
   });
 });
@@ -163,9 +153,8 @@ describe('F-10 — snapshot decreases never silently mutate provenance', () => {
       .withExternalSnapshot(new Map([[B, Money.fromString('0.3')]]))
       .authorizeExternal(B);
     const before = { bt: p.position(B)!.sourceQuantities.BOT.toFixed(8), et: p.position(B)!.sourceQuantities.EXTERNAL_AUTHORIZED.toFixed(8) };
-    const r = new Reconciler();
-    const report = r.reconcile(EMPTY_LOCAL, snapshot([bal('BTC', exchangeBtc)]), { expectedBalances: p.expectedAssetBalances() });
-    expect(report.safeToTrade).toBe(false);
+    const findings = reconcileBalances(p.expectedAssetBalances(), [bal('BTC', exchangeBtc)]);
+    expect(findings.some((f) => f.mismatch)).toBe(true);
     expect(p.position(B)!.sourceQuantities.BOT.toFixed(8)).toBe(before.bt);
     expect(p.position(B)!.sourceQuantities.EXTERNAL_AUTHORIZED.toFixed(8)).toBe(before.et);
   });
@@ -316,7 +305,7 @@ describe('F-10 — reservation independence', () => {
   it('reconciliation cannot release or create a reservation', () => {
     const p = cashPortfolio('1000').reserveQuote('CAD', Money.fromString('300'));
     const before = p.reserved('CAD').toFixed(2);
-    new Reconciler().reconcile(EMPTY_LOCAL, snapshot([]), { expectedBalances: p.expectedAssetBalances() });
+    reconcileBalances(p.expectedAssetBalances(), []);
     expect(p.reserved('CAD').toFixed(2)).toBe(before);
   });
 });

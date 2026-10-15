@@ -14,7 +14,6 @@ import { describe, expect, it } from 'vitest';
 import { rmSync } from 'node:fs';
 import { Money } from '../../../src/money/Money.js';
 import { OrderStore } from '../../../src/persistence/OrderStore.js';
-import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import {
   LiveOrderEngine,
   type LiveExecutionConfig,
@@ -68,8 +67,7 @@ function buildEngine(exchange: FakeExchange, extraCfg: Partial<LiveExecutionConf
   exchange.setTicker(SYMBOL, { last: Money.fromString('40000') });
   rmSync(LEDGER, { force: true });
   const store = new OrderStore(LEDGER);
-  const service = new ReconcileService(exchange, store);
-  return new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), {
+  return new LiveOrderEngine(exchange, store, new RiskManager(riskConfig()), {
     gate,
     killSwitch: false,
     maxLiveQuoteNotional: Money.fromString('1000000'),

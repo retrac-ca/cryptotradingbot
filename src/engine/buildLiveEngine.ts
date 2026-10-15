@@ -21,7 +21,6 @@ import { buildRiskManager } from '../risk/index.js';
 import { OrderStore } from '../persistence/OrderStore.js';
 import { ManagedStateStore } from '../persistence/ManagedStateStore.js';
 import { ManualIntentStore } from '../manual/ManualIntentStore.js';
-import { ReconcileService } from '../reconcile/ReconcileService.js';
 import { LiveOrderEngine } from '../execution/LiveExecutionEngine.js';
 import { LiveOrderMonitor } from '../execution/LiveOrderMonitor.js';
 import { createAutonomousLiveSession, endAutonomousLiveSession } from '../execution/AutonomousLiveSession.js';
@@ -83,7 +82,6 @@ export async function buildLiveEngine(cfg: BotConfig, logger: Logger): Promise<L
   const orders = new OrderStore(cfg.orderLedgerFile);
   const live = new ManagedStateStore(cfg.liveManagedStateFile);
   const manualIntents = new ManualIntentStore(cfg.manualIntentFile);
-  const reconcileService = new ReconcileService(exchange, orders);
 
   // The reservation hook needs a market's fee model. NDAX fees are flat across
   // markets, so the configured first pair's market is used.
@@ -107,7 +105,7 @@ export async function buildLiveEngine(cfg: BotConfig, logger: Logger): Promise<L
     expiresAtMs,
   });
 
-  const liveOrderEngine = new LiveOrderEngine(exchange, orders, reconcileService, riskManager, {
+  const liveOrderEngine = new LiveOrderEngine(exchange, orders, riskManager, {
     gate: { tradingMode: 'live', realFundsAtRisk: cfg.realFundsAtRisk },
     killSwitch: cfg.killSwitch,
     maxLiveQuoteNotional: Money.fromNumber(cfg.liveMaxQuoteNotional),

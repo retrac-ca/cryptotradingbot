@@ -315,17 +315,13 @@ but they are important to understand before relying on the live/manual realm:
   A stale candle series therefore fails closed (`STALE_CANDLES`) before the
   strategy evaluates. Direct coordinator constructions without the bound retain
   the legacy behavior; the production composition roots always set it.
-- **Two reconciliation paths coexist.** The newer V1 (`bot reconcile` →
-  `reconcile()`/`commitProven()`) performs execution-level correlation,
-  completeness analysis, fee disposition, reservation and balance reconciliation,
-  and an explicit commit gate; the older V0 (`ReconcileService`/`Reconciler`)
-  is still used by some live-test/live-engine paths. An important behavioral
-  difference: V1 **surfaces** unexpected external exchange balances, whereas V0's
-  balance check iterates only the currencies the bot already expects and therefore
-  does **not** surface unexpected currencies (though neither path auto-adopts
-  them). This is a known architectural coexistence/observability limitation, not
-  an adoption risk. See `docs/RECONCILIATION_UNIFICATION.md` for the proposed
-  unification plan (V0 is currently vestigial in the production path).
+- **Reconciliation is a single V1 path.** `bot reconcile` (and the live/manual
+  paths) use the one V1 implementation (`reconcile()`/`commitProven()`) for
+  execution correlation, completeness analysis, fee disposition, reservation and
+  balance reconciliation, and an explicit commit gate. It **surfaces** unexpected
+  external exchange balances and never auto-adopts them. The legacy V0
+  (`Reconciler`/`ReconcileService`) path was removed (see `docs/DECISIONS.md`
+  §48 and `docs/RECONCILIATION_UNIFICATION.md`).
 
 ## Development
 

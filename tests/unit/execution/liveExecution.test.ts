@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import { rmSync } from 'node:fs';
 import { Money } from '../../../src/money/Money.js';
 import { OrderStore } from '../../../src/persistence/OrderStore.js';
-import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import { LiveOrderEngine, LiveGateError } from '../../../src/execution/LiveExecutionEngine.js';
 import { RiskManager } from '../../../src/risk/RiskManager.js';
 import type { RiskConfig } from '../../../src/risk/RiskConfig.js';
@@ -90,8 +89,7 @@ function buildEngine(
   }
   rmSync(LEDGER, { force: true });
   const store = new OrderStore(LEDGER);
-  const service = new ReconcileService(exchange, store);
-  return new LiveOrderEngine(exchange, store, service, risk, {
+  return new LiveOrderEngine(exchange, store, risk, {
     gate,
     killSwitch: cfg.killSwitch ?? false,
     ackTimeoutMs: cfg.ackTimeoutMs,
@@ -118,8 +116,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     rmSync(LEDGER, { force: true });
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     const store = new OrderStore(LEDGER);
-    const service = new ReconcileService(exchange, store);
-    expect(() => new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), {
+    expect(() => new LiveOrderEngine(exchange, store, new RiskManager(riskConfig()), {
       gate: { tradingMode: 'live', realFundsAtRisk: false },
       killSwitch: false,
       maxLiveQuoteNotional: Money.fromString('1000000'),
@@ -132,8 +129,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     const exchange = new FakeExchange({ balances: { CAD: '100000' }, markets: { 'BTC/CAD': market } });
     (exchange.capabilities as { supportsOrderPlacement: boolean }).supportsOrderPlacement = false;
     const store = new OrderStore(LEDGER);
-    const service = new ReconcileService(exchange, store);
-    expect(() => new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), { gate, killSwitch: false, maxLiveQuoteNotional: Money.fromString('1000000'), maxLiveBaseQuantity: Money.fromString('100') })).toThrow(LiveGateError);
+    expect(() => new LiveOrderEngine(exchange, store, new RiskManager(riskConfig()), { gate, killSwitch: false, maxLiveQuoteNotional: Money.fromString('1000000'), maxLiveBaseQuantity: Money.fromString('100') })).toThrow(LiveGateError);
   });
 
   it('applies the kill switch and refuses to construct when active', () => {
@@ -330,7 +326,7 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     expect(['OPEN', 'FILLED', 'PARTIALLY_FILLED']).toContain(authoritative.status);
   });
 
-  it('records ambiguous submissions for reconciliation and confirms via reconcile', async () => {
+  it('records ambiguous submissions for reconciliation (no retry)', async () => {
     const exchange = new FakeExchange({
       balances: { CAD: '100000' },
       markets: { 'BTC/CAD': market },
@@ -341,9 +337,8 @@ describe('LiveOrderEngine — safety-critical live order placement', () => {
     expect(result.unknownOutcome).toBe(true);
     expect(result.order.status).toBe('UNKNOWN');
     expect(result.order.exchangeOrderId).toBeNull();
-    // The engine refuses to retry; the reconcile() path is the sanctioned next step.
-    const report = await engine.reconcile();
-    expect(typeof report.consistent).toBe('boolean');
+    // The engine refuses to retry. The durable UNKNOWN record is the input to the
+    // single V1 reconciliation path (`bot reconcile`); no V0 engine passthrough exists.
   });
 
   it('never places an order at construction/startup (no automatic first trade)', async () => {

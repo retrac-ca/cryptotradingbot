@@ -21,7 +21,6 @@ import {
 } from '../../../src/persistence/index.js';
 import { ManualIntentStore } from '../../../src/manual/index.js';
 import { Portfolio } from '../../../src/portfolio/Portfolio.js';
-import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import { classifyOrder } from '../../../src/reconcile/index.js';
 import { LiveOrderEngine } from '../../../src/execution/LiveExecutionEngine.js';
 import { RiskManager } from '../../../src/risk/RiskManager.js';
@@ -134,8 +133,7 @@ function abandonedOrder(): Order {
 function buildEngine(fake: FakeExchange, ledger: string): LiveOrderEngine {
   fake.setTicker(SYMBOL, { last: Money.fromString('40000') });
   const store = new OrderStore(ledger);
-  const service = new ReconcileService(fake, store);
-  return new LiveOrderEngine(fake, store, service, new RiskManager(riskConfig()), {
+  return new LiveOrderEngine(fake, store, new RiskManager(riskConfig()), {
     gate: { tradingMode: 'live', realFundsAtRisk: true },
     killSwitch: false,
     maxLiveQuoteNotional: Money.fromString('1000000'),
@@ -282,9 +280,6 @@ describe('P2-2 — ABANDONED is terminal and durable', () => {
     const ledger = statePath('p22-reconcile', 'ledger.json');
     const store = new OrderStore(ledger);
     store.save(abandonedOrder());
-    const fake = new FakeExchange();
-    const service = new ReconcileService(fake, store);
-    expect(service.localLedger().openLocalOrderIds).not.toContain(CLIENT);
     expect(
       classifyOrder({
         localStatus: 'ABANDONED',

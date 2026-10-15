@@ -11,8 +11,6 @@
  * balances and cross-domain validation.
  */
 
-export { Reconciler, TERMINAL } from './Reconciler.js';
-export { ReconcileService } from './ReconcileService.js';
 export { reconcile, commitProven } from './orchestrator.js';
 export type { ReconciliationDeps } from './orchestrator.js';
 export { livePreTradeGate } from './preTradeGate.js';
@@ -42,10 +40,3 @@ export type {
   ReservationDisposition,
   OperatorFindingKind,
 } from './reconciliationTypes.js';
-export type {
-  Discrepancy,
-  ExchangeAccountSnapshot,
-  LocalOrderLedger,
-  ReconcileOptions,
-  ReconcileReport,
-} from './types.js';

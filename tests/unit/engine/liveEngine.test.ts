@@ -5,7 +5,6 @@ import { Portfolio } from '../../../src/portfolio/Portfolio.js';
 import { OrderStore } from '../../../src/persistence/OrderStore.js';
 import { ManagedStateStore } from '../../../src/persistence/ManagedStateStore.js';
 import { ManualIntentStore } from '../../../src/manual/ManualIntentStore.js';
-import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import { RiskManager } from '../../../src/risk/RiskManager.js';
 import type { RiskConfig } from '../../../src/risk/RiskConfig.js';
 import { LiveOrderEngine } from '../../../src/execution/LiveExecutionEngine.js';
@@ -123,7 +122,7 @@ function build(overrides: { killSwitch?: boolean; unknownSubmissions?: boolean }
     expiresAtMs: Date.now() + 3_600_000,
   });
 
-  const liveOrderEngine = new LiveOrderEngine(exchange, orders, new ReconcileService(exchange, orders), riskManager, {
+  const liveOrderEngine = new LiveOrderEngine(exchange, orders, riskManager, {
     gate: { tradingMode: 'live', realFundsAtRisk: true },
     // The engine refuses to construct while the kill switch is on (production
     // checks it earlier); the LiveEngine-level kill switch is exercised instead.

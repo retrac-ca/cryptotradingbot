@@ -1,10 +1,11 @@
 # Reconciliation unification (V0 → V1) — design & plan
 
-**Status: PROPOSED — not implemented. Requires owner approval before execution.**
+**Status: IMPLEMENTED (2026-10-15).** The legacy V0 reconciliation path has been
+removed; a single V1 path remains. See `docs/DECISIONS.md` §48 for the change
+record and validation.
 
-This document scopes the removal of the legacy V0 reconciliation path so a single
-reconciliation implementation remains. It is a plan only; no code is changed by
-this document.
+This document records the scoping and rationale for removing the legacy V0
+reconciliation path so a single reconciliation implementation remains.
 
 ## Background
 

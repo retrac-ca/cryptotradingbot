@@ -6,7 +6,6 @@ import { OrderStore } from '../../../src/persistence/OrderStore.js';
 import { PaperStateStore } from '../../../src/persistence/PaperStateStore.js';
 import { ManagedStateStore } from '../../../src/persistence/ManagedStateStore.js';
 import { ManualIntentStore } from '../../../src/manual/ManualIntentStore.js';
-import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import { Portfolio } from '../../../src/portfolio/Portfolio.js';
 import { buildRiskManager } from '../../../src/risk/index.js';
 import type { BotConfig } from '../../../src/config/schema.js';
@@ -107,7 +106,6 @@ interface Deps {
   store: OrderStore;
   live: ManagedStateStore;
   manualIntents: ManualIntentStore;
-  reconcile: ReconcileService;
   riskManager: ReturnType<typeof buildRiskManager>;
   portfolio: Portfolio;
   confirm?: (message: string) => Promise<boolean>;
@@ -126,7 +124,6 @@ function buildDeps(over: { cfg?: Partial<BotConfig>; adapter?: (e: FakeExchange)
   });
   over.adapter?.(adapter);
   const store = new OrderStore(LEDGER);
-  const reconcile = new ReconcileService(adapter, store);
   const riskManager = buildRiskManager(c);
   // Default managed portfolio: the bot EXCHANGE-CONFIRMED managing 0.25 BTC
   // (as if it acquired it), so the pre-existing exchange balance is all managed.
@@ -145,7 +142,6 @@ function buildDeps(over: { cfg?: Partial<BotConfig>; adapter?: (e: FakeExchange)
     store,
     live,
     manualIntents,
-    reconcile,
     riskManager,
     portfolio,
     confirm: over.confirm ?? (async () => true),

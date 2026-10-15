@@ -14,7 +14,6 @@ import { describe, expect, it } from 'vitest';
 import { rmSync } from 'node:fs';
 import { Money } from '../../../src/money/Money.js';
 import { OrderStore } from '../../../src/persistence/OrderStore.js';
-import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import { LiveOrderEngine, LiveGateError } from '../../../src/execution/LiveExecutionEngine.js';
 import { RiskManager } from '../../../src/risk/RiskManager.js';
 import type { RiskConfig } from '../../../src/risk/RiskConfig.js';
@@ -96,8 +95,7 @@ function buildEngine(
   exchange.setTicker('BTC/CAD', { last: Money.fromString('40000') });
   rmSync(LEDGER, { force: true });
   const store = new OrderStore(LEDGER);
-  const service = new ReconcileService(exchange, store);
-  return new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), {
+  return new LiveOrderEngine(exchange, store, new RiskManager(riskConfig()), {
     gate,
     killSwitch: false,
     maxLiveQuoteNotional: Money.fromString(limits.maxLiveQuoteNotional ?? '1000000'),
@@ -307,8 +305,7 @@ describe('Controlled LIVE scope — one-in-flight order guard', () => {
     await engine.place(riskContext(), limitIntent('first'));
     // Simulate a restart with a fresh engine reading the same durable ledger.
     const store = new OrderStore(LEDGER);
-    const service = new ReconcileService(exchange, store);
-    const restarted = new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), {
+    const restarted = new LiveOrderEngine(exchange, store, new RiskManager(riskConfig()), {
       gate,
       killSwitch: false,
       maxLiveQuoteNotional: Money.fromString('1000000'),
