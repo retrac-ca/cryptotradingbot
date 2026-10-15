@@ -15,10 +15,10 @@
  */
 
 import { loadConfig } from '../config/load.js';
-import { createExchange } from '../exchanges/index.js';
 import { createLogger } from '../logging/logger.js';
 import type { CommandHandler } from './context.js';
 import { runPaperEngine } from './run-engine.js';
+import { runLiveEngine } from './run-live.js';
 import type { BotConfig } from '../config/schema.js';
 
 export const startCommand: CommandHandler = async (args): Promise<number> => {
@@ -48,7 +48,7 @@ export const startCommand: CommandHandler = async (args): Promise<number> => {
   }
 
   if (cfg.tradingMode === 'live') {
-    return runLiveStart(cfg, args);
+    return await runLiveStart(cfg, args);
   }
 
   // eslint-disable-next-line no-console
@@ -62,11 +62,13 @@ export const startCommand: CommandHandler = async (args): Promise<number> => {
 
 /**
  * LIVE start path. Requires the explicit `--confirm-live` flag in addition to
- * the configuration gates, then verifies the adapter's order-placement
- * capability. Every failure path returns non-zero before any engine runs, so a
- * live order can never be placed by accident or on startup.
+ * the configuration gates, and requires autonomous placement to be explicitly
+ * armed (`LIVE_AUTONOMOUS_ENABLED=true`). When armed, it starts the continuous
+ * `LiveEngine` with a bounded autonomous session. Every failure path returns
+ * non-zero before any engine runs, so a live order can never be placed by
+ * accident or on startup.
  */
-function runLiveStart(cfg: BotConfig, args: string[]): number {
+async function runLiveStart(cfg: BotConfig, args: string[]): Promise<number> {
   if (!cfg.realFundsAtRisk) {
     // eslint-disable-next-line no-console
     console.error(
@@ -88,36 +90,27 @@ function runLiveStart(cfg: BotConfig, args: string[]): number {
     return 1;
   }
 
-  const credentials: Record<string, string> = {
-    apiKey: cfg.ndaxApiKey,
-    apiSecret: cfg.ndaxApiSecret,
-    userId: cfg.ndaxUserId,
-    userName: cfg.ndaxUserName,
-  };
-  if (cfg.ndaxAccountId !== undefined) credentials.accountId = String(cfg.ndaxAccountId);
-  const adapter = createExchange(cfg.exchange, {
-    credentials,
-    config: {
-      enableAuthenticatedReads: cfg.enableAuthenticatedReads,
-      baseUrl: cfg.ndaxRestBaseUrl,
-    },
-  });
-
-  if (!adapter.capabilities.supportsOrderPlacement) {
+  if (!cfg.liveAutonomousEnabled) {
     // eslint-disable-next-line no-console
     console.error(
-      `Cannot start live trading: the ${adapter.id} exchange adapter reports ` +
-        'supportsOrderPlacement=false. NDAX order placement is implemented but NOT yet ' +
-        'enabled; live trading fails closed and no order can be placed.',
+      'LIVE mode requested but autonomous order placement is not armed.\n' +
+        'Set LIVE_AUTONOMOUS_ENABLED=true (with TRADING_MODE=live, REAL_FUNDS_AT_RISK=true and\n' +
+        'ENABLE_AUTHENTICATED_READS=true) to run the continuous autonomous engine, or use\n' +
+        '`bot live-test buy|sell` for a single controlled operator-confirmed order.\n' +
+        'Refusing to start.',
     );
     return 1;
   }
 
-  // Unreachable while every registered adapter keeps supportsOrderPlacement
-  // false — kept as an explicit fail-closed sentinel: live start is not wired.
   // eslint-disable-next-line no-console
-  console.error(
-    'Live start is not yet implemented in this milestone. No automatic first trade will be placed.',
+  console.warn(
+    '\n*** AUTONOMOUS LIVE TRADING IS ARMED ***\n' +
+      'The bot will trade real funds, unattended, with LIMIT-IOC orders bounded by\n' +
+      `LIVE_MAX_BASE_QUANTITY=${cfg.liveMaxBaseQuantity}, LIVE_MAX_QUOTE_NOTIONAL=${cfg.liveMaxQuoteNotional}, ` +
+      `and a session budget of ${cfg.liveAutonomousMaxSessionQuoteNotional} quote over ${cfg.liveAutonomousMaxSessionOrders} orders.\n` +
+      'Ctrl-C stops it. KILL_SWITCH=false is required.\n',
   );
-  return 1;
+
+  const logger = createLogger({ level: cfg.logLevel });
+  return runLiveEngine(cfg, logger);
 }
