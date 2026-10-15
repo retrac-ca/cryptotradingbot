@@ -11,12 +11,21 @@
 export { MonitoringService } from './MonitoringService.js';
 export type { MonitoringServiceDeps } from './MonitoringService.js';
 export { createReadOnlyExchangeAdapter } from './readOnlyAdapter.js';
+export {
+  writeEngineStatus,
+  readEngineStatus,
+} from './engineHeartbeat.js';
+export type { EngineStatusRecord, EngineStatusLoad } from './engineHeartbeat.js';
+export { createNotifier, NULL_NOTIFIER } from './notifier.js';
+export type { Notifier, NotifierOptions, Alert } from './notifier.js';
 export type {
   AppliedExecutionSnapshot,
   AttestationSnapshot,
   FillSnapshot,
   HealthSnapshot,
   InitStatus,
+  EngineStatusSnapshot,
+  EquityCurveSnapshot,
   LockStatus,
   ManualSettlementSnapshot,
   MarketSnapshot,

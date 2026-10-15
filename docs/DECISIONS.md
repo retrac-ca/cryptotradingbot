@@ -1921,3 +1921,94 @@ value-required; `--yes`/`--force` still rejected. `npm run typecheck`,
 `npm run lint` clean.
 
 
+## 46. Autonomous LIVE engine + monitoring (2026-10-09)
+
+**Decision.** Add an explicitly-armed, bounded AUTONOMOUS NDAX LIVE engine (the
+continuous counterpart of `PaperEngine`) plus operational monitoring. This is
+the deliberate transition from controlled one-shot live orders to unattended
+trading, gated behind a new, explicit arming mechanism. `supportsOrderPlacement`
+remains `false`.
+
+**Arming mechanism (`src/execution/AutonomousLiveSession.ts`).** A
+process-local, anti-forgery capability (same registry pattern as
+`ControlledLiveAuthorization`) that permits LIMIT+IOC orders for BOTH sides,
+bounded by per-order caps, a session quote-notional/count budget, and an expiry.
+It is minted only by `buildLiveEngine` when ALL of: `LIVE_AUTONOMOUS_ENABLED=true`,
+`TRADING_MODE=live`, `REAL_FUNDS_AT_RISK=true`, `ENABLE_AUTHENTICATED_READS=true`,
+`KILL_SWITCH=false`, and the per-invocation `--confirm-live` flag. It is consumed
+at the exchange mutation boundary (`NdaxAdapter.assertOrderPlacementEnabled` via
+`authorizeAutonomousLiveOrder`), so a session cannot exceed its budget. A cloned
+session with a tampered scope, a forged token, or an expired session is rejected.
+Alternative rejected: flipping `supportsOrderPlacement=true` globally (larger
+blast radius; loses the process-local capability boundary).
+
+**Order type — LIMIT + IOC.** Autonomous orders never rest on the book, so the
+one-in-flight guard stays clean and no auto-cancel path (still disabled) is
+needed. Price is the risk-approved reference (ask/bid); an unfilled IOC is simply
+skipped and retried next cycle. Market orders stay disabled (unbounded
+worst-case price). `LiveOrderEngine` gained optional `tif` on the intent and an
+IOC requirement when a session is armed.
+
+**The `LiveEngine` (`src/engine/LiveEngine.ts`).** Continuous loop:
+- reconciles/accounts each cycle (`LiveOrderMonitor` + `reconcile()` +
+  `commitProven()`), applying only PROVEN quote-fee fills and safe reservation
+  releases;
+- refuses new placement while any unresolved live order exists;
+- requires the action-aware `livePreTradeGate` to allow the exact intended
+  action before submission;
+- places via `LiveOrderEngine.place` using the coordinator's exact `RiskContext`
+  (the engine re-runs RiskManager and builds the order only from that approval);
+- halts new placement (while continuing to observe/account) on reconciliation
+  `HALTED`, read failures, `UNKNOWN` submissions, the kill switch, or N
+  consecutive cycle errors.
+
+**P2 candle freshness.** `evaluateCandleFreshness` + a configured
+`CANDLE_MAX_AGE_MS` (default derived as 3× the timeframe) cause the coordinator
+to skip a market whose newest COMPLETED candle has aged out. Enforcement is
+opt-in at the coordinator level and always set by the production composition
+roots, so direct constructions keep legacy behaviour.
+
+**Monitoring.** The engine writes a heartbeat (`ENGINE_STATUS_FILE`) and an
+append-only equity history (`EQUITY_HISTORY_FILE`). `MonitoringService` exposes
+`engine` and `equityCurve` sections (read-only), surfaced at `/api/engine` and
+`/api/equity` and rendered by a new dashboard Engine panel (heartbeat, P&L/
+positions via the existing portfolio view, order lifecycle, and an equity
+sparkline). Curve geometry is normalized SERVER-SIDE so the browser never parses
+a monetary value with floating point (preserving the dashboard source policy).
+Optional alerting (`ALERT_WEBHOOK_URL` / `ALERT_NTFY_TOPIC`) is fire-and-forget
+and never throws into the engine.
+
+**Ops.** `deploy/systemd/cryptotradingbot-live.service` (`Restart=no`; a crash
+requires human review), `docs/AUTONOMOUS_LIVE.md` runbook, a CI workflow, and
+`.env.example` for every new variable.
+
+**What this does NOT change.** `supportsOrderPlacement` stays `false`; the
+controlled `live-test buy|sell` path and the manual bridge are unchanged;
+accounting remains fail-closed and never claims exactly-once or exchange-proven
+provenance; NDAX `SendOrder`/`CancelOrder` wire details and the first real order
+remain the empirical proof. Tests: `npm test`, `npm run typecheck`,
+`npm run lint`, `npm run build` all green.
+
+### 46.1 F-8 follow-up — bounded managed-valuation staleness (2026-10-09)
+
+The controlled/autonomous LIVE account held pre-existing **illiquid dust**
+(EXTERNAL_AUTHORIZED BTC/ETH/ADA/DOT/SHIB/TLM/ATOM). Under the strict F-8 policy
+(`MARKET_DATA_MAX_AGE_MS=60s`) every non-candidate managed position had to be
+freshly quoted, but the illiquid ones carry exchange quote timestamps
+minutes-to-days old. The whole managed portfolio therefore became unpriceable
+(`UNKNOWN_PORTFOLIO_VALUE`) and **every BUY was rejected**, while SELL exits were
+unaffected. This was correct fail-closed behavior, but it made BUYs impossible.
+
+**Decision.** Add `MANAGED_VALUATION_MAX_AGE_MS` (default `0` = unchanged/strict).
+When positive, it relaxes the **quote-age bound used ONLY to value non-candidate
+managed positions**; the CANDIDATE/executable quote freshness remains
+`MARKET_DATA_MAX_AGE_MS` (60s). Applied in `MarketCoordinator` (`managedValuationPolicy`)
+and the `live-test` context builder (kept consistent so `--check` reflects
+reality). It is a deliberate, bounded operator decision for illiquid inventory —
+never a relaxation of execution freshness — and is documented in `.env.example`
+(a 7-day bound was chosen for this dust).
+
+**Validation.** `tests/unit/engine/coordinatorF8.test.ts` proves a relaxed policy
+values stale dust and allows a fresh candidate BUY, while a stale CANDIDATE is
+still rejected as `STALE_MARKET_DATA`. With the dust allowance set, the read-only
+`bot live-test buy --check` transitions from `BLOCKED` to `READY`.

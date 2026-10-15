@@ -36,7 +36,10 @@ import type { Candle, MarketInfo, Ticker, Timeframe } from '../types.js';
 import type { Signal } from '../strategy/Signal.js';
 import { Money } from '../money/Money.js';
 import { evaluateFreshness, type FreshnessPolicy } from '../marketdata/freshness.js';
-import { completedCandles } from '../marketdata/candles.js';
+import {
+  completedCandles,
+  evaluateCandleFreshness,
+} from '../marketdata/candles.js';
 
 export interface CoordinatorMarketSource {
   /** Market metadata per symbol (null => unknown, risk fails closed). */
@@ -79,6 +82,13 @@ export interface SelectedTrade {
    * `null` when the signal did not provide one.
    */
   entryAnchorPrice: Money | null;
+  /**
+   * The exact `RiskContext` that produced this approval. Carried so a live
+   * execution can submit the SAME transaction the risk layer approved (the live
+   * engine re-runs RiskManager against this context at submission), without
+   * rebuilding a divergent snapshot. Never mutated by callers.
+   */
+  riskContext: RiskContext;
 }
 
 export interface CoordinatorResult {
@@ -108,6 +118,20 @@ export interface CoordinatorDeps {
    * config, not an NDAX-specific format.
    */
   freshnessPolicy: FreshnessPolicy;
+  /**
+   * F-8: freshness policy used ONLY to value NON-candidate managed positions for
+   * portfolio equity/exposure. Defaults to `freshnessPolicy`. A looser
+   * `maxQuoteAgeMs` here (config `MANAGED_VALUATION_MAX_AGE_MS`) allows illiquid
+   * managed inventory to be valued without relaxing the CANDIDATE/executable
+   * quote freshness (which stays `freshnessPolicy`).
+   */
+  managedValuationPolicy?: FreshnessPolicy;
+  /**
+   * P2: maximum age (ms) of the newest COMPLETED candle before the candle
+   * series is treated as stale and the market is skipped. `0`/absent derives a
+   * default of three timeframe intervals via {@link defaultCandleMaxAgeMs}.
+   */
+  candleMaxAgeMs?: number;
 }
 
 export class MarketCoordinator {
@@ -151,6 +175,27 @@ export class MarketCoordinator {
       // live/paper decision input matches the backtest for equivalent completed
       // data. The currently-forming candle (end time in the future) is excluded.
       const candles = completedCandles(marketSource.getCandles(symbol, timeframe), nowMs);
+      // P2: fail closed on a stale candle series BEFORE the strategy evaluates.
+      // Enforced only when a positive `candleMaxAgeMs` is configured (the
+      // production composition roots always set one); a direct coordinator
+      // construction without it preserves the legacy behaviour.
+      const candleMaxAgeMs = this.deps.candleMaxAgeMs ?? 0;
+      if (candleMaxAgeMs > 0) {
+        const candleFreshness = evaluateCandleFreshness(candles, nowMs, candleMaxAgeMs);
+        if (!candleFreshness.fresh) {
+          evaluated.push({
+            symbol,
+            signal: 'HOLD',
+            signalType: 'HOLD',
+            signalReason: null,
+            decision: null,
+            skipped: true,
+            skipReason: `STALE_CANDLES:${candleFreshness.reason}`,
+            relativeSpread: relativeSpreadOf(ticker),
+          });
+          continue;
+        }
+      }
       const managed = portfolio.position(symbol) ?? null;
 
       const strategyCtx: StrategyContext = {
@@ -214,6 +259,7 @@ export class MarketCoordinator {
           // Carry the strategy's anchor verbatim. It is NOT routed through
           // RiskManager/RiskContext/RiskApproval and never alters the decision.
           entryAnchorPrice: signal.entryAnchorPrice ?? null,
+          riskContext: riskCtx,
         });
       }
     }
@@ -266,7 +312,7 @@ export class MarketCoordinator {
         nowMs,
         quoteTimestampMs: posTicker?.timestampMs ?? null,
         observedAtMs: posTicker?.observedAtMs ?? null,
-        policy: this.deps.freshnessPolicy,
+        policy: this.deps.managedValuationPolicy ?? this.deps.freshnessPolicy,
       });
       if (!posFreshness.fresh) {
         valuationUnknown = true;

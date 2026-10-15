@@ -14,7 +14,7 @@
 import { Money } from '../money/Money.js';
 import { join } from 'node:path';
 import { createExchange } from '../exchanges/index.js';
-import { LiveMarketData, requiredCandleLookbackMs } from '../marketdata/index.js';
+import { LiveMarketData, requiredCandleLookbackMs, defaultCandleMaxAgeMs } from '../marketdata/index.js';
 import type { FreshnessPolicy } from '../marketdata/freshness.js';
 import { buildStrategy } from '../strategy/index.js';
 import { buildRiskManager } from '../risk/index.js';
@@ -76,6 +76,15 @@ export function buildEngineDeps(cfg: BotConfig, logger: Logger): PaperEngineDeps
     maxAcceptableFutureSkewMs: cfg.maxClockSkewMs,
   };
 
+  // P2: enforce a candle-series age bound in the decision path. `0` derives the
+  // default (three intervals) rather than disabling the check.
+  const candleMaxAgeMs = cfg.candleMaxAgeMs > 0 ? cfg.candleMaxAgeMs : defaultCandleMaxAgeMs(cfg.timeframe);
+  // F-8 relaxation for valuing non-candidate managed positions only (default off).
+  const managedValuationPolicy: FreshnessPolicy | undefined =
+    cfg.managedValuationMaxAgeMs > 0
+      ? { ...freshnessPolicy, maxQuoteAgeMs: cfg.managedValuationMaxAgeMs }
+      : undefined;
+
   return {
     logger,
     marketData,
@@ -93,6 +102,8 @@ export function buildEngineDeps(cfg: BotConfig, logger: Logger): PaperEngineDeps
     symbols,
     timeframe: cfg.timeframe,
     freshnessPolicy,
+    managedValuationPolicy,
+    candleMaxAgeMs,
     restoredExecutedOrderIds: loaded.executedOrderIds,
   };
 }

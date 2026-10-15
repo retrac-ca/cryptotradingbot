@@ -13,6 +13,8 @@ import {
   recoveryTone,
 } from '../status.js';
 import type {
+  EngineStatusSnapshot,
+  EquityCurveSnapshot,
   HealthSnapshot,
   MarketSnapshot,
   OrdersSnapshot,
@@ -27,6 +29,8 @@ export interface OverviewInput {
   portfolio: PortfolioSnapshot | null;
   orders: OrdersSnapshot | null;
   market: MarketSnapshot | null;
+  engine: EngineStatusSnapshot | null;
+  equity: EquityCurveSnapshot | null;
   health: HealthSnapshot | null;
   reconciliation: ReconciliationViewState;
   /** Process/API reachability derived from the latest status request. */
@@ -51,7 +55,7 @@ function tile(t: Tile): string {
 }
 
 export function renderOverview(input: OverviewInput): string {
-  const { system, portfolio, orders, market, health, reconciliation } = input;
+  const { system, portfolio, orders, market, health, reconciliation, engine, equity } = input;
   const cfg = system?.config ?? null;
 
   const apiTile: Tile = {
@@ -122,6 +126,18 @@ export function renderOverview(input: OverviewInput): string {
     apiTile,
     ndaxTile,
     marketTile,
+    {
+      label: 'Engine',
+      value: engine ? (engine.running ? 'RUNNING' : engine.running === false ? 'STOPPED' : EMPTY) : EMPTY,
+      badgeText: engine ? (engine.halted ? 'HALTED' : engine.status) : 'UNAVAILABLE',
+      tone: engine ? (engine.halted ? 'error' : observationTone(engine.status)) : 'unavailable',
+    },
+    {
+      label: 'Equity',
+      value: equity && equity.status === 'OK' ? displayText(equity.latestEquity ?? engine?.equity) : EMPTY,
+      badgeText: equity ? equity.status : 'UNAVAILABLE',
+      tone: equity ? observationTone(equity.status) : 'unavailable',
+    },
     {
       label: 'LIVE portfolio',
       value: portfolio ? realmSummary(portfolio.live) : EMPTY,

@@ -62,11 +62,16 @@ import type {
 } from '../persistence/index.js';
 import { ManualIntentStore } from '../manual/ManualIntentStore.js';
 import { createReadOnlyExchangeAdapter } from './readOnlyAdapter.js';
+import { readEngineStatus } from './engineHeartbeat.js';
+import { readEquityHistory } from '../persistence/equityHistory.js';
+import type { EquitySample } from '../persistence/equityHistory.js';
 import type {
   AttestationSnapshot,
   FillSnapshot,
   HealthSnapshot,
   InitStatus,
+  EngineStatusSnapshot,
+  EquityCurveSnapshot,
   LockStatus,
   ManualSettlementSnapshot,
   MarketSnapshot,
@@ -109,6 +114,18 @@ export interface MonitoringServiceDeps {
   initMarker: StateInitMarker;
   /** State directory (used only for a read-only mutation-lock presence check). */
   stateDir: string;
+  /**
+   * Optional engine heartbeat file written by the running engine. When absent,
+   * the engine section is UNAVAILABLE (the service never starts its own engine).
+   */
+  engineStatusFile?: string | null;
+  /**
+   * Optional append-only equity-curve history file written by the running engine.
+   * When absent, the equity-curve section is UNAVAILABLE.
+   */
+  equityHistoryFile?: string | null;
+  /** Max equity-curve samples returned (tail). Default 500. */
+  equityHistoryLimit?: number;
   /**
    * Optional in-process market-data provider. When absent, market data is
    * reported as UNAVAILABLE — the service never starts its own polling process
@@ -162,7 +179,57 @@ export class MonitoringService {
       portfolios: this.buildPortfolios(capturedAtMs),
       orders: this.readOrders(capturedAtMs),
       market: this.readMarket(capturedAtMs),
+      engine: this.readEngine(capturedAtMs),
+      equityCurve: this.readEquityCurve(),
     };
+  }
+
+  // -------------------------------------------------------------------------
+  // Engine heartbeat + equity curve (read-only files written by the engine)
+  // -------------------------------------------------------------------------
+
+  private readEngine(nowMs: number): EngineStatusSnapshot {
+    if (!this.deps.engineStatusFile) {
+      return { status: 'UNAVAILABLE', ...emptyEngineFields(), reason: 'no engine status file configured' };
+    }
+    const r = readEngineStatus(this.deps.engineStatusFile);
+    if (r.status === 'MISSING') {
+      return { status: 'MISSING', ...emptyEngineFields(), reason: 'no engine heartbeat (engine not running)' };
+    }
+    if (r.status === 'CORRUPT') {
+      return { status: 'CORRUPT', ...emptyEngineFields(), reason: r.reason };
+    }
+    const s = r.data.status as Record<string, unknown>;
+    const halt = (s.halt ?? null) as { reason?: unknown } | null;
+    return {
+      status: 'OK',
+      kind: r.data.kind,
+      updatedAtMs: r.data.updatedAtMs,
+      ageMs: nowMs - r.data.updatedAtMs,
+      running: typeof s.running === 'boolean' ? s.running : null,
+      halted: typeof s.halted === 'boolean' ? s.halted : null,
+      haltReason: halt && typeof halt.reason === 'string' ? halt.reason : null,
+      lastEvaluateMs: typeof s.lastEvaluateMs === 'number' ? s.lastEvaluateMs : null,
+      lastReconciliationStatus: typeof s.lastReconciliationStatus === 'string' ? s.lastReconciliationStatus : null,
+      ordersPlaced: typeof s.ordersPlaced === 'number' ? s.ordersPlaced : null,
+      equity: typeof s.equity === 'string' ? s.equity : null,
+    };
+  }
+
+  private readEquityCurve(): EquityCurveSnapshot {
+    if (!this.deps.equityHistoryFile) {
+      return { status: 'UNAVAILABLE', samples: [], latestEquity: null, points: [], reason: 'no equity history file configured' };
+    }
+    const r = readEquityHistory(this.deps.equityHistoryFile, this.deps.equityHistoryLimit ?? 500);
+    if (r.status === 'MISSING') {
+      return { status: 'MISSING', samples: [], latestEquity: null, points: [], reason: 'no equity history yet' };
+    }
+    if (r.status === 'ERROR') {
+      return { status: 'ERROR', samples: [], latestEquity: null, points: [], reason: r.reason };
+    }
+    const samples: EquitySample[] = r.samples;
+    const latest = samples.length > 0 ? samples[samples.length - 1]!.equity : null;
+    return { status: 'OK', samples, latestEquity: latest, points: normalizeEquityPoints(samples) };
   }
 
   // -------------------------------------------------------------------------
@@ -589,6 +656,21 @@ function provenance(
     : { kind, asOfMs, fetchedAtMs, stale, detail };
 }
 
+/** Null engine fields for the MISSING/CORRUPT/UNAVAILABLE cases. */
+function emptyEngineFields(): Omit<EngineStatusSnapshot, 'status' | 'reason'> {  return {
+    kind: null,
+    updatedAtMs: null,
+    ageMs: null,
+    running: null,
+    halted: null,
+    haltReason: null,
+    lastEvaluateMs: null,
+    lastReconciliationStatus: null,
+    ordersPlaced: null,
+    equity: null,
+  };
+}
+
 function nullRealmFields(): Omit<
   PortfolioRealmSnapshot,
   'realm' | 'status' | 'reason' | 'provenance'
@@ -790,4 +872,24 @@ function unavailableMarket(
     staleReason: reason,
     lastError: lastError ? lastError.message : null,
   };
+}
+
+/**
+ * Normalize a series of exact-decimal equity strings into dimensionless
+ * geometry (x, y in [0,1]) for the browser. This is the ONLY place a monetary
+ * value is parsed to a JS number, and it is purely for pixel scaling — never
+ * accounting.
+ */
+function normalizeEquityPoints(samples: EquitySample[]): Array<{ x: number; y: number }> {
+  if (samples.length === 0) return [];
+  if (samples.length === 1) return [{ x: 0, y: 0.5 }];
+  const values = samples.map((s) => Number(s.equity));
+  if (values.some((v) => !Number.isFinite(v))) return [];
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min;
+  return values.map((v, i) => ({
+    x: i / (values.length - 1),
+    y: range === 0 ? 0.5 : (v - min) / range,
+  }));
 }

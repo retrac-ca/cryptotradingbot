@@ -30,6 +30,19 @@ export type {
   ControlledLiveAuthorization,
   ControlledLiveScope,
 } from './ControlledLiveAuthorization.js';
+export {
+  createAutonomousLiveSession,
+  isAutonomousLiveSession,
+  evaluateAutonomousLiveOrder,
+  authorizeAutonomousLiveOrder,
+  endAutonomousLiveSession,
+  autonomousSessionUsage,
+} from './AutonomousLiveSession.js';
+export type {
+  AutonomousLiveSession,
+  AutonomousLiveScope,
+  SessionAuthorizationResult,
+} from './AutonomousLiveSession.js';
 export { classifyReattachment, isProvableReattachmentMatch } from './recovery.js';
 export type {
   ReattachmentOutcome,

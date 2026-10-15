@@ -39,13 +39,14 @@ describe('bot start — live confirmation gates', () => {
     expect(errorSpy.mock.calls.join(' ')).toMatch(/REAL_FUNDS_AT_RISK/);
   });
 
-  it('refuses live start while the exchange adapter reports supportsOrderPlacement=false', async () => {
+  it('refuses live start while autonomous placement is not armed', async () => {
     vi.stubEnv('TRADING_MODE', 'live');
     vi.stubEnv('REAL_FUNDS_AT_RISK', 'true');
+    vi.stubEnv('LIVE_AUTONOMOUS_ENABLED', 'false');
     const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const code = await startCommand(['--confirm-live']);
     expect(code).toBe(1);
-    expect(errorSpy.mock.calls.join(' ')).toContain('supportsOrderPlacement');
+    expect(errorSpy.mock.calls.join(' ')).toContain('LIVE_AUTONOMOUS_ENABLED');
   });
 
   it('refuses when the kill switch is active', async () => {

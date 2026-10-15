@@ -42,18 +42,27 @@ This project is under active development, built incrementally in phases. See
 - A **backtesting** module (`bot backtest`) that replays historical candles
   through the strategy → risk → execution pipeline and reports performance
 - A **live execution engine** with strict safety controls, and the NDAX
-  SendOrder/CancelOrder network paths — both kept **disabled**
-- An **explicit live-confirmation mechanism** — `bot start` requires
-  `TRADING_MODE=live` + `REAL_FUNDS_AT_RISK=true` **and** a per-invocation
-  `--confirm-live` flag before it will even consider live mode
+  SendOrder/CancelOrder network paths — the controlled one-shot path and the
+  **autonomous engine** are the only routes, both explicitly armed and bounded
+- An **explicit live-confirmation mechanism** — `bot live-test` and `bot start`
+  require `TRADING_MODE=live` + `REAL_FUNDS_AT_RISK=true`, and `bot start` also
+  requires `LIVE_AUTONOMOUS_ENABLED=true` plus a per-invocation `--confirm-live`
+- An **autonomous LIVE engine** (`src/engine/LiveEngine.ts`) that runs the
+  strategy → risk → coordinator loop continuously with LIMIT+IOC orders, live
+  reconciliation/accounting each cycle, and automatic halts on reconciliation
+  failure, `UNKNOWN` orders, or repeated errors (see `docs/AUTONOMOUS_LIVE.md`)
+- **Monitoring**: a read-only dashboard API plus engine heartbeat, live managed
+  equity, an equity curve, and optional webhook/ntfy alerts
 
-**Live order execution is not yet enabled for NDAX.** The live execution engine,
-reconciliation, and the order-placement network paths are implemented and fully
-tested, but the NDAX adapter keeps real order placement **disabled**
-(`supportsOrderPlacement=false`) because NDAX order-submission semantics and
-private-header signing have not yet been verified against a live account and
-there is no official public testnet. Live trading therefore fails closed (even
-`bot start --confirm-live` refuses) until that is individually validated.
+**Live order execution is deliberately hard to enable.** The controlled one-shot
+`bot live-test buy|sell` path lets an operator make a single, risk-sized,
+operator-confirmed order. Autonomous live trading is additionally gated by an
+explicit arming flag (`LIVE_AUTONOMOUS_ENABLED=true`) plus `--confirm-live`, and
+is bounded by per-order caps and a session budget. The NDAX adapter keeps
+`supportsOrderPlacement=false`; order placement is permitted only through an
+explicit, process-local capability (a controlled-test authorization or an armed
+autonomous session). Live trading fails closed (and `bot start` refuses) until
+that arming is deliberate.
 
 ## Requirements
 
@@ -117,7 +126,7 @@ A fresh clone can be up and running in PAPER mode like this:
 | `setup` | Create a `.env` file from the template (never overwrites) |
 | `config` | Show the effective resolved (non-secret) configuration |
 | `paper` | Start the bot in SAFE simulated trading mode |
-| `start` | Start the bot (honors `TRADING_MODE`, paper by default) |
+| `start` | Start the bot (honors `TRADING_MODE`, paper by default). In live mode with `LIVE_AUTONOMOUS_ENABLED=true`, `--confirm-live` starts the autonomous engine (see `docs/AUTONOMOUS_LIVE.md`) |
 | `status` | Show current bot/trading status |
 | `backtest <candles.json>` | Run a historical backtest and report performance |
 | `trades` | Show the durable order ledger |
@@ -155,6 +164,13 @@ Key settings:
   default to files under it (see below). `LIVE_MANAGED_STATE_FILE` is the
   separate store for the bot's **live managed** inventory and must differ from
   `PAPER_STATE_FILE` (the config refuses to run if they are the same).
+- Autonomous + monitoring (see `.env.example` for all): `LIVE_AUTONOMOUS_ENABLED`
+  (default `false`), `LIVE_AUTONOMOUS_MAX_SESSION_QUOTE_NOTIONAL`,
+  `LIVE_AUTONOMOUS_MAX_SESSION_ORDERS`, `LIVE_AUTONOMOUS_SESSION_MINUTES`,
+  `CANDLE_MAX_AGE_MS` (0 = derive 3× timeframe), `MANAGED_VALUATION_MAX_AGE_MS`
+  (0 = strict; loosen only for illiquid managed dust valuation), `ALERT_WEBHOOK_URL` /
+  `ALERT_NTFY_TOPIC`, and `ENGINE_STATUS_FILE` / `EQUITY_HISTORY_FILE` (the
+  dashboard reads the latter two).
 
 ### State directory and runtime files
 
@@ -167,6 +183,8 @@ following files are created there and are git-ignored — do not commit them:
   (kept separate from paper state)
 - `order-ledger.json` — the durable order ledger, keyed by `clientOrderId`
 - `manual-intents.json` — manual-execution intents (Gate 9)
+- `engine-status.json` — the running engine's heartbeat (read by the dashboard)
+- `equity-history.jsonl` — append-only managed-equity history (read by the dashboard)
 - `.init.json` — the per-realm initialization marker, used to distinguish a
   genuine first run from unexpected state loss (a missing state file after
   initialization fails closed rather than re-seeding)
@@ -234,23 +252,30 @@ win rate, realized P&L, fees, max drawdown, and largest win/loss.
 - API credentials are stored only in your environment / `.env` (which is
   git-ignored) and are never logged.
 
-**Live order placement is not yet enabled for NDAX.** The live execution engine,
-reconciliation, and the NDAX SendOrder/CancelOrder network paths exist and are
-tested, but the NDAX adapter refuses real order placement
-(`supportsOrderPlacement=false`) until its order semantics and private-header
-signing are verified against a live account. Live mode fails closed.
+**Live order placement is gated, not freely enabled.** The NDAX adapter keeps
+`supportsOrderPlacement=false`; it reaches `SendOrder` only through an explicit,
+process-local capability — a one-shot controlled-test authorization
+(`bot live-test buy|sell`) or an armed autonomous session (`bot start`, see
+`docs/AUTONOMOUS_LIVE.md`). Both are bounded, and neither is a generic
+"live enabled" flag.
 
-**Controlled LIVE scope (readiness only).** The software now enforces a tightly
-bounded controlled LIVE workflow as groundwork, but this does **not** authorize
-live trading. PAPER remains the default and safe mode; autonomous NDAX LIVE
-order placement is still disabled (`supportsOrderPlacement=false`). Within that
-bounded scope: LIVE **market orders remain disabled** (worst-case execution
-price is not currently bounded); only **LIMIT orders** with an explicit price are
-permitted, capped by `LIVE_MAX_BASE_QUANTITY` and `LIVE_MAX_QUOTE_NOTIONAL`;
-**at most one unresolved live order** may exist at a time; **UNKNOWN** orders
-always require reconciliation and are never auto-retried; **automatic
-cancellation is disabled**. This is not authorization for unrestricted LIVE
-trading.
+**Controlled/autonomous LIVE scope.** PAPER remains the default and safe mode.
+Within the bounded scope: LIVE **market orders remain disabled** (worst-case
+execution price is not bounded); only **LIMIT orders** are permitted (the
+autonomous engine uses **IOC**, so orders never rest); orders are capped by
+`LIVE_MAX_BASE_QUANTITY` / `LIVE_MAX_QUOTE_NOTIONAL` and, for the autonomous
+engine, a **session budget** (`LIVE_AUTONOMOUS_MAX_SESSION_QUOTE_NOTIONAL` /
+`LIVE_AUTONOMOUS_MAX_SESSION_ORDERS`) and expiry; **at most one unresolved live
+order** may exist at a time; **UNKNOWN** orders always require reconciliation and
+are never auto-retried; **automatic cancellation is disabled**. The autonomous
+engine halts new placement on any reconciliation failure, `UNKNOWN` order, or
+repeated cycle error.
+
+**Autonomous LIVE arming.** The continuous autonomous engine is reachable only
+when `TRADING_MODE=live`, `REAL_FUNDS_AT_RISK=true`, `ENABLE_AUTHENTICATED_READS=true`,
+`KILL_SWITCH=false`, **and** `LIVE_AUTONOMOUS_ENABLED=true`, **and**
+`--confirm-live` is passed on the invocation. Config validation enforces the
+first four. Read `docs/AUTONOMOUS_LIVE.md` before arming.
 
 **Controlled-test mutation arming (readiness only).** The only way the software
 can reach `SendOrder` today is via the explicit `bot live-test sell` path, which
@@ -283,17 +308,13 @@ authorization for unrestricted trading.
 These are documented limitations that do **not** invalidate the PAPER-first V1,
 but they are important to understand before relying on the live/manual realm:
 
-- **Candle-series freshness is not age-checked at decision time.** The strategy
-  decision path checks ticker/quote freshness (quote age, transport age, and
-  future-skew), but does **not** explicitly age-check the candle series the
-  strategy evaluates. This means a strategy could theoretically evaluate a stale
-  candle series while the ticker is fresh enough for risk approval. This is a
-  **P2 LIVE-readiness limitation** — it is **not** a demonstrated failure of the
-  completed 24-hour PAPER soak (the soak's 22 `STALE_MARKET_DATA` events were
-  ticker/quote-freshness rejections, not candle staleness). It must be addressed
-  before autonomous NDAX LIVE trading could be considered. Note autonomous NDAX
-  LIVE remains disabled independently for the broader NDAX capability/evidence
-  reasons above.
+- **Candle-series freshness is now age-checked at decision time (P2 addressed).**
+  The continuous paper/live decision path (`MarketCoordinator`) skips a market
+  whose newest **completed** candle is older than `CANDLE_MAX_AGE_MS` (default
+  derived as three timeframe intervals), independently of ticker/quote freshness.
+  A stale candle series therefore fails closed (`STALE_CANDLES`) before the
+  strategy evaluates. Direct coordinator constructions without the bound retain
+  the legacy behavior; the production composition roots always set it.
 - **Two reconciliation paths coexist.** The newer V1 (`bot reconcile` →
   `reconcile()`/`commitProven()`) performs execution-level correlation,
   completeness analysis, fee disposition, reservation and balance reconciliation,

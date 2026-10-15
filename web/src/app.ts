@@ -16,6 +16,7 @@ import { badge, healthTone } from './status.js';
 import { renderMarket } from './views/market.js';
 import { renderOrders } from './views/orders.js';
 import { renderOverview } from './views/overview.js';
+import { renderEngine } from './views/engine.js';
 import { renderPortfolio } from './views/portfolio.js';
 import {
   emptyReconciliationState,
@@ -24,6 +25,8 @@ import {
 } from './views/reconciliation.js';
 import { renderSystem } from './views/system.js';
 import type {
+  EngineStatusSnapshot,
+  EquityCurveSnapshot,
   HealthSnapshot,
   MarketSnapshot,
   OrdersSnapshot,
@@ -37,6 +40,8 @@ export const REFRESH_INTERVALS = {
   portfolio: 10_000,
   orders: 10_000,
   market: 5_000,
+  engine: 5_000,
+  equity: 15_000,
   health: 30_000,
   healthz: 10_000,
 } as const;
@@ -50,6 +55,10 @@ interface DashboardState {
   ordersError: string | null;
   market: MarketSnapshot | null;
   marketError: string | null;
+  engine: EngineStatusSnapshot | null;
+  engineError: string | null;
+  equity: EquityCurveSnapshot | null;
+  equityError: string | null;
   health: HealthSnapshot | null;
   healthError: string | null;
   apiReachable: boolean | null;
@@ -66,6 +75,10 @@ export class Dashboard {
     ordersError: null,
     market: null,
     marketError: null,
+    engine: null,
+    engineError: null,
+    equity: null,
+    equityError: null,
     health: null,
     healthError: null,
     apiReachable: null,
@@ -86,6 +99,8 @@ export class Dashboard {
       { key: 'portfolio', intervalMs: REFRESH_INTERVALS.portfolio, run: () => this.refreshPortfolio() },
       { key: 'orders', intervalMs: REFRESH_INTERVALS.orders, run: () => this.refreshOrders() },
       { key: 'market', intervalMs: REFRESH_INTERVALS.market, run: () => this.refreshMarket() },
+      { key: 'engine', intervalMs: REFRESH_INTERVALS.engine, run: () => this.refreshEngine() },
+      { key: 'equity', intervalMs: REFRESH_INTERVALS.equity, run: () => this.refreshEquity() },
       { key: 'health', intervalMs: REFRESH_INTERVALS.health, run: () => this.refreshHealth() },
       { key: 'healthz', intervalMs: REFRESH_INTERVALS.healthz, run: () => this.refreshHealthz() },
     ]);
@@ -164,6 +179,29 @@ export class Dashboard {
     this.renderOverviewSection();
   }
 
+  private async refreshEngine(): Promise<void> {
+    const result = await this.client.getEngine();
+    if (result.ok && result.data) {
+      this.state.engine = result.data;
+      this.state.engineError = null;
+    } else {
+      this.state.engineError = result.error ?? `HTTP ${result.status}`;
+    }
+    this.renderEngineSection();
+    this.renderOverviewSection();
+  }
+
+  private async refreshEquity(): Promise<void> {
+    const result = await this.client.getEquity();
+    if (result.ok && result.data) {
+      this.state.equity = result.data;
+      this.state.equityError = null;
+    } else {
+      this.state.equityError = result.error ?? `HTTP ${result.status}`;
+    }
+    this.renderEngineSection();
+  }
+
   private async refreshHealth(): Promise<void> {
     const result: ApiResult<HealthSnapshot> = await this.client.getHealth();
     // A non-OK health is returned with a 503 and a valid HealthSnapshot body;
@@ -222,6 +260,7 @@ export class Dashboard {
   private renderAll(): void {
     this.renderOverviewSection();
     this.renderMarketSection();
+    this.renderEngineSection();
     this.renderPortfolioSection();
     this.renderOrdersSection();
     this.renderReconciliationSection();
@@ -267,6 +306,8 @@ export class Dashboard {
       portfolio: this.state.portfolio,
       orders: this.state.orders,
       market: this.state.market,
+      engine: this.state.engine,
+      equity: this.state.equity,
       health: this.state.health,
       reconciliation: this.state.reconciliation,
       apiReachable: this.state.apiReachable,
@@ -276,6 +317,11 @@ export class Dashboard {
   private renderMarketSection(): void {
     const el = this.section('market');
     if (el) el.innerHTML = renderMarket(this.state.market, this.state.marketError);
+  }
+
+  private renderEngineSection(): void {
+    const el = this.section('engine');
+    if (el) el.innerHTML = renderEngine(this.state.engine, this.state.equity, this.state.engineError ?? this.state.equityError);
   }
 
   private renderPortfolioSection(): void {

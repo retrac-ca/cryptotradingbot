@@ -55,3 +55,47 @@ export function completedCandles(candles: Candle[], nowMs: number): Candle[] {
   if (candles.length === 0) return candles;
   return candles.filter((c) => c.timestampMs <= nowMs);
 }
+
+/**
+ * Default maximum age (ms) of the newest completed candle before a candle
+ * series is considered stale. Three intervals tolerates one missed/gap bar plus
+ * a small margin while still failing closed on a genuinely stale series (P2).
+ */
+export function defaultCandleMaxAgeMs(timeframe: Timeframe): number {
+  return 3 * TIMEFRAME_MS[timeframe];
+}
+
+export type CandleFreshnessCheck =
+  | { fresh: true; newestTimestampMs: number }
+  | { fresh: false; reason: 'CANDLE_MISSING' | 'CANDLE_STALE'; detail: string };
+
+/**
+ * P2: age-check the candle series used for a decision. A strategy must not
+ * evaluate a stale candle series while the ticker is fresh enough for risk
+ * approval. `timestampMs` is the candle END/CLOSE time, so the newest completed
+ * candle's timestamp is its close time; if that close is older than `maxAgeMs`
+ * the series is stale. Missing (no completed candle) also fails closed.
+ *
+ * Pure and deterministic; the same policy is used by the continuous engine.
+ */
+export function evaluateCandleFreshness(
+  candles: Candle[],
+  nowMs: number,
+  maxAgeMs: number,
+): CandleFreshnessCheck {
+  const newest = candles.reduce<number | null>(
+    (acc, c) => (acc === null || c.timestampMs > acc ? c.timestampMs : acc),
+    null,
+  );
+  if (newest === null) {
+    return { fresh: false, reason: 'CANDLE_MISSING', detail: 'no completed candle available' };
+  }
+  if (nowMs - newest > maxAgeMs) {
+    return {
+      fresh: false,
+      reason: 'CANDLE_STALE',
+      detail: `newest completed candle is ${nowMs - newest}ms old (max ${maxAgeMs}ms)`,
+    };
+  }
+  return { fresh: true, newestTimestampMs: newest };
+}

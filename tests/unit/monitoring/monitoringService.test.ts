@@ -13,6 +13,8 @@ import {
 import { ManualIntentStore } from '../../../src/manual/ManualIntentStore.js';
 import { createReadOnlyExchangeAdapter, MonitoringService } from '../../../src/monitoring/index.js';
 import type { MonitoringServiceDeps } from '../../../src/monitoring/index.js';
+import { writeEngineStatus } from '../../../src/monitoring/engineHeartbeat.js';
+import { appendEquitySample } from '../../../src/persistence/equityHistory.js';
 import type { BotConfig } from '../../../src/config/schema.js';
 import type { MarketDataProvider } from '../../../src/marketdata/types.js';
 import type { OrderBook, Ticker } from '../../../src/types.js';
@@ -408,5 +410,43 @@ describe('MonitoringService — read-only read model', () => {
     expect(health.status).toBe('ERROR');
     expect(health.connected).toBeNull();
     expect(health.error).toContain('simulated network failure');
+  });
+
+  it('reports the engine heartbeat and equity curve read-only', async () => {
+    const engineFile = join(dir, 'engine-status.json');
+    const equityFile = join(dir, 'equity-history.jsonl');
+    writeEngineStatus(engineFile, {
+      kind: 'live',
+      updatedAtMs: NOW - 2000,
+      status: { running: true, halted: false, ordersPlaced: 3, equity: '1234.5', lastReconciliationStatus: 'READY' },
+    });
+    appendEquitySample(equityFile, { atMs: NOW - 3000, equity: '1000', cash: { CAD: '1000' } });
+    appendEquitySample(equityFile, { atMs: NOW - 1000, equity: '1234.5', cash: { CAD: '234.5' } });
+
+    const service = makeService({ engineStatusFile: engineFile, equityHistoryFile: equityFile });
+    const snap = await service.getSnapshot();
+    expect(snap.engine.status).toBe('OK');
+    expect(snap.engine.kind).toBe('live');
+    expect(snap.engine.running).toBe(true);
+    expect(snap.engine.halted).toBe(false);
+    expect(snap.engine.ordersPlaced).toBe(3);
+    expect(snap.engine.equity).toBe('1234.5');
+    expect(snap.engine.ageMs).toBe(2000);
+
+    expect(snap.equityCurve.status).toBe('OK');
+    expect(snap.equityCurve.samples).toHaveLength(2);
+    expect(snap.equityCurve.latestEquity).toBe('1234.5');
+    // Server-computed dimensionless geometry (x in [0,1], y rising).
+    expect(snap.equityCurve.points).toHaveLength(2);
+    expect(snap.equityCurve.points[0]).toEqual({ x: 0, y: 0 });
+    expect(snap.equityCurve.points[1]!.x).toBe(1);
+    expect(snap.equityCurve.points[1]!.y).toBe(1);
+  });
+
+  it('reports engine/equity as UNAVAILABLE when not configured', async () => {
+    const service = makeService();
+    const snap = await service.getSnapshot();
+    expect(snap.engine.status).toBe('UNAVAILABLE');
+    expect(snap.equityCurve.status).toBe('UNAVAILABLE');
   });
 });

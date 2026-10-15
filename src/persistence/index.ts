@@ -22,6 +22,8 @@ export type { StateInitPayload } from './init.js';
 export { recoverState, requireOk } from './recovery.js';
 export type { RecoveryInputs } from './recovery.js';
 export { migrateLegacyState } from './migration.js';
+export { appendEquitySample, readEquityHistory } from './equityHistory.js';
+export type { EquitySample, EquityHistoryLoad } from './equityHistory.js';
 export {
   CorruptStateError,
   StateLockedError,

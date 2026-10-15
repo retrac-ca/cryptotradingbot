@@ -23,6 +23,16 @@ import type {
 import type { NewOrder, Order, OrderStatus } from '../order.js';
 import type { ExchangeCapabilities } from './types.js';
 import type { ControlledLiveAuthorization } from '../execution/ControlledLiveAuthorization.js';
+import type { AutonomousLiveSession } from '../execution/AutonomousLiveSession.js';
+
+/**
+ * An explicit, narrowly-scoped capability that may permit a mutation on an
+ * adapter that otherwise reports `supportsOrderPlacement=false`. Either a
+ * single-use controlled-test authorization (one side, one order) or an armed
+ * autonomous live session (both sides, LIMIT+IOC, bounded by per-order caps and
+ * a session budget). Neither is a generic "live enabled" flag.
+ */
+export type PlacementAuthorization = ControlledLiveAuthorization | AutonomousLiveSession;
 
 /** Connectivity/health of an exchange. */
 export interface ExchangeHealth {
@@ -96,11 +106,12 @@ export interface ExchangeAdapter {
    * execution engine.
    *
    * `authorization` is an optional, explicitly-scoped controlled-test
-   * authorization. When present and valid, it may permit a narrowly-scoped
-   * SELL/LIMIT mutation on an adapter that otherwise reports
-   * `supportsOrderPlacement=false`. It is NOT a generic "live enabled" flag.
+   * authorization or an armed autonomous live session. When present and valid,
+   * it may permit a narrowly-scoped mutation on an adapter that otherwise
+   * reports `supportsOrderPlacement=false`. It is NOT a generic "live enabled"
+   * flag.
    */
-  placeOrder(order: NewOrder, authorization?: ControlledLiveAuthorization): Promise<PlaceOrderResult>;
+  placeOrder(order: NewOrder, authorization?: PlacementAuthorization): Promise<PlaceOrderResult>;
 
   cancelOrder(symbol: string, exchangeOrderId: string): Promise<CancelResult>;
 }

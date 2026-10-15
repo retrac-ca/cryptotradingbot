@@ -270,6 +270,8 @@ const KNOWN_PATHS: ReadonlySet<string> = new Set([
   '/api/portfolio',
   '/api/orders',
   '/api/market',
+  '/api/engine',
+  '/api/equity',
   '/api/health',
   '/api/reconciliation',
 ]);
@@ -337,6 +339,12 @@ async function dispatch(model: MonitoringReadModel, pathname: string): Promise<J
 
     case '/api/market':
       return { status: 200, body: (await model.getSnapshot()).market };
+
+    case '/api/engine':
+      return { status: 200, body: (await model.getSnapshot()).engine };
+
+    case '/api/equity':
+      return { status: 200, body: (await model.getSnapshot()).equityCurve };
 
     case '/api/health': {
       const health = await model.getHealth();

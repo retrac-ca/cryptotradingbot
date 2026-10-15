@@ -343,3 +343,36 @@ export interface ReconciliationResponse {
 export interface ApiErrorEnvelope {
   error: { code: string; message: string };
 }
+
+// --- Engine heartbeat + equity curve ----------------------------------------
+
+export interface EngineStatusSnapshot {
+  status: ObservationStatus;
+  kind: 'paper' | 'live' | null;
+  updatedAtMs: number | null;
+  ageMs: number | null;
+  running: boolean | null;
+  halted: boolean | null;
+  haltReason: string | null;
+  lastEvaluateMs: number | null;
+  lastReconciliationStatus: string | null;
+  ordersPlaced: number | null;
+  equity: string | null;
+  reason?: string;
+}
+
+export interface EquitySample {
+  atMs: number;
+  equity: string;
+  cash: Record<string, string>;
+  note?: string;
+}
+
+export interface EquityCurveSnapshot {
+  status: ObservationStatus;
+  samples: EquitySample[];
+  latestEquity: string | null;
+  /** Server-computed dimensionless curve geometry (x, y in [0,1]). */
+  points: Array<{ x: number; y: number }>;
+  reason?: string;
+}
