@@ -180,6 +180,8 @@ export const dashboardCommand: CommandHandler = async (args, { logger }): Promis
     manualIntents: new ManualIntentStore(cfg.manualIntentFile),
     initMarker: new StateInitMarker(join(cfg.stateDir, '.init.json')),
     stateDir: cfg.stateDir,
+    engineStatusFile: cfg.engineStatusFile,
+    equityHistoryFile: cfg.equityHistoryFile,
     // No in-process market data provider in a standalone dashboard process:
     // /api/market reports UNAVAILABLE rather than inventing values.
     adapter,

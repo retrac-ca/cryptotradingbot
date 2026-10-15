@@ -18,6 +18,7 @@
  */
 
 import type { ReconciliationResult } from '../reconcile/reconciliationTypes.js';
+import type { EquitySample } from '../persistence/equityHistory.js';
 
 /** The origin/authority of a value in the snapshot. */
 export type ValueKind =
@@ -324,4 +325,47 @@ export interface MonitoringSnapshot {
   portfolios: PortfolioSnapshot;
   orders: OrdersSnapshot;
   market: MarketSnapshot;
+  /** Running-engine heartbeat (paper or live), read-only. */
+  engine: EngineStatusSnapshot;
+  /** Durable equity-curve history tail, read-only. */
+  equityCurve: EquityCurveSnapshot;
+}
+
+// ---------------------------------------------------------------------------
+// Engine heartbeat (read-only)
+// ---------------------------------------------------------------------------
+
+export interface EngineStatusSnapshot {
+  status: ObservationStatus;
+  kind: 'paper' | 'live' | null;
+  updatedAtMs: number | null;
+  /** Age of the heartbeat vs `nowMs` (null when missing/corrupt). */
+  ageMs: number | null;
+  running: boolean | null;
+  halted: boolean | null;
+  haltReason: string | null;
+  lastEvaluateMs: number | null;
+  lastReconciliationStatus: string | null;
+  ordersPlaced: number | null;
+  /** Best-effort managed equity from the engine, exact decimal string. */
+  equity: string | null;
+  reason?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Equity curve (read-only, append-only history)
+// ---------------------------------------------------------------------------
+
+export interface EquityCurveSnapshot {
+  status: ObservationStatus;
+  samples: EquitySample[];
+  latestEquity: string | null;
+  /**
+   * Dimensionless normalized geometry (x, y in [0,1]) for rendering a curve.
+   * Computed SERVER-SIDE so the browser never parses a monetary value with
+   * floating point. x is chronological (first=0, last=1); y is 0 at the series
+   * minimum and 1 at the maximum (0.5 when flat).
+   */
+  points: Array<{ x: number; y: number }>;
+  reason?: string;
 }

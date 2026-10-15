@@ -75,6 +75,8 @@ describe('dashboard refresh policy', () => {
       portfolio: 10_000,
       orders: 10_000,
       market: 5_000,
+      engine: 5_000,
+      equity: 15_000,
       health: 30_000,
       healthz: 10_000,
     });

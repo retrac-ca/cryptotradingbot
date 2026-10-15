@@ -16,6 +16,8 @@
 
 import type {
   ApiErrorEnvelope,
+  EngineStatusSnapshot,
+  EquityCurveSnapshot,
   HealthSnapshot,
   MarketSnapshot,
   OrdersSnapshot,
@@ -113,6 +115,14 @@ export class ApiClient {
 
   getMarket(): Promise<ApiResult<MarketSnapshot>> {
     return this.get<MarketSnapshot>('/api/market');
+  }
+
+  getEngine(): Promise<ApiResult<EngineStatusSnapshot>> {
+    return this.get<EngineStatusSnapshot>('/api/engine');
+  }
+
+  getEquity(): Promise<ApiResult<EquityCurveSnapshot>> {
+    return this.get<EquityCurveSnapshot>('/api/equity');
   }
 
   getHealth(): Promise<ApiResult<HealthSnapshot>> {
