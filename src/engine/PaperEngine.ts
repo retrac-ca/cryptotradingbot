@@ -72,6 +72,12 @@ export interface PaperEngineDeps {
    * `executedOrderIds` and is not dropped by the next save.
    */
   restoredExecutedOrderIds?: string[];
+  /**
+   * Optional status sink (heartbeat), invoked after start/stop and after every
+   * evaluation cycle. The composition root writes it to the engine-status file;
+   * the engine itself performs no file I/O.
+   */
+  onStatus?: (status: PaperEngineStatus) => void;
 }
 
 export interface PaperEngineStatus {
@@ -80,6 +86,15 @@ export interface PaperEngineStatus {
   lastEvaluateMs: number | null;
   lastEvaluateError: string | null;
   symbols: string[];
+  /** Number of paper orders attempted (filled/rejected/open). */
+  ordersPlaced: number;
+  /**
+   * Best-effort managed equity (quote) from the latest polled tickers, or null
+   * when any managed position is unpriceable (never invent a partial equity).
+   */
+  equity: string | null;
+  /** Managed cash by currency, exact decimal strings (for the equity sample). */
+  cash: Record<string, string>;
 }
 
 export class PaperEngine {
@@ -89,6 +104,7 @@ export class PaperEngine {
   private readonly riskManager: RiskManager;
   private portfolio: Portfolio;
   private readonly store: PaperStateStore | null;
+  private readonly onStatus?: (status: PaperEngineStatus) => void;
   private readonly paper: PaperExecutionEngine;
   private readonly evaluateIntervalMs: number;
   private readonly symbols: string[];
@@ -112,6 +128,7 @@ export class PaperEngine {
     this.riskManager = deps.riskManager;
     this.portfolio = deps.portfolio;
     this.store = deps.store;
+    this.onStatus = deps.onStatus;
     this.paper = new PaperExecutionEngine(deps.paperConfig, deps.portfolio);
     this.paper.restoreExecutedOrderIds(deps.restoredExecutedOrderIds ?? []);
     this.evaluateIntervalMs = deps.evaluateIntervalMs;
@@ -149,6 +166,9 @@ export class PaperEngine {
       lastEvaluateMs: this.lastEvaluateMs,
       lastEvaluateError: this.lastEvaluateError,
       symbols: this.eligibleSymbols.length ? this.eligibleSymbols : this.symbols,
+      ordersPlaced: this.paper.orderHistory.length,
+      equity: this.computeEquity(),
+      cash: this.cashSummary(),
     };
   }
 
@@ -174,6 +194,7 @@ export class PaperEngine {
       { evaluateIntervalMs: this.evaluateIntervalMs, portfolio: this.portfolioSummary() },
       'paper engine started',
     );
+    this.emitStatus();
   }
 
   stop(): void {
@@ -185,6 +206,7 @@ export class PaperEngine {
     }
     this.persist();
     this.logger.info({ portfolio: this.portfolioSummary() }, 'paper engine stopped and state persisted');
+    this.emitStatus();
   }
 
   /** One evaluation pass over the eligible universe. Safe to call from a timer or a test. */
@@ -225,6 +247,7 @@ export class PaperEngine {
       this.lastEvaluateError = message;
       this.logger.error({ err, step: 'evaluateOnce' }, 'evaluation pass failed');
     }
+    this.emitStatus();
   }
 
   private executeSelected(
@@ -341,6 +364,37 @@ export class PaperEngine {
       };
     }
     return { cash, positions, realizedPnl: this.portfolio.stateModel.realizedPnl.toString() };
+  }
+
+  /**
+   * Best-effort managed equity (quote) from the latest polled tickers. Returns
+   * null when any managed position cannot be priced, so a consumer never reads a
+   * misleading partial equity. Never invents a price.
+   */
+  private computeEquity(): string | null {
+    const priceMap = new Map<string, Money>();
+    for (const pos of this.portfolio.stateModel.positions.values()) {
+      const t = this.marketData.getTicker(pos.symbol);
+      const mark = t?.last ?? t?.ask ?? t?.bid ?? null;
+      if (!mark) return null;
+      priceMap.set(pos.symbol, mark);
+    }
+    return this.portfolio.markToMarket(priceMap).equity.toString();
+  }
+
+  private cashSummary(): Record<string, string> {
+    const cash: Record<string, string> = {};
+    for (const [cur, amt] of this.portfolio.stateModel.cash) cash[cur] = amt.toString();
+    return cash;
+  }
+
+  /** Emit the current status to the optional sink; never throws into the engine. */
+  private emitStatus(): void {
+    try {
+      this.onStatus?.(this.status);
+    } catch {
+      // Heartbeat must never break the engine.
+    }
   }
 
   private persist(): void {

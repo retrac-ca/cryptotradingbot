@@ -2012,3 +2012,24 @@ never a relaxation of execution freshness — and is documented in `.env.example
 values stale dust and allows a fresh candidate BUY, while a stale CANDIDATE is
 still rejected as `STALE_MARKET_DATA`. With the dust allowance set, the read-only
 `bot live-test buy --check` transitions from `BLOCKED` to `READY`.
+
+## 47. Paper engine heartbeat + equity curve (2026-10-15)
+
+**Context.** §46 added the engine heartbeat (`ENGINE_STATUS_FILE`) and equity
+curve (`EQUITY_HISTORY_FILE`) and a dashboard Engine panel, but only the LIVE
+`LiveEngine` wrote them. `EngineStatusRecord.kind` already allowed `'paper'`
+and its contract says the running engine (paper or live) writes the record, so in
+the default PAPER mode the Engine panel was always empty.
+
+**Decision.** Wire the PAPER engine to the same monitoring files. `PaperEngine`
+gains an optional `onStatus` sink (invoked after start/stop and each cycle),
+mirroring `LiveEngine`; `PaperEngineStatus` gains `ordersPlaced` and a best-effort
+`equity`/`cash` (null equity when any managed position is unpriceable — never a
+partial value). `buildEngineDeps` writes the heartbeat (`kind: 'paper'`) and
+appends an equity sample. The engine performs no file I/O itself; the composition
+root owns the paths. Paper-only change; no LIVE safety path is touched.
+
+**Validation.** `tests/unit/engine/paperEngineStatus.test.ts` (status emitted on
+start/stop/cycle) and `tests/unit/engine/buildEngineHeartbeat.test.ts` (the paper
+heartbeat + equity sample are written). `npm test` → 126 files / 1657 passed;
+typecheck, lint, build clean.
