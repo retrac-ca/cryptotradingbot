@@ -112,6 +112,18 @@ export const botConfigSchema = z.object({
   maxPortfolioExposureFraction: fractionZeroToOne.default(0.5),
   maxDrawdownFraction: fractionZeroToOne.default(0.1),
   marketDataMaxAgeMs: z.coerce.number().int().positive().default(60000),
+  // P2: maximum age (ms) of the newest COMPLETED candle before the candle series
+  // is treated as stale at decision time (independent of ticker/quote freshness).
+  // `0` derives a default of three timeframe intervals. Must be addressed before
+  // autonomous LIVE trading; enforced for the paper/live continuous engines.
+  candleMaxAgeMs: z.coerce.number().int().min(0).default(0),
+  // F-8 valuation staleness allowance for NON-candidate managed positions only
+  // (used to value the rest of the managed portfolio for equity/exposure).
+  // `0` uses the decision freshness policy (strict, unchanged). A positive value
+  // is a DELIBERATE relaxation for illiquid managed inventory (e.g. dust) that
+  // would otherwise make the whole portfolio unpriceable and fail closed on every
+  // BUY. It never relaxes the CANDIDATE/executable quote freshness.
+  managedValuationMaxAgeMs: z.coerce.number().int().min(0).default(0),
   // Gate 4 (hybrid freshness): separate TRANSPORT (fetch) age limit and a
   // bounded clock-skew guard for forward-dated exchange quote timestamps.
   marketDataTransportMaxAgeMs: z.coerce.number().int().positive().default(60000),
@@ -128,6 +140,20 @@ export const botConfigSchema = z.object({
   liveMaxQuoteNotional: z.coerce.number().positive().default(100),
   // Read-only LIVE lifecycle-monitor polling interval (seconds). Conservative floor.
   liveMonitorIntervalSeconds: z.coerce.number().int().min(5).default(30),
+
+  // --- Autonomous LIVE session (deliberate arming) ---
+  // When true (plus TRADING_MODE=live, REAL_FUNDS_AT_RISK=true, and the
+  // per-invocation --confirm-live flag), `bot start` arms a bounded autonomous
+  // live session: continuous strategy -> risk -> LIMIT+IOC orders. Default false.
+  // `supportsOrderPlacement` stays false; the session is the explicit exception.
+  liveAutonomousEnabled: boolFromString.default(false),
+  // Session ceiling on cumulative quote notional across all autonomous orders.
+  liveAutonomousMaxSessionQuoteNotional: z.coerce.number().positive().default(1000),
+  // Session ceiling on the number of autonomous orders.
+  liveAutonomousMaxSessionOrders: z.coerce.number().int().positive().default(100),
+  // Session lifetime in minutes; 0 means "no expiry" (only allowed when explicitly
+  // set — the default is a bounded 12h so a forgotten loop cannot run forever).
+  liveAutonomousSessionMinutes: z.coerce.number().int().min(0).default(720),
 
   // --- Paper execution / engine (Phase 8) ---
   // Paper fill/fee/slippage realism knobs. 0 disables the respective effect.
@@ -155,6 +181,12 @@ export const botConfigSchema = z.object({
   // never be confused with a submitted live order, and separate from the managed
   // portfolio state file (which holds accounting, not intent).
   manualIntentFile: z.string().default('.state/manual-intents.json'),
+  // Where the running engine writes its heartbeat/status (read by the READ-ONLY
+  // dashboard). Must live under STATE_DIR like every other state domain.
+  engineStatusFile: z.string().default('.state/engine-status.json'),
+  // Append-only equity-curve history (JSONL) written by the running engine and
+  // read by the dashboard. Must live under STATE_DIR.
+  equityHistoryFile: z.string().default('.state/equity-history.jsonl'),
   // How often the engine re-evaluates candles/signals (ms); also the market-data
   // candle poll cadence. Kept small in tests via override.
   evaluateIntervalSeconds: z.coerce.number().int().positive().default(60),
@@ -165,6 +197,18 @@ export const botConfigSchema = z.object({
     .default('info'),
   reconcileIntervalSeconds: z.coerce.number().int().min(1).default(60),
   killSwitch: boolFromString.default(false),
+
+  // --- Alerting (optional; off by default) ---
+  // Generic JSON webhook POSTed on critical engine events (UNKNOWN order, halt,
+  // kill switch, repeated cycle errors). Empty disables. Secrets, if any, belong
+  // in the URL/headers supplied by the environment — never logged.
+  alertWebhookUrl: z.union([z.string().url(), z.literal('')]).default(''),
+  // ntfy topic/server for push notifications (e.g. to a phone). Empty topic
+  // disables. `alertNtfyServer` defaults to the public ntfy.sh.
+  alertNtfyTopic: z.string().default(''),
+  alertNtfyServer: z.union([z.string().url(), z.literal('')]).default('https://ntfy.sh'),
+  // Minimum ms between repeated identical alerts (debounce), to avoid a storm.
+  alertMinIntervalMs: z.coerce.number().int().min(0).default(60000),
 
   // --- Read-only monitoring dashboard API (Stage 2) ---
   // Bind host/port for the READ-ONLY HTTP monitoring API (`bot dashboard`).
@@ -230,6 +274,26 @@ export function validateConfig(cfg: BotConfig): void {
     );
   }
 
+  // Autonomous LIVE arming requires the full deliberate LIVE precondition set.
+  // Config alone can never arm autonomous trading silently.
+  if (cfg.liveAutonomousEnabled) {
+    if (cfg.tradingMode !== 'live') {
+      throw new Error(
+        'LIVE_AUTONOMOUS_ENABLED=true requires TRADING_MODE=live (autonomous trading is never armed in paper mode).',
+      );
+    }
+    if (!cfg.realFundsAtRisk) {
+      throw new Error(
+        'LIVE_AUTONOMOUS_ENABLED=true requires REAL_FUNDS_AT_RISK=true (autonomous trading places real orders).',
+      );
+    }
+    if (!cfg.enableAuthenticatedReads) {
+      throw new Error(
+        'LIVE_AUTONOMOUS_ENABLED=true requires ENABLE_AUTHENTICATED_READS=true (the live loop must read and reconcile the account).',
+      );
+    }
+  }
+
   // F-1 safety: paper and live managed state must be physically separate. If a
   // single path were used, paper positions could be (mis)interpreted as the bot's
   // live-managed inventory — a fundamental ownership violation. Refuse to run.
@@ -252,6 +316,8 @@ export function validateConfig(cfg: BotConfig): void {
       ['LIVE_MANAGED_STATE_FILE', cfg.liveManagedStateFile],
       ['ORDER_LEDGER_FILE', cfg.orderLedgerFile],
       ['MANUAL_INTENT_FILE', cfg.manualIntentFile],
+      ['ENGINE_STATUS_FILE', cfg.engineStatusFile],
+      ['EQUITY_HISTORY_FILE', cfg.equityHistoryFile],
     ] as const) {
       if (p) {
         const resolved = resolvePath(p);
