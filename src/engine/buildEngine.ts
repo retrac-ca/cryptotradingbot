@@ -19,7 +19,8 @@ import type { FreshnessPolicy } from '../marketdata/freshness.js';
 import { buildStrategy } from '../strategy/index.js';
 import { buildRiskManager } from '../risk/index.js';
 import { Portfolio } from '../portfolio/index.js';
-import { PaperStateStore, StateInitMarker, withStateDirLock, CorruptStateError, migrateLegacyState } from '../persistence/index.js';
+import { PaperStateStore, StateInitMarker, withStateDirLock, CorruptStateError, migrateLegacyState, appendEquitySample } from '../persistence/index.js';
+import { writeEngineStatus } from '../monitoring/engineHeartbeat.js';
 import type { PaperEngineDeps } from './PaperEngine.js';
 import type { Logger } from '../logging/logger.js';
 import type { BotConfig } from '../config/schema.js';
@@ -105,6 +106,24 @@ export function buildEngineDeps(cfg: BotConfig, logger: Logger): PaperEngineDeps
     managedValuationPolicy,
     candleMaxAgeMs,
     restoredExecutedOrderIds: loaded.executedOrderIds,
+    onStatus: (status) => {
+      try {
+        writeEngineStatus(cfg.engineStatusFile, {
+          kind: 'paper',
+          updatedAtMs: Date.now(),
+          status: status as unknown as Record<string, unknown>,
+        });
+        if (status.equity !== null) {
+          appendEquitySample(cfg.equityHistoryFile, {
+            atMs: Date.now(),
+            equity: status.equity,
+            cash: status.cash,
+          });
+        }
+      } catch (err) {
+        logger.warn({ err }, 'failed to write engine heartbeat/equity sample');
+      }
+    },
   };
 }
 
