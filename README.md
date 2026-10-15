@@ -324,7 +324,8 @@ but they are important to understand before relying on the live/manual realm:
   balance check iterates only the currencies the bot already expects and therefore
   does **not** surface unexpected currencies (though neither path auto-adopts
   them). This is a known architectural coexistence/observability limitation, not
-  an adoption risk.
+  an adoption risk. See `docs/RECONCILIATION_UNIFICATION.md` for the proposed
+  unification plan (V0 is currently vestigial in the production path).
 
 ## Development
 
