@@ -58,7 +58,8 @@ import { mapCancelOrderResponse,
 } from './orderMappings.js';
 import { ndaxSignature } from './signing.js';
 import { isControlledLiveOrder } from '../../execution/ControlledLiveAuthorization.js';
-import type { ControlledLiveAuthorization } from '../../execution/ControlledLiveAuthorization.js';
+import { authorizeAutonomousLiveOrder } from '../../execution/AutonomousLiveSession.js';
+import type { PlacementAuthorization } from '../ExchangeAdapter.js';
 
 export interface NdaxCredentials {
   apiKey: string;
@@ -409,7 +410,7 @@ export class NdaxAdapter implements ExchangeAdapter {
    * authenticated reads are enabled. `capabilities.supportsOrderPlacement`
    * stays false, so the live engine never reaches this path.
    */
-  async placeOrder(order: NewOrder, authorization?: ControlledLiveAuthorization): Promise<PlaceOrderResult> {
+  async placeOrder(order: NewOrder, authorization?: PlacementAuthorization): Promise<PlaceOrderResult> {
     this.assertOrderPlacementEnabled(authorization, order);
     const auth = await this.requireAuth();
     const market = await this.getMarketInfo(order.symbol);
@@ -463,20 +464,32 @@ export class NdaxAdapter implements ExchangeAdapter {
     return String(nonce);
   }
 
-  /** Refuse order placement unless armed, or an explicit controlled-test authorization is present. */
+  /** Refuse order placement unless armed, or an explicit authorization is present. */
   private assertOrderPlacementEnabled(
-    authorization?: ControlledLiveAuthorization,
+    authorization?: PlacementAuthorization,
     order?: NewOrder,
   ): void {
     // Existing fully-armed path (internal test switch only — never set via config).
     if (this.enableOrderPlacement) return;
     // Explicit, narrowly-scoped controlled-test authorization: one side + LIMIT only.
     if (authorization && order && isControlledLiveOrder(order, authorization)) return;
+    // Armed autonomous live session: LIMIT+IOC, bounded per-order + session budget.
+    if (
+      authorization &&
+      order &&
+      authorizeAutonomousLiveOrder(
+        { side: order.side, type: order.type, tif: order.tif ?? null, quantity: order.quantity, price: order.price ?? null },
+        authorization,
+      ).ok
+    ) {
+      return;
+    }
     throw new OrderRejectedError(
       'NDAX order placement is disabled. The SendOrder/CancelOrder network ' +
         'paths are implemented but not enabled: supportsOrderPlacement remains ' +
         'false and live trading fails closed. Only an explicitly-authorized ' +
-        'controlled LIMIT-only SELL/BUY test may reach SendOrder.',
+        'controlled LIMIT-only SELL/BUY test or an armed autonomous live session ' +
+        'may reach SendOrder.',
     );
   }
 

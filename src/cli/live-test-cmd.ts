@@ -41,11 +41,12 @@ import { loadConfig } from '../config/load.js';
 import { createExchange } from '../exchanges/index.js';
 import type { ExchangeAdapter } from '../exchanges/ExchangeAdapter.js';
 import { LiveOrderEngine } from '../execution/LiveExecutionEngine.js';
-import type { PreparedLiveOrder, LiveOrderIntent, ManagedOrderGuard } from '../execution/LiveExecutionEngine.js';
+import type { PreparedLiveOrder, LiveOrderIntent } from '../execution/LiveExecutionEngine.js';
+import { buildManagedOrderGuard, buildManagedQuoteReservation } from '../execution/liveHooks.js';
+export { buildManagedOrderGuard, buildManagedQuoteReservation };
 import { createControlledLiveAuthorization } from '../execution/ControlledLiveAuthorization.js';
 import { evaluateLiveBuyReadiness, structuralPlacementGuarantees } from '../execution/readiness.js';
 import type { LiveBuyReadinessInput, LiveBuyReadinessReport } from '../execution/readiness.js';
-import type { NewOrder } from '../order.js';
 import type { Logger } from '../logging/logger.js';
 import { evaluateFreshness, isValidEpochMs } from '../marketdata/index.js';
 import type { FreshnessPolicy } from '../marketdata/index.js';
@@ -289,6 +290,17 @@ function fractionOfMoney(amount: Money, fraction: number): Money {
   return amount.mulFraction(num, scale);
 }
 
+/**
+ * F-8: the optional looser freshness policy used ONLY to value NON-candidate
+ * managed positions. `MANAGED_VALUATION_MAX_AGE_MS=0` returns undefined (strict,
+ * unchanged). It never relaxes the candidate/executable quote freshness.
+ */
+function managedValuationPolicyOf(cfg: BotConfig, base: FreshnessPolicy): FreshnessPolicy | undefined {
+  return cfg.managedValuationMaxAgeMs > 0
+    ? { ...base, maxQuoteAgeMs: cfg.managedValuationMaxAgeMs }
+    : undefined;
+}
+
 interface SummaryRiskPolicy {
   marketDataMaxAgeMs: number;
   marketDataTransportMaxAgeMs: number;
@@ -468,6 +480,8 @@ export function buildLiveRiskContext(i: {
   managedValuation: ReadonlyMap<string, Ticker>;
   /** F-2/F-8: freshness policy used to gate non-candidate valuation prices. */
   freshnessPolicy: FreshnessPolicy;
+  /** F-8: optional looser policy for NON-candidate managed-position valuation. */
+  managedValuationPolicy?: FreshnessPolicy;
 }): RiskContext {
   const { snapshot, portfolio, symbol, side, reason, sellTarget } = i;
   const [base, quote] = symbol.split('/');
@@ -508,12 +522,13 @@ export function buildLiveRiskContext(i: {
       valuationUnknown = true;
       continue;
     }
-    const fresh = i.freshnessPolicy
+    const valuationPolicy = i.managedValuationPolicy ?? i.freshnessPolicy;
+    const fresh = valuationPolicy
       ? evaluateFreshness({
           nowMs: snapshot.observedAtMs,
           quoteTimestampMs: vt.timestampMs ?? null,
           observedAtMs: vt.observedAtMs ?? null,
-          policy: i.freshnessPolicy,
+          policy: valuationPolicy,
         })
       : { fresh: false as const };
     if (!fresh.fresh) {
@@ -556,41 +571,9 @@ export function buildLiveRiskContext(i: {
 /**
  * Mutation-boundary managed-state guard for the controlled live path (TOCTOU).
  *
- * The live-test flow reads managed portfolio state, prepares the EXACT order,
- * displays it, and waits for operator confirmation. Another process could mutate
- * the durable managed state in that window, leaving the approved order based on a
- * stale snapshot. This guard is invoked by the engine INSIDE the submission
- * mutation lock, immediately before exchange submission: it RELOADS the
- * authoritative managed state and revalidates the exact order against it. It
- * performs NO mutation and NEVER resizes, reprices, rebuilds, retries, or
- * substitutes the order — if the fresh managed position no longer covers the
- * approved SELL quantity it returns a fail-closed reason.
+ * Implemented in `src/execution/liveHooks.ts` (shared with the autonomous
+ * LiveEngine); re-exported here for existing callers/tests.
  */
-export function buildManagedOrderGuard(live: ManagedStateStore): ManagedOrderGuard {
-  return (order) => {
-    const r = live.load();
-    if (r.status === 'CORRUPT') {
-      return `live managed state is corrupt (${r.reason})`;
-    }
-    if (r.status === 'MISSING') {
-      return 'live managed state is missing at submission time (unexpected state loss)';
-    }
-    const portfolio = live.toPortfolio(r.data);
-    if (!portfolio) {
-      return 'live managed state could not be reconstructed at submission time';
-    }
-    if (order.side === 'SELL') {
-      const managed = portfolio.position(order.symbol)?.quantity ?? Money.zero();
-      if (managed.compareTo(order.quantity) < 0) {
-        return (
-          `managed position for ${order.symbol} is now ${managed.toString()} and no longer covers ` +
-          `the approved SELL quantity ${order.quantity.toString()}; re-run live-test`
-        );
-      }
-    }
-    return null;
-  };
-}
 
 /**
  * Run the full live-test workflow. Returns a process exit code (0 = clean ack +
@@ -641,6 +624,7 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
     sellTarget,
     managedValuation: await fetchManagedValuation(adapter, deps.portfolio, symbol, now),
     freshnessPolicy: policy,
+    managedValuationPolicy: managedValuationPolicyOf(cfg, policy),
   });
   const decision = deps.riskManager.evaluate(displayCtx);
 
@@ -989,54 +973,10 @@ function buildBuyReadiness(args: BuyReadinessArgs): LiveBuyReadinessReport {
 
 /**
  * Build the durable managed-quote reservation hooks used INSIDE the engine's
- * submission mutation lock (persist-before-submit). The reservation amount is
- * the exact worst-case cost (limit notional + conservative taker fee). The hooks
- * NEVER resize/reprice; they only reserve/release exactly the prepared order.
+ * submission mutation lock (persist-before-submit). Implemented in
+ * `src/execution/liveHooks.ts` (shared with the autonomous LiveEngine); the
+ * `buildManagedQuoteReservation` re-export above preserves existing callers.
  */
-export function buildManagedQuoteReservation(args: { live: ManagedStateStore; market: MarketInfo }): {
-  reserve: (order: NewOrder) => string | null;
-  release: (order: NewOrder) => void;
-} {
-  const estimateFee = (order: NewOrder): Money => {
-    const taker = args.market.feeInfo?.taker ?? 0;
-    if (taker <= 0) return Money.zero();
-    const notional = order.quantity.mul(order.price ?? Money.zero());
-    return fractionOfMoney(notional, taker);
-  };
-
-  const reserve = (order: NewOrder): string | null => {
-    const r = args.live.load();
-    if (r.status === 'CORRUPT') return `live managed state is corrupt (${r.reason})`;
-    if (r.status === 'MISSING') return 'live managed state is missing at submission time (unexpected state loss)';
-    const portfolio = args.live.toPortfolio(r.data);
-    if (!portfolio) return 'live managed state could not be reconstructed at submission time';
-    const quote = order.symbol.split('/')[1] ?? '';
-    const cost = order.quantity.mul(order.price ?? Money.zero()).add(estimateFee(order));
-    try {
-      const next = portfolio.reserveOrder(order.clientOrderId, quote, cost);
-      args.live.save(next.stateModel);
-    } catch (e) {
-      return `could not reserve managed ${quote} for ${order.clientOrderId}: ${e instanceof Error ? e.message : String(e)}`;
-    }
-    return null;
-  };
-
-  const release = (order: NewOrder): void => {
-    const r = args.live.load();
-    if (r.status !== 'OK') return;
-    const portfolio = args.live.toPortfolio(r.data);
-    if (!portfolio) return;
-    try {
-      const next = portfolio.releaseOrderReservation(order.clientOrderId);
-      args.live.save(next.stateModel);
-    } catch {
-      // Best-effort idempotent release; a failure leaves the reservation for the
-      // operator/reconciliation path rather than guessing.
-    }
-  };
-
-  return { reserve, release };
-}
 
 interface BuySummaryInputs {
   symbol: string;
@@ -1260,6 +1200,7 @@ export async function executeLiveBuy(deps: LiveTestDeps, opts: LiveBuyOptions): 
     sellTarget: null,
     managedValuation: await fetchManagedValuation(adapter, deps.portfolio, symbol, now),
     freshnessPolicy: policy,
+    managedValuationPolicy: managedValuationPolicyOf(cfg, policy),
   });
   const decision = deps.riskManager.evaluate(displayCtx);
 

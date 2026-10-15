@@ -44,7 +44,7 @@
 import { randomUUID } from 'node:crypto';
 import { dirname } from 'node:path';
 import { Money } from '../money/Money.js';
-import type { NewOrder, Order, OrderStatus, OrderType } from '../order.js';
+import type { NewOrder, Order, OrderStatus, OrderTif, OrderType } from '../order.js';
 import type { ExchangeAdapter } from '../exchanges/ExchangeAdapter.js';
 import type { MarketInfo } from '../types.js';
 import {
@@ -66,6 +66,10 @@ import {
   isControlledLiveAuthorization,
   type ControlledLiveAuthorization,
 } from './ControlledLiveAuthorization.js';
+import {
+  isAutonomousLiveSession,
+  type AutonomousLiveSession,
+} from './AutonomousLiveSession.js';
 
 export interface LiveGate {
   tradingMode: 'live';
@@ -107,6 +111,14 @@ export interface LiveExecutionConfig {
    * path and is passed to the adapter's `placeOrder`.
    */
   controlledLiveAuthorization?: ControlledLiveAuthorization;
+  /**
+   * An armed AUTONOMOUS live session. When present and valid, it permits the
+   * engine to place LIMIT+IOC orders for BOTH sides without the one-shot
+   * controlled authorization, and it supplies the exchange mutation boundary's
+   * per-order + session budget. It is created only by the armed live-start path
+   * and is NOT a generic live-enable flag; `supportsOrderPlacement` stays false.
+   */
+  autonomousLiveSession?: AutonomousLiveSession;
   /**
    * Optional mutation-boundary guard that revalidates the exact order against a
    * freshly reloaded managed portfolio under the submission lock (TOCTOU). See
@@ -171,6 +183,11 @@ export interface LiveOrderIntent {
    * aggressive. Ignored for non-limit types.
    */
   price?: Money;
+  /**
+   * Optional time-in-force. Autonomous live sessions require `IOC` (never rest
+   * on the book); the controlled one-shot path defaults to GTC when omitted.
+   */
+  tif?: OrderTif;
 }
 
 /**
@@ -261,7 +278,12 @@ export class LiveOrderEngine {
     if (this.cfg.killSwitch) {
       throw new LiveGateError('kill switch is active; live order placement is disabled');
     }
-    if (this.cfg.controlledLiveAuthorization) {
+    if (this.cfg.autonomousLiveSession) {
+      // Armed autonomous session: explicit, bounded, process-local capability.
+      if (!isAutonomousLiveSession(this.cfg.autonomousLiveSession)) {
+        throw new LiveGateError('invalid or expired autonomous live session');
+      }
+    } else if (this.cfg.controlledLiveAuthorization) {
       // Controlled-LIVE test: an explicit, narrowly-scoped authorization permits
       // the controlled SELL/LIMIT path even though the adapter reports
       // `supportsOrderPlacement=false`. Validate it is genuine.
@@ -461,6 +483,12 @@ export class LiveOrderEngine {
         'a LIVE LIMIT order requires an explicit positive limit price',
       );
     }
+    // Autonomous sessions are IOC-only (never rest on the book). The controlled
+    // one-shot path keeps GTC unless a TIF is explicitly supplied.
+    const tif: OrderTif | undefined = intent.tif ?? (this.cfg.autonomousLiveSession ? 'IOC' : undefined);
+    if (this.cfg.autonomousLiveSession && tif !== 'IOC') {
+      throw new LiveGateError('autonomous LIVE orders must be IOC');
+    }
     return {
       clientOrderId: this.nextClientOrderId(symbol),
       symbol,
@@ -468,6 +496,7 @@ export class LiveOrderEngine {
       type,
       quantity: approval.quantity,
       price,
+      ...(tif ? { tif } : {}),
       reason: intent.reason,
     };
   }
@@ -553,7 +582,7 @@ export class LiveOrderEngine {
       }
 
       try {
-        const result = await this.withAckTimeout(order, this.adapter.placeOrder(order, this.cfg.controlledLiveAuthorization));
+        const result = await this.withAckTimeout(order, this.adapter.placeOrder(order, this.cfg.autonomousLiveSession ?? this.cfg.controlledLiveAuthorization));
         if (result.unknownOutcome) {
           const unknown = this.buildRecorded(order, 'UNKNOWN', result.exchangeOrderId ?? null);
           this.store.save(unknown);
@@ -725,6 +754,9 @@ export class LiveOrderEngine {
         'NDAX LIVE market orders are disabled because worst-case execution price is not ' +
           'currently bounded; only LIMIT orders are permitted',
       );
+    }
+    if (this.cfg.autonomousLiveSession && order.tif !== 'IOC') {
+      throw new LiveGateError('autonomous LIVE orders must be IOC (never rest on the book)');
     }
     if (!order.quantity.isPositive()) {
       throw new LiveGateError('order quantity must be positive');
