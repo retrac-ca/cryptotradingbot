@@ -1,0 +1,68 @@
+# Cryptotradingbot AUTONOMOUS LIVE engine — systemd USER unit.
+#
+# DANGER: this unit runs `bot start --confirm-live`, which (when the .env also
+# sets TRADING_MODE=live, REAL_FUNDS_AT_RISK=true, ENABLE_AUTHENTICATED_READS=true,
+# KILL_SWITCH=false and LIVE_AUTONOMOUS_ENABLED=true) places REAL orders with
+# REAL funds UNATTENDED. Installing/enabling/starting this unit is a deliberate
+# operator decision and is NEVER done automatically by this repository.
+#
+# Do NOT enable this unit and the PAPER unit against the same intent; the LIVE
+# engine uses the live-managed state files, the PAPER engine the paper ones, and
+# they must never share a state file (validated at startup). The dashboard unit
+# may run concurrently — it only reads.
+#
+# Install (as the login user; explicit operator action):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/cryptotradingbot-live.service ~/.config/systemd/user/
+#   npm run build
+#   # Confirm .env is correct and run the read-only preflight first:
+#   node dist/index.js live-test buy --check
+#   systemctl --user daemon-reload
+#   systemd-analyze --user verify ~/.config/systemd/user/cryptotradingbot-live.service
+#   systemctl --user enable cryptotradingbot-live.service
+#   systemctl --user start  cryptotradingbot-live.service
+#
+# Stop immediately with:  systemctl --user stop cryptotradingbot-live.service
+# Or set KILL_SWITCH=true and restart. See docs/AUTONOMOUS_LIVE.md.
+#
+# Optional persistence after logout (host-level, explicit operator opt-in):
+#   loginctl enable-linger "$USER"
+
+[Unit]
+Description=Cryptotradingbot AUTONOMOUS LIVE engine (REAL FUNDS AT RISK)
+Documentation=file:%h/code/cryptotradingbot/docs/AUTONOMOUS_LIVE.md
+After=network-online.target
+Wants=network-online.target
+AssertPathExists=%h/code/cryptotradingbot/dist/index.js
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/cryptotradingbot
+# --confirm-live is the explicit human acknowledgement required by `bot start`.
+ExecStart=/usr/bin/node %h/code/cryptotradingbot/dist/index.js start --confirm-live
+# Never auto-restart into live trading after a failure/crash: a crash may leave
+# an ambiguous order, so a human must review state before restarting.
+Restart=no
+TimeoutStopSec=30
+
+Environment=NODE_ENV=production
+
+# Secrets live ONLY in the application's own .env under WorkingDirectory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Contain the write-capable LIVE process: $HOME is READ-ONLY; the ONLY writable
+# path is the repository state directory (managed portfolio, order ledger,
+# heartbeat, equity history, mutation lock).
+ProtectHome=read-only
+ReadWritePaths=%h/code/cryptotradingbot/.state
+
+[Install]
+WantedBy=default.target
