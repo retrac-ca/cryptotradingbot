@@ -25,6 +25,7 @@ behind the design. The guiding principles are:
 | 11 | Live trading safeguards | **DONE** (engine + reconciliation tested; NDAX order placement remains **disabled**, fail-closed, until verified against a live account) |
 | 12 | CLI / UX | **DONE** |
 | 13 | Docs + packaging | **DONE** |
+| 14 | Autonomous LIVE engine + monitoring | **DONE** (bounded, explicitly armed; see `docs/AUTONOMOUS_LIVE.md`) |
 
 Phases are implemented and reviewed incrementally, not all at once.
 
@@ -140,6 +141,24 @@ editing source.
   ticks on a fixed cadence (no busy loop), fails closed on stale/unknown market
   data, and shuts down gracefully, persisting on stop. `buildEngine.ts` is the
   composition root that assembles the dependency graph from config.
+- **Autonomous LIVE engine.** `src/engine/LiveEngine.ts` is the live counterpart
+  of `PaperEngine`: the same `Strategy → Risk → Coordinator` selection routed to
+  the real exchange through `LiveOrderEngine`, using **LIMIT + IOC** orders that
+  never rest on the book. Each cycle it runs the read-only `LiveOrderMonitor`
+  plus `reconcile()`/`commitProven()`, applies only **PROVEN quote-fee** fills,
+  refuses new placement while any live order is unresolved, and halts new
+  placement (while continuing to observe/account) on reconciliation `HALTED`,
+  read failures, an `UNKNOWN` submission, the kill switch, or repeated cycle
+  errors. `buildLiveEngine.ts` is its composition root. Arming is an explicit,
+  process-local capability (`src/execution/AutonomousLiveSession.ts`): LIMIT+IOC,
+  both sides, bounded by per-order caps plus a session budget and expiry, minted
+  only by the armed `bot start` live path. `supportsOrderPlacement` stays `false`.
+- **`src/monitoring/`** — the read-only observability layer. `MonitoringService`
+  exposes the dashboard snapshot, now including a running-engine heartbeat
+  (`src/monitoring/engineHeartbeat.ts`) and an append-only equity curve
+  (`src/persistence/equityHistory.ts`), surfaced at `/api/engine` and
+  `/api/equity`. Optional alerting (`src/monitoring/notifier.ts`; webhook/ntfy) is
+  fire-and-forget and never throws into the engine.
 - **Multi-asset (Gate 5):** `src/engine/universe.ts` builds the eligible market
   universe from the curated `UNIVERSE_MARKETS` filtered by metadata eligibility
   (quote currency, valid ticks, min order, fees, market orders — never the
