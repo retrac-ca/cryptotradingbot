@@ -11,6 +11,8 @@ export { LiveMarketData } from './LiveMarketData.js';
 export {
   completedCandles,
   requiredCandleLookbackMs,
+  evaluateCandleFreshness,
+  defaultCandleMaxAgeMs,
   TIMEFRAME_MS,
   CANDLE_WARMUP_MARGIN_BARS,
 } from './candles.js';

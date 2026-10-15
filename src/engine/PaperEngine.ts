@@ -59,6 +59,13 @@ export interface PaperEngineDeps {
   timeframe: Timeframe;
   /** F-8: freshness policy applied to managed-position valuation quotes. */
   freshnessPolicy: FreshnessPolicy;
+  /** F-8: optional looser policy for NON-candidate managed-position valuation. */
+  managedValuationPolicy?: FreshnessPolicy;
+  /**
+   * P2: maximum age (ms) of the newest completed candle before a market is
+   * skipped as stale. `0`/absent derives three timeframe intervals.
+   */
+  candleMaxAgeMs?: number;
   /**
    * Durable executed-order identity loaded from persisted state on restart, so
    * the paper engine's order identity is consistent with the durable
@@ -122,6 +129,8 @@ export class PaperEngine {
         getCandles: (symbol, tf) => this.marketData.getCandles(symbol, tf),
       },
       freshnessPolicy: deps.freshnessPolicy,
+      managedValuationPolicy: deps.managedValuationPolicy,
+      candleMaxAgeMs: deps.candleMaxAgeMs,
     });
   }
 

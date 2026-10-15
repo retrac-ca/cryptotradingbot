@@ -89,7 +89,7 @@ interface Harness {
 }
 
 function build(
-  opts: { managed?: (p: Portfolio) => Portfolio; signals: Record<string, 'BUY' | 'SELL' | 'HOLD'>; tickers: Record<string, { price: string; ts: number }> },
+  opts: { managed?: (p: Portfolio) => Portfolio; signals: Record<string, 'BUY' | 'SELL' | 'HOLD'>; tickers: Record<string, { price: string; ts: number }>; managedValuationPolicy?: FreshnessPolicy },
 ): Harness {
   const portfolio = opts.managed
     ? opts.managed(Portfolio.empty(new Map([['CAD', Money.fromString('1000')]])))
@@ -111,6 +111,7 @@ function build(
       getCandles: (s) => source.candles.get(s) ?? [],
     },
     freshnessPolicy,
+    ...(opts.managedValuationPolicy ? { managedValuationPolicy: opts.managedValuationPolicy } : {}),
   });
   return { coordinator, risk, portfolio, source };
 }
@@ -254,5 +255,35 @@ describe('F-8 — candidate staleness cannot win ranking', () => {
     const r = h.coordinator.evaluate(['ETH/CAD', 'BTC/CAD'], NOW);
     expect(r.selected).not.toBeNull();
     expect(r.selected!.symbol).toBe('BTC/CAD'); // tighter relative spread wins
+  });
+});
+
+describe('F-8 relaxation — MANAGED_VALUATION_MAX_AGE_MS for non-candidate positions only', () => {
+  it('a relaxed managed-valuation policy values stale dust and allows a fresh candidate BUY', () => {
+    const relaxed: FreshnessPolicy = { ...freshnessPolicy, maxQuoteAgeMs: 1_000_000_000 };
+    const h = build({
+      managed: (p) => p.applyFill('ETH/CAD', 'BUY', Money.fromString('0.1'), Money.fromString('2000'), Money.zero()),
+      signals: { 'SOL/CAD': 'BUY' },
+      tickers: { 'ETH/CAD': { price: '3000', ts: STALE }, 'SOL/CAD': { price: '100', ts: FRESH } },
+      managedValuationPolicy: relaxed,
+    });
+    // Realistic: the valuation ticker was just FETCHED (fresh transport) but its
+    // exchange quote is old (illiquid) — only the quote-age bound is relaxed.
+    h.source.tickers.set('ETH/CAD', { ...ticker('ETH/CAD', '3000', STALE), observedAtMs: NOW });
+    const r = h.coordinator.evaluate(['SOL/CAD'], NOW);
+    expect(r.selected?.symbol).toBe('SOL/CAD');
+  });
+
+  it('the candidate freshness is NOT relaxed by the managed-valuation policy', () => {
+    const relaxed: FreshnessPolicy = { ...freshnessPolicy, maxQuoteAgeMs: 1_000_000_000 };
+    const h = build({
+      signals: { 'SOL/CAD': 'BUY' },
+      tickers: { 'SOL/CAD': { price: '100', ts: STALE } },
+      managedValuationPolicy: relaxed,
+    });
+    const r = h.coordinator.evaluate(['SOL/CAD'], NOW);
+    expect(r.selected).toBeNull();
+    const sol = r.evaluated.find((e) => e.symbol === 'SOL/CAD');
+    expect(sol?.decision?.reason).toBe('STALE_MARKET_DATA');
   });
 });
