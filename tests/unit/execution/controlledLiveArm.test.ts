@@ -15,7 +15,6 @@ import { Money } from '../../../src/money/Money.js';
 import { botConfigSchema } from '../../../src/config/schema.js';
 import { NdaxAdapter } from '../../../src/exchanges/ndax/NdaxAdapter.js';
 import { OrderStore } from '../../../src/persistence/OrderStore.js';
-import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import { LiveOrderEngine, LiveGateError } from '../../../src/execution/LiveExecutionEngine.js';
 import {
   createControlledLiveAuthorization,
@@ -113,8 +112,7 @@ function buildEngine(exchange: FakeExchange, extraCfg: Record<string, unknown> =
   exchange.setTicker('BTC/CAD', { last: Money.fromString('40000') });
   rmSync(LEDGER, { force: true });
   const store = new OrderStore(LEDGER);
-  const service = new ReconcileService(exchange, store);
-  return new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), {
+  return new LiveOrderEngine(exchange, store, new RiskManager(riskConfig()), {
     gate,
     killSwitch: false,
     maxLiveQuoteNotional: Money.fromString('1000000'),

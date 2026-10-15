@@ -56,7 +56,6 @@ import {
 } from '../exchanges/errors.js';
 import { OrderStore } from '../persistence/OrderStore.js';
 import { withStateDirLockAsync } from '../persistence/index.js';
-import { ReconcileService } from '../reconcile/ReconcileService.js';
 import { RiskManager } from '../risk/RiskManager.js';
 import type { RiskApproval, RiskRejection } from '../risk/Reason.js';
 import type { RiskContext } from '../risk/RiskContext.js';
@@ -231,7 +230,6 @@ export class LiveGateError extends Error {
 export class LiveOrderEngine {
   private readonly adapter: ExchangeAdapter;
   private readonly store: OrderStore;
-  private readonly reconcileService: ReconcileService;
   private readonly riskManager: RiskManager;
   private readonly cfg: LiveExecutionConfig & {
     ackTimeoutMs: number;
@@ -248,13 +246,11 @@ export class LiveOrderEngine {
   constructor(
     adapter: ExchangeAdapter,
     store: OrderStore,
-    reconcile: ReconcileService,
     riskManager: RiskManager,
     cfg: LiveExecutionConfig,
   ) {
     this.adapter = adapter;
     this.store = store;
-    this.reconcileService = reconcile;
     this.riskManager = riskManager;
     this.stateDir = dirname(store.path);
     this.cfg = {
@@ -632,11 +628,6 @@ export class LiveOrderEngine {
     const live = await this.adapter.getOrderStatus(order.symbol, order.clientOrderId, order.exchangeOrderId);
     this.store.save(live);
     return live;
-  }
-
-  /** Convenience: full reconcile-and-store based on a single order. */
-  async reconcile(): Promise<ReturnType<ReconcileService['reconcile']>> {
-    return this.reconcileService.reconcile();
   }
 
   /**

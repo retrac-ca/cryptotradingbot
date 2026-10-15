@@ -62,7 +62,7 @@ import {
 } from '../persistence/index.js';
 import { ManualIntentStore } from '../manual/index.js';
 import { Portfolio } from '../portfolio/index.js';
-import { ReconcileService, reconcile, livePreTradeGate } from '../reconcile/index.js';
+import { reconcile, livePreTradeGate } from '../reconcile/index.js';
 import type { ReconciliationDeps, ReconciliationResult, LivePreTradeGateResult } from '../reconcile/index.js';
 import { buildRiskManager } from '../risk/index.js';
 import type { RiskContext } from '../risk/index.js';
@@ -95,7 +95,6 @@ export interface LiveTestDeps {
   live: ManagedStateStore;
   /** Durable manual-intent store (V1 cross-domain reconciliation). */
   manualIntents: ManualIntentStore;
-  reconcile: ReconcileService;
   riskManager: import('../risk/RiskManager.js').RiskManager;
   /** The bot-MANAGED portfolio. External holdings are never sold here. */
   portfolio: Portfolio;
@@ -688,7 +687,7 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
   // locked submission path below. It is never persisted.
   const controlledAuth = mintControlledAuthorization('SELL', cfg);
 
-  const engine = new LiveOrderEngine(adapter, deps.store, deps.reconcile, deps.riskManager, {
+  const engine = new LiveOrderEngine(adapter, deps.store, deps.riskManager, {
     gate: { tradingMode: 'live', realFundsAtRisk: cfg.realFundsAtRisk },
     killSwitch: cfg.killSwitch,
     // Controlled LIVE scope: only LIMIT orders are permitted. These caps are
@@ -755,7 +754,14 @@ export async function executeLiveTest(deps: LiveTestDeps, opts: LiveTestOptions)
   try {
     const authoritative = await engine.refreshOrder(result.order);
     await adapter.getOpenOrders(symbol);
-    await deps.reconcile.reconcile();
+    await reconcile({
+      stateDir: cfg.stateDir ?? dirname(cfg.liveManagedStateFile),
+      orders: deps.store,
+      live: deps.live,
+      manualIntents: deps.manualIntents,
+      adapter,
+      nowMs: now,
+    });
     // eslint-disable-next-line no-console
     console.log('\nlive-test: order acknowledged. exchanged order id=' + (authoritative.exchangeOrderId ?? 'n/a') + ' authoritative status=' + authoritative.status);
   } catch (e) {
@@ -1293,7 +1299,7 @@ export async function executeLiveBuy(deps: LiveTestDeps, opts: LiveBuyOptions): 
 
   // 6. Mint the single-use BUY authorization and construct the engine.
   const reservation = buildManagedQuoteReservation({ live: deps.live, market: initial.market });
-  const engine = new LiveOrderEngine(adapter, deps.store, deps.reconcile, deps.riskManager, {
+  const engine = new LiveOrderEngine(adapter, deps.store, deps.riskManager, {
     gate: { tradingMode: 'live', realFundsAtRisk: cfg.realFundsAtRisk },
     killSwitch: cfg.killSwitch,
     maxLiveQuoteNotional: Money.fromNumber(cfg.liveMaxQuoteNotional),
@@ -1350,7 +1356,14 @@ export async function executeLiveBuy(deps: LiveTestDeps, opts: LiveBuyOptions): 
   try {
     const authoritative = await engine.refreshOrder(result.order);
     await adapter.getOpenOrders(symbol);
-    await deps.reconcile.reconcile();
+    await reconcile({
+      stateDir: cfg.stateDir ?? dirname(cfg.liveManagedStateFile),
+      orders: deps.store,
+      live: deps.live,
+      manualIntents: deps.manualIntents,
+      adapter,
+      nowMs: now,
+    });
     // eslint-disable-next-line no-console
     console.log('\nlive-test buy: order acknowledged. exchange order id=' + (authoritative.exchangeOrderId ?? 'n/a') + ' authoritative status=' + authoritative.status);
   } catch (e) {
@@ -1399,7 +1412,6 @@ export const liveTestCommand: CommandHandler = async (args): Promise<number> => 
   });
 
   const store = new OrderStore(cfg.orderLedgerFile);
-  const service = new ReconcileService(adapter, store);
   const liveStore = new ManagedStateStore(cfg.liveManagedStateFile);
   const manualIntents = new ManualIntentStore(cfg.manualIntentFile);
 
@@ -1411,7 +1423,6 @@ export const liveTestCommand: CommandHandler = async (args): Promise<number> => 
     store,
     live: liveStore,
     manualIntents,
-    reconcile: service,
     riskManager: buildRiskManager(cfg),
     portfolio: livePortfolio,
   };

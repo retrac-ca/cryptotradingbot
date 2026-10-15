@@ -14,7 +14,6 @@ import { Money } from '../../../src/money/Money.js';
 import { OrderStore } from '../../../src/persistence/OrderStore.js';
 import { ManagedStateStore } from '../../../src/persistence/ManagedStateStore.js';
 import { ManualIntentStore } from '../../../src/manual/ManualIntentStore.js';
-import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import { Portfolio } from '../../../src/portfolio/Portfolio.js';
 import { buildRiskManager } from '../../../src/risk/index.js';
 import type { BotConfig } from '../../../src/config/schema.js';
@@ -167,7 +166,6 @@ function buildDeps(over: BuildOpts = {}): BuyDeps {
     over.supportsOrderPlacement ?? false;
   over.adapter?.(adapter);
   const store = new OrderStore(LEDGER);
-  const reconcile = new ReconcileService(adapter, store);
   const riskManager = buildRiskManager(c);
   const portfolio = over.portfolio ?? Portfolio.empty(new Map([['CAD', Money.fromString('1000')]]));
   const live = new ManagedStateStore(LIVE_FILE);
@@ -179,7 +177,6 @@ function buildDeps(over: BuildOpts = {}): BuyDeps {
     store,
     live,
     manualIntents,
-    reconcile,
     riskManager,
     portfolio,
     ...(over.omitConfirm ? {} : { confirm: over.confirm ?? (async () => true) }),

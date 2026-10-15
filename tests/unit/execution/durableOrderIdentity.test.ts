@@ -12,7 +12,6 @@ import { describe, expect, it } from 'vitest';
 import { rmSync } from 'node:fs';
 import { Money } from '../../../src/money/Money.js';
 import { OrderStore } from '../../../src/persistence/OrderStore.js';
-import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import { LiveOrderEngine } from '../../../src/execution/LiveExecutionEngine.js';
 import { RiskManager } from '../../../src/risk/RiskManager.js';
 import type { RiskConfig } from '../../../src/risk/RiskConfig.js';
@@ -88,8 +87,7 @@ function buildEngine(exchange: FakeExchange): LiveOrderEngine {
   exchange.setTicker('BTC/CAD', { last: Money.fromString('40000') });
   rmSync(LEDGER, { force: true });
   const store = new OrderStore(LEDGER);
-  const service = new ReconcileService(exchange, store);
-  return new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), {
+  return new LiveOrderEngine(exchange, store, new RiskManager(riskConfig()), {
     gate,
     killSwitch: false,
     maxLiveQuoteNotional: Money.fromString('1000000'),
@@ -148,7 +146,6 @@ describe('Gate 7.1 — durable order identity', () => {
     const third = new LiveOrderEngine(
       exchange,
       new OrderStore(LEDGER),
-      new ReconcileService(exchange, new OrderStore(LEDGER)),
       new RiskManager(riskConfig()),
       { gate, killSwitch: false, maxLiveQuoteNotional: Money.fromString('1000000'), maxLiveBaseQuantity: Money.fromString('100') },
     );

@@ -31,7 +31,6 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { Money } from '../../../src/money/Money.js';
 import { OrderStore } from '../../../src/persistence/OrderStore.js';
-import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import { LiveOrderEngine } from '../../../src/execution/LiveExecutionEngine.js';
 import { RiskManager } from '../../../src/risk/RiskManager.js';
 import { withStateDirLockAsync, isLockHeld } from '../../../src/persistence/index.js';
@@ -128,8 +127,7 @@ function unresolvedOrder(clientOrderId: string): Order {
 function buildEngineWithStore(exchange: FakeExchange, ledger: string): { engine: LiveOrderEngine; store: OrderStore } {
   exchange.setTicker('BTC/CAD', { last: Money.fromString('40000') });
   const store = new OrderStore(ledger);
-  const service = new ReconcileService(exchange, store);
-  const engine = new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), {
+  const engine = new LiveOrderEngine(exchange, store, new RiskManager(riskConfig()), {
     gate: { tradingMode: 'live', realFundsAtRisk: true },
     killSwitch: false,
     maxLiveQuoteNotional: Money.fromString('1000000'),
@@ -153,20 +151,18 @@ interface Generation {
   engineMod: typeof import('../../../src/execution/LiveExecutionEngine.js');
   storeMod: typeof import('../../../src/persistence/OrderStore.js');
   riskMod: typeof import('../../../src/risk/RiskManager.js');
-  reconMod: typeof import('../../../src/reconcile/ReconcileService.js');
   lockMod: typeof import('../../../src/persistence/lock.js');
 }
 
 async function loadGeneration(): Promise<Generation> {
   vi.resetModules();
-  const [engineMod, storeMod, riskMod, reconMod, lockMod] = await Promise.all([
+  const [engineMod, storeMod, riskMod, lockMod] = await Promise.all([
     import('../../../src/execution/LiveExecutionEngine.js'),
     import('../../../src/persistence/OrderStore.js'),
     import('../../../src/risk/RiskManager.js'),
-    import('../../../src/reconcile/ReconcileService.js'),
     import('../../../src/persistence/lock.js'),
   ]);
-  return { engineMod, storeMod, riskMod, reconMod, lockMod };
+  return { engineMod, storeMod, riskMod, lockMod };
 }
 
 function buildGenerationEngine(
@@ -175,9 +171,8 @@ function buildGenerationEngine(
   ledger: string,
 ): import('../../../src/execution/LiveExecutionEngine.js').LiveOrderEngine {
   const store = new gen.storeMod.OrderStore(ledger);
-  const service = new gen.reconMod.ReconcileService(exchange, store);
   const risk = new gen.riskMod.RiskManager(riskConfig());
-  return new gen.engineMod.LiveOrderEngine(exchange, store, service, risk, {
+  return new gen.engineMod.LiveOrderEngine(exchange, store, risk, {
     gate: { tradingMode: 'live', realFundsAtRisk: true },
     killSwitch: false,
     maxLiveQuoteNotional: Money.fromString('1000000'),

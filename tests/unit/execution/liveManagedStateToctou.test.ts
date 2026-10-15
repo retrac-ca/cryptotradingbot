@@ -19,7 +19,6 @@ import { Money } from '../../../src/money/Money.js';
 import { ManagedStateStore } from '../../../src/persistence/ManagedStateStore.js';
 import { OrderStore } from '../../../src/persistence/OrderStore.js';
 import { isLockHeld } from '../../../src/persistence/index.js';
-import { ReconcileService } from '../../../src/reconcile/ReconcileService.js';
 import { LiveOrderEngine } from '../../../src/execution/LiveExecutionEngine.js';
 import type { ManagedOrderGuard, PreparedLiveOrder } from '../../../src/execution/LiveExecutionEngine.js';
 import { buildManagedOrderGuard } from '../../../src/cli/live-test-cmd.js';
@@ -148,14 +147,13 @@ function setup(opts: { held?: string; guard?: ManagedOrderGuard; exchange?: Fake
     });
   exchange.setTicker(SYMBOL, { last: Money.fromString('40000') });
   const store = new OrderStore(ledger);
-  const service = new ReconcileService(exchange, store);
   const auth = createControlledLiveAuthorization({
     side: 'SELL',
     type: 'limit',
     maxBaseQuantity: Money.fromString('1'),
     maxQuoteNotional: Money.fromString('100000'),
   });
-  const engine = new LiveOrderEngine(exchange, store, service, new RiskManager(riskConfig()), {
+  const engine = new LiveOrderEngine(exchange, store, new RiskManager(riskConfig()), {
     gate: { tradingMode: 'live', realFundsAtRisk: true },
     killSwitch: false,
     maxLiveQuoteNotional: Money.fromString('100000'),
@@ -232,7 +230,7 @@ describe('LiveExecutionEngine — managed-state TOCTOU guard', () => {
       return baseGuard(order);
     };
     const store = new OrderStore(ledger);
-    const engine = new LiveOrderEngine(exchange, store, new ReconcileService(exchange, store), new RiskManager(riskConfig()), {
+    const engine = new LiveOrderEngine(exchange, store, new RiskManager(riskConfig()), {
       gate: { tradingMode: 'live', realFundsAtRisk: true },
       killSwitch: false,
       maxLiveQuoteNotional: Money.fromString('100000'),

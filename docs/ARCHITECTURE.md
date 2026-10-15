@@ -130,11 +130,14 @@ editing source.
   ids, so a restart does not reset the account. `OrderStore` persists the
   durable order ledger keyed by `clientOrderId` (Money stored as decimal
   strings), which underpins duplicate-order prevention and reconciliation.
-- **`src/reconcile/`** — `Reconciler` compares the bot's local order ledger
-  against the exchange's **authoritative** balances/open orders/history and
-  classifies discrepancies; `ReconcileService` fetches the exchange snapshot via
-  the adapter (failing closed if any read fails). The exchange is authoritative;
-  the bot never "fixes" a discrepancy by guessing.
+- **`src/reconcile/`** — the single V1 reconciliation path. `reconcile()` reads
+  the exchange's **authoritative** balances / open orders / order history / account
+  trades and correlates them against the bot's local ledger, classifying execution
+  attribution, completeness, fee disposition, order/reservation state, balances,
+  and cross-domain findings; `commitProven()` applies only deterministic PROVEN
+  accounting and safe reservation releases behind an explicit gate. The exchange is
+  authoritative; the bot never "fixes" a discrepancy by guessing, and unexpected
+  external balances are surfaced (never auto-adopted).
 - **`src/engine/`** — `PaperEngine` (Phase 8) wires everything into one
   continuously-running loop: `Market Data → Universe → Coordinator → Strategy →
   Signal → Risk → Paper Execution → Managed Portfolio → Logging/Persistence`. It
