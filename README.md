@@ -13,7 +13,9 @@ the future without rewriting trading logic.
 ## Status
 
 This project is under active development, built incrementally in phases. See
-`docs/ARCHITECTURE.md` for the full plan and current progress.
+`docs/ARCHITECTURE.md` for the full plan and current progress, and
+`docs/NEXT_STEPS.md` for the current handoff status and the remaining
+operational steps.
 
 **Currently implemented (V1, PAPER-first):**
 - Project scaffolding (TypeScript, Vitest, ESLint) and a safe fixed-point money
