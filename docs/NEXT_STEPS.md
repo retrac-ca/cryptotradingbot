@@ -37,6 +37,11 @@ Expected: typecheck/lint/build clean; `npm test` → **127 files / 1656 tests**.
   equity curve are live. `bot healthcheck` reports **HEALTHY** (5/5).
 - `LIVE_AUTONOMOUS_ENABLED=false` in `.env` (disarmed during the handoff —
   see §4). The LIVE systemd unit is deliberately **not** installed.
+- The **healthcheck and backup user timers are installed, enabled, and active**
+  (`cryptotradingbot-healthcheck.timer`, `cryptotradingbot-backup.timer`).
+  Healthcheck runs every 5 minutes (first run: **HEALTHY**); the daily backup is
+  scheduled for 03:30 local and `.state-backups/` currently holds two snapshots
+  (git-ignored).
 - Read-only LIVE preflight on 2026-10-17: `live-test buy --check` ends
   **BUY PREFLIGHT: READY** (reconciliation `RECONCILIATION_REQUIRED` only from
   historical UNCORRELATED executions; pre-trade BUY gate **ALLOWED**);
@@ -100,16 +105,15 @@ Do these in order. Nothing here is automated.
 3. **Bounded autonomous session** — only after 1–2 are clean. Read
    `docs/AUTONOMOUS_LIVE.md` first, then arm with deliberately small caps and
    `node dist/index.js start --confirm-live`.
-4. **Deploy + monitor** — the PAPER and dashboard units are already installed
-   and running (§0.1). Remaining optional pieces: install the healthcheck and
-   backup timers from `deploy/systemd/` (see `docs/OPERATIONS.md`), set
+4. **Deploy + monitor** — the PAPER, dashboard, healthcheck, and backup timers
+   are already installed and running (§0.1). Remaining optional pieces: set
    `ALERT_WEBHOOK_URL` / `ALERT_NTFY_TOPIC`, and (if remote access is wanted)
    front loopback with Tailscale per `docs/DASHBOARD_DEPLOYMENT.md`. The **LIVE**
    unit stays uninstalled until unattended real-money trading is deliberately
    wanted.
-5. **Backups** — run `node dist/index.js backup-state` once and enable the daily
-   timer. Snapshots default to `.state-backups/` (git-ignored) and retain 14;
-   restore steps are in `docs/OPERATIONS.md` §2.
+5. **Backups** — the daily timer is already active (§0.1). Run one on demand with
+   `node dist/index.js backup-state`; snapshots default to `.state-backups/`
+   (git-ignored) and retain 14. Restore steps are in `docs/OPERATIONS.md` §2.
 
 If an order reports **UNKNOWN**: **do not retry**. See
 `docs/AUTONOMOUS_LIVE.md` §7 and `docs/CREATED_ORDER_RECOVERY.md`.

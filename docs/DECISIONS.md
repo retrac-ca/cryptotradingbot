@@ -2132,8 +2132,9 @@ validation need both.
 Systemd one-shot units and timers are provided for both
 (`cryptotradingbot-healthcheck.{service,timer}` every 5 minutes,
 `cryptotradingbot-backup.{service,timer}` daily at 03:30). The operator runbook
-is `docs/OPERATIONS.md`. Installing/enabling the units remains an explicit
-operator action; this change did not install them.
+is `docs/OPERATIONS.md`. Both timers were installed and enabled on 2026-10-17 in
+the current deployment; installation remains an explicit operator action in the
+repository.
 
 **Safety.** No trading, risk, execution, accounting, reconciliation, or
 authorization behavior changed. `healthcheck` is read-only; `backup-state` is
@@ -2157,7 +2158,7 @@ mutation lock. The first controlled BUY and any autonomous arming remain
 operator actions and were not performed.
 
 **Validation.** `npm run typecheck`, `npm run lint`, `npm test`
-(127 files / 1656 passed), `npm run build` all clean. `systemd-analyze --user
-verify` accepts the four new unit/timer files. `healthcheck` and `backup-state`
-were exercised against the live PAPER deployment (HEALTHY; one snapshot created
-in `.state-backups/`, git-ignored).
+(127 files / 1656 tests), `npm run build` all clean. `systemd-analyze --user
+verify` accepts the four new unit/timer files; both timers are enabled/active,
+the healthcheck one-shot exits 0 (**HEALTHY**, 5/5), and the backup one-shot
+created a snapshot in `.state-backups/` (git-ignored).
