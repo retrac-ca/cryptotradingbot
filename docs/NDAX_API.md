@@ -378,13 +378,15 @@ tested): `toNdaxSendOrderRequest`, `toNdaxCancelOrderRequest`,
 recognized `"Accepted"`/`"Rejected"` status throws `InvalidResponseError`
 (AMBIGUOUS), so a malformed ack can never be treated as a definite acknowledgement.
 
-The paths stay DISABLED: they only execute when the internal
-`enableOrderPlacement` option is set (a test-only switch NOT exposed through the
-bot configuration), and `capabilities.supportsOrderPlacement` remains `false`.
-`bot start` enforces an explicit `--confirm-live` flag (plus
-`TRADING_MODE=live` and `REAL_FUNDS_AT_RISK=true`) before it will even consider
-live mode, and then fails closed because the adapter does not advertise
-placement. See the checklist below and `DECISIONS.md` §24.
+The paths stay gated: they execute only when the internal `enableOrderPlacement`
+test switch is set, or when a validated, process-local `PlacementAuthorization`
+is supplied — a controlled-test authorization from `bot live-test` or an armed
+autonomous live session. `capabilities.supportsOrderPlacement` remains `false`,
+and no bot configuration exposes a generic placement switch. `bot start`
+additionally requires `TRADING_MODE=live`, `REAL_FUNDS_AT_RISK=true`,
+`ENABLE_AUTHENTICATED_READS=true`, `LIVE_AUTONOMOUS_ENABLED=true`, and the
+per-invocation `--confirm-live` flag. See the checklist below and
+`DECISIONS.md` §24.
 
 - **OrderState**: 🔎 RESOLVED — REST returns **string** values: `"Accepted"`,
   `"Rejected"`, `"Working"`, `"Canceled"`, `"Expired"`, `"FullyExecuted"`
@@ -435,21 +437,21 @@ What this does and does NOT establish:
 ### feeProductId → fee currency
 
 - ✅ `feeProductId` is populated on every executed trade (live-verified).
-- 🔎 `feeProductId` identifies a **product** (asset) via NDAX `GetProducts`
-  (`productId` ↔ `product`/`productFullName`). To resolve whether the fee is
-  charged in the instrument's **base** or **quote**, you must also know the
-  instrument's `product1Id`/`product2Id` (or `product1Symbol`/`product2Symbol`)
-  from `GetInstruments`.
-- ❌ The adapter's `MarketInfo` currently surfaces only `symbol` + `exchangeId`
-  (instrument id) — it does **NOT** expose `product1`/`product2` ids or their
-  symbols, and the adapter does not call `GetProducts`. **Therefore fee currency
-  CANNOT yet be safely derived from `feeProductId` in code.** The manual bridge
-  keeps its fail-closed rule: only an exchange-confirmed quote fee is accounted;
-  base/missing/negative fees fail closed. The `mapOrder` `feeCurrency:'quote'`
-  hardcode remains an UNVERIFIED assumption and MUST be removed before any
-  execution-level fee accounting is trusted.
-- ⚠️ A fee can potentially be charged in an asset OTHER than base/quote
-  (`feeProductId` is an arbitrary product). The adapter must never coerce it.
+- `feeProductId` identifies a **product** (asset) via NDAX `GetProducts`
+  (`productId` ↔ `product`/`productFullName`). The instrument's
+  `product1Id`/`product2Id` (or `product1Symbol`/`product2Symbol`) from
+  `GetInstruments` identify base/quote.
+- ✅ **Implemented and live-verified (2026-09-03):** `MarketInfo` surfaces
+  `baseProductId`/`quoteProductId`/`baseProductSymbol`/`quoteProductSymbol`, and
+  the adapter resolves fees through
+  `resolveFeeCurrency(feeProductId, symbol)` (`GetProducts` + `GetInstruments`).
+  See §7c below for the full resolution and the evidence.
+- A fee can be charged in an asset OTHER than base/quote. `resolveFeeProduct`
+  reports `other`/`unknown` and the accounting paths fail closed; they never
+  coerce a fee to quote.
+- ⚠️ `GetOrderStatus` carries no `feeProductId`, so the **order-level** fee
+  currency remains `'unknown'`. Authoritative currency exists only at the
+  execution level (`GetAccountTrades`).
 
 ### OrderId → RETRAC intent provenance
 
@@ -683,12 +685,13 @@ Still flagged (not yet exercised against a live account):
    (GetUserAccounts/GetAccountPositions/GetOpenOrders/GetOrderHistory/
    GetAccountTrades all returned real data).
    ⚠️ Still unverified: **`executionId` uniqueness across all executions/time**
-   (only a 33-row sample; an order with multiple executions was not observed), and
+   (only a small sample; an order with multiple executions was not observed), and
    **whether `GetAccountTrades` can reliably enumerate ALL of one order's
    executions** (it is paginated, max 200, and not filterable by `orderId`).
-   ⚠️ **`feeProductId`→currency resolution** is NOT implemented: `GetProducts`
-   and the instrument's `product1`/`product2` ids/symbols are not surfaced by the
-   adapter, so fee currency cannot be safely derived yet.
+   ✅ **`feeProductId`→currency resolution is implemented and live-verified**
+   (`resolveFeeCurrency` via `GetProducts` + `GetInstruments`); see §7c. The
+   order-level `GetOrderStatus` fee currency remains `'unknown'` because that
+   read carries no `feeProductId`.
 2. **Testnet availability** — `https://ndaxmarginstaging.cdnhop.net:8443/AP` is
    third-party; no official public testnet documented. No safe non-production
    order-placement path exists.
@@ -742,12 +745,13 @@ interaction with a real NDAX account is still NOT satisfied**, so the flag stays
    `Trading` permission and any IP whitelist must include the bot's egress IP).
 6. **Fees confirmed** to use in risk/paper modeling (flat 0.20%).
 
-Until all six are satisfied, NDAX keeps `supportsOrderPlacement=false`, so live
-mode fails closed (the `LiveOrderEngine` refuses to construct, and `bot start`
-in live mode refuses even with `--confirm-live`). Gate 3 adds a redundant human
-gate in front of any future live start: `bot start` requires
-`TRADING_MODE=live` + `REAL_FUNDS_AT_RISK=true` + the per-invocation
-`--confirm-live` flag.
+`supportsOrderPlacement` remains `false` in the current design; there is no
+generic config switch to turn it on. The SendOrder/CancelOrder paths are
+reachable only through an explicit, process-local capability — a controlled-test
+authorization or an armed autonomous session — and `bot start` in live mode
+additionally requires `TRADING_MODE=live`, `REAL_FUNDS_AT_RISK=true`,
+`ENABLE_AUTHENTICATED_READS=true`, `LIVE_AUTONOMOUS_ENABLED=true`, and the
+per-invocation `--confirm-live` flag.
 
 ### V1 software readiness vs NDAX private-API verification vs live-trading authorization
 

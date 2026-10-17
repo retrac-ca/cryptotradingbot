@@ -1,0 +1,17 @@
+# Cryptotradingbot health check timer — systemd USER timer.
+#
+# Runs the read-only health check every 5 minutes (and 5 minutes after boot).
+# See cryptotradingbot-healthcheck.service for install instructions.
+
+[Unit]
+Description=Run the Cryptotradingbot health check every 5 minutes
+Documentation=file:%h/code/cryptotradingbot/docs/OPERATIONS.md
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=cryptotradingbot-healthcheck.service
+
+[Install]
+WantedBy=timers.target

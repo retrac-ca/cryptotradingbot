@@ -4,14 +4,17 @@
  * PAPER mode runs the full end-to-end paper engine (never touches a real order
  * endpoint).
  *
- * LIVE mode is deliberately hard to enable and fails closed. Three independent
- * conditions must hold, and even then live trading is not yet operational:
+ * LIVE mode is deliberately hard to enable and fails closed. All of the
+ * following must hold:
  *   1. TRADING_MODE=live
- *   2. REAL_FUNDS_AT_RISK=true        (also enforced by the config schema)
- *   3. An explicit per-invocation confirmation flag:  bot start --confirm-live
- * Afterwards `start` verifies the exchange adapter actually reports
- * `supportsOrderPlacement`. Until the NDAX adapter enables it, live start
- * refuses — there is NO automatic first trade and no startup trade.
+ *   2. REAL_FUNDS_AT_RISK=true          (also enforced by the config schema)
+ *   3. ENABLE_AUTHENTICATED_READS=true  (also enforced by the config schema)
+ *   4. KILL_SWITCH=false
+ *   5. LIVE_AUTONOMOUS_ENABLED=true     (arms the bounded autonomous session)
+ *   6. An explicit per-invocation confirmation flag: bot start --confirm-live
+ * The NDAX adapter keeps `supportsOrderPlacement=false`; the armed, bounded
+ * autonomous session is the explicit process-local capability that permits
+ * placement. There is NO automatic first trade and no startup trade.
  */
 
 import { loadConfig } from '../config/load.js';

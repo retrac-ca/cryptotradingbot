@@ -1,0 +1,17 @@
+# Cryptotradingbot state backup timer — systemd USER timer.
+#
+# Takes one snapshot daily at 03:30 local time (persistent: catches up after a
+# reboot/sleep). See cryptotradingbot-backup.service for install instructions.
+
+[Unit]
+Description=Daily Cryptotradingbot STATE_DIR snapshot
+Documentation=file:%h/code/cryptotradingbot/docs/OPERATIONS.md
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=cryptotradingbot-backup.service
+
+[Install]
+WantedBy=timers.target

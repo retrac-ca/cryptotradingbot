@@ -17,10 +17,11 @@ export { ndaxSignature, ndaxNonce, signaturesMatch, isHexDigest } from './signin
 export { mapLevel1ToTicker, mapInstrumentToMarketInfo, mapOrder, mapL2ToOrderBook, mapTickerHistoryRow } from './mappings.js';
 
 // Order submission/cancellation request+response mappers. Pure + unit-tested.
-// They ARE now wired into NdaxAdapter.placeOrder/cancelOrder (the SendOrder /
+// They ARE wired into NdaxAdapter.placeOrder/cancelOrder (the SendOrder /
 // CancelOrder network paths), but those paths stay gated behind the internal
-// enableOrderPlacement switch (default false) while supportsOrderPlacement is
-// false — so no production path can reach a live order endpoint.
+// enableOrderPlacement switch (default false) and an explicit process-local
+// PlacementAuthorization (controlled-test or armed autonomous session) while
+// supportsOrderPlacement remains false.
 export {
   toNdaxSendOrderRequest,
   toNdaxCancelOrderRequest,

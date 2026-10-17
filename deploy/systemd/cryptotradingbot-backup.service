@@ -1,0 +1,46 @@
+# Cryptotradingbot state backup — systemd USER unit.
+#
+# Runs `bot backup-state --keep 14` once. It copies STATE_DIR into the sibling
+# .state-backups/ directory (skipping .mutation.lock and *.tmp), writes a
+# manifest, and prunes older snapshots. It never contacts the exchange, never
+# mutates state, and never acquires the mutation lock.
+#
+# Install (as the login user; never done automatically by this repo):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/cryptotradingbot-backup.* ~/.config/systemd/user/
+#   npm run build
+#   systemctl --user daemon-reload
+#   systemd --user start cryptotradingbot-backup.service   # run once
+#   systemctl --user enable --now cryptotradingbot-backup.timer
+#
+# The unit writes ONLY .state-backups/. If you pass `--dir` to use another
+# location, update ReadWritePaths= to match (and keep it outside STATE_DIR).
+#
+# Optional persistence after logout (host-level, explicit operator opt-in):
+#   loginctl enable-linger "$USER"
+
+[Unit]
+Description=Cryptotradingbot STATE_DIR snapshot (local filesystem only)
+Documentation=file:%h/code/cryptotradingbot/docs/OPERATIONS.md
+AssertPathExists=%h/code/cryptotradingbot/dist/index.js
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/cryptotradingbot
+ExecStart=/usr/bin/node %h/code/cryptotradingbot/dist/index.js backup-state --keep 14
+Environment=NODE_ENV=production
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# The whole home directory is READ-ONLY; the ONLY writable path is the backup
+# directory. STATE_DIR remains readable but is never modified by this unit.
+ProtectHome=read-only
+ReadWritePaths=%h/code/cryptotradingbot/.state-backups

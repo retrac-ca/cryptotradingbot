@@ -156,6 +156,13 @@ export const dashboardCommand: CommandHandler = async (args, { logger }): Promis
   // Read-only credentials context. The adapter is handed to MonitoringService,
   // which wraps it in a read-only facade; this command never calls a write
   // method on it.
+  if (!isLoopbackHost(parsed.host)) {
+    logger.warn(
+      { host: parsed.host },
+      'dashboard is bound to a NON-loopback address; the monitoring API has no authentication. ' +
+        'Prefer loopback + a private access layer (docs/DASHBOARD_DEPLOYMENT.md).',
+    );
+  }
   const credentials: Record<string, string> = {
     apiKey: cfg.ndaxApiKey,
     apiSecret: cfg.ndaxApiSecret,
