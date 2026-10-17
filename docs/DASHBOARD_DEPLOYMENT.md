@@ -202,7 +202,8 @@ Access is limited by tailnet membership. For tighter control, use Tailscale
 
 Do **not** set `DASHBOARD_HOST` / `DASHBOARD_ALLOW_REMOTE` for this setup. The
 API stays on `127.0.0.1:8787`; Tailscale provides the private, authenticated
-boundary.
+boundary. If a non-loopback bind is explicitly allowed, the dashboard logs a
+prominent warning at startup because the API itself has no authentication.
 
 Because every request must present an explicitly allowlisted `Host` header, you
 must add the Tailscale Serve hostname to `DASHBOARD_ALLOWED_HOSTS` (the port is

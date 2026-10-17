@@ -1,0 +1,48 @@
+# Cryptotradingbot operational health check — systemd USER unit.
+#
+# Runs `bot healthcheck --require-engine` once. It is READ-ONLY: it never
+# contacts the exchange, never mutates state, and never places/cancels/resolves
+# an order. Exit code 0 = healthy; 2 = degraded/unhealthy (the unit is then
+# marked failed and `systemctl --user --failed` surfaces it).
+#
+# Install (as the login user; never done automatically by this repo):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/cryptotradingbot-healthcheck.* ~/.config/systemd/user/
+#   npm run build
+#   systemctl --user daemon-reload
+#   systemd --user start cryptotradingbot-healthcheck.service   # run once
+#   systemctl --user enable --now cryptotradingbot-healthcheck.timer
+#
+# The check probes the local dashboard's /api/healthz. If the dashboard unit is
+# intentionally not installed, add `--no-dashboard` to ExecStart (otherwise the
+# probe is a WARN and the unit exits 2). Set ALERT_WEBHOOK_URL / ALERT_NTFY_TOPIC
+# in .env if you also want engine-level push alerts.
+#
+# Optional persistence after logout (host-level, explicit operator opt-in):
+#   loginctl enable-linger "$USER"
+
+[Unit]
+Description=Cryptotradingbot READ-ONLY health check (state, heartbeat, equity, dashboard)
+Documentation=file:%h/code/cryptotradingbot/docs/OPERATIONS.md
+After=network-online.target
+Wants=network-online.target
+AssertPathExists=%h/code/cryptotradingbot/dist/index.js
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/code/cryptotradingbot
+ExecStart=/usr/bin/node %h/code/cryptotradingbot/dist/index.js healthcheck --require-engine
+Environment=NODE_ENV=production
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Read-only: the check reads .env and .state/, and writes nothing.
+ProtectHome=read-only

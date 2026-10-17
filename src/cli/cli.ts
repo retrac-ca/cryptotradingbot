@@ -3,15 +3,17 @@
  *
  * Command dispatcher for the `bot` binary. Each subcommand is a small module.
  * Commands cover setup/config, paper+start engines, status, read-only historical
- * candle acquisition, backtesting, the order ledger (trades), and read-only
- * reconciliation.
+ * candle acquisition, backtesting, the order ledger (trades), read-only
+ * reconciliation, monitoring, health checking, and state backups.
  */
 
 import { createLogger } from '../logging/logger.js';
 import { VERSION } from './context.js';
 import { backtestCommand } from './backtest-cmd.js';
+import { backupStateCommand } from './backup-state-cmd.js';
 import { configureCommand } from './config-cmd.js';
 import { dashboardCommand } from './dashboard-cmd.js';
+import { healthcheckCommand } from './healthcheck-cmd.js';
 import { fetchCandlesCommand } from './fetch-candles-cmd.js';
 import { liveAdoptExternalCashCommand } from './live-adopt-external-cash-cmd.js';
 import { liveMonitorCommand } from './live-monitor-cmd.js';
@@ -31,6 +33,8 @@ export const COMMANDS = {
   setup: setupCommand,
   config: configureCommand,
   dashboard: dashboardCommand,
+  healthcheck: healthcheckCommand,
+  'backup-state': backupStateCommand,
   paper: paperCommand,
   start: startCommand,
   status: statusCommand,
@@ -54,9 +58,11 @@ const USAGE = `cryptotradingbot v${VERSION}
 Usage: bot <command> [options]
 
 Commands:
-  setup     Create/configure the .env file interactively
+  setup     Create a .env file from the template (never overwrites)
   config    Show the effective resolved (non-secret) configuration
   dashboard Start the READ-ONLY monitoring HTTP API (observational only; never trades)
+  healthcheck READ-ONLY local health check (state, heartbeat, equity curve, dashboard; never trades)
+  backup-state Snapshot STATE_DIR to a timestamped backup (read-only; never mutates state)
   paper     Start the bot in PAPER (simulated) trading mode
   start     Start the bot (paper by default)
   status    Show current bot / trading status

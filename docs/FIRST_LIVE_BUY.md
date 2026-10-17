@@ -5,9 +5,13 @@ This is the operator procedure for the first real-money BUY via
 single confirmed submission. Do not retry, and never run the submission command
 until the pre-flight is green.
 
-> The bot has **no autonomous live trading**. `bot live-test buy` is the only
-> production BUY path. It is LIMIT-only, side-scoped, single-use-authorized,
-> persist-before-submit, mutation-locked, and requires an interactive `EXECUTE`.
+> This runbook covers the **controlled, operator-confirmed** path only. A separate
+> bounded autonomous engine exists and must be deliberately armed
+> (`LIVE_AUTONOMOUS_ENABLED=true` + `--confirm-live`; see
+> `docs/AUTONOMOUS_LIVE.md`). For the controlled path, `bot live-test buy` is the
+> only production BUY command. It is LIMIT-only, side-scoped,
+> single-use-authorized, persist-before-submit, mutation-locked, and requires an
+> interactive `EXECUTE`.
 
 ## 0. What is deliberately NOT available
 

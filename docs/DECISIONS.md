@@ -1510,7 +1510,9 @@ to `AMBIGUOUS`, nothing double-accounted).
 - At the ORDER level an authoritative NDAX fee is never obtainable (currency is
   `'unknown'`), so a fee-bearing real NDAX order lands in
   `RECONCILIATION_REQUIRED` rather than an ACCOUNTED state — accounting refuses
-  rather than guess.
+  rather than guess. (Superseded in part by §34: fee currency **is** resolvable
+  at the execution level via `feeProductId`; a PROVEN + QUOTE fee is
+  accountable, while BASE/OTHER/UNKNOWN still fail closed.)
 - `executionId` universal uniqueness and per-OrderId enumeration completeness are
   NOT proven; exactly-once execution/accounting is NOT claimed.
 - Operator attestation is the attribution layer; if an operator attests falsely
@@ -2068,3 +2070,95 @@ gated any submission. Ownership/adoption, the manual bridge, live accounting, an
 **Validation.** `npm run typecheck`, `npm run lint`, `npm test`
 (125 files / 1643 passed), `npm run build` all clean. `grep` confirms no
 `Reconciler`/`ReconcileService` symbol remains in `src/` or `tests/`.
+
+## 49. Documentation accuracy pass + live-arm disarm (2026-10-16)
+
+**Context.** The handoff docs had drifted from implemented behavior: the README
+CLI table omitted several commands and described `live-test` as SELL-only;
+`.env.example`, `ARCHITECTURE.md`, and `NDAX_API.md` still implied a generic live
+order path was unreachable because `supportsOrderPlacement=false`; and
+`NEXT_STEPS.md` warned that `LIVE_AUTONOMOUS_ENABLED=true` could not arm while the
+rest of `.env` was already live-configured.
+
+**Decision.** Bring the operational docs in line with the code, without changing
+behavior: document the full CLI; describe placement as reachable only through the
+explicit controlled-test authorization or the armed autonomous session while
+`supportsOrderPlacement` stays `false`; add the current deployment snapshot to
+`NEXT_STEPS.md` §0.1; and correct the matching safety comments in
+`src/cli/start-cmd.ts` and the NDAX adapter. Also correct two remaining stale
+claims: `docs/FIRST_LIVE_BUY.md` no longer says autonomous live trading does not
+exist (it is scoped to the controlled operator path), and the read-only
+`bot live-monitor` banner no longer claims autonomous placement is disabled
+(`supportsOrderPlacement=false` remains true, but that flag is not the whole
+placement boundary). Disarmed the runtime `.env`
+(`LIVE_AUTONOMOUS_ENABLED=false`); `.env` is not versioned.
+
+**Safety.** Docs/comments only — no execution, risk, accounting, or
+reconciliation behavior changed. The running PAPER engine and dashboard are
+untouched; the one-shot `bot live-test buy|sell` and autonomous paths keep their
+existing gates.
+
+**Validation.** `npm run typecheck`, `npm run lint`, `npm test`
+(125 files / 1643 passed), `npm run build` all clean.
+
+## 50. Operations hardening — health check + state backups (2026-10-17)
+
+**Context.** The deployment had monitoring (heartbeat/equity/dashboard), but no
+operator-friendly way to answer "is the deployment healthy right now?" and no
+durable backup procedure for `STATE_DIR`. A long PAPER soak and any later LIVE
+validation need both.
+
+**Decision.** Add two deliberately read-only operational commands:
+
+1. `bot healthcheck` (`src/ops/healthcheck.ts`) composes the existing
+   fail-closed readers: `recoverState` (corruption, unresolved orders /
+   reservations / intents, unexpected state loss), the mutation-lock presence,
+   the engine heartbeat (freshness, halted/running), the equity curve, and the
+   **local** dashboard `/api/healthz` liveness probe. It never contacts NDAX and
+   never mutates state. Exit codes follow the CLI convention: 0 healthy,
+   2 degraded/unhealthy, 1 error. `--require-engine` turns a missing/stale
+   heartbeat into FAIL; `--no-dashboard` is available when the dashboard unit is
+   not installed.
+2. `bot backup-state` (`src/ops/stateBackup.ts`) copies every regular file from
+   `STATE_DIR` into a timestamped sibling directory (`<STATE_DIR>-backups/` by
+   default), writes a `manifest.json`, skips `.mutation.lock` and `*.tmp`, and
+   prunes only recognized snapshots with a manifest (default retention 14). It
+   creates the destination with mode `0700`, refuses a destination inside
+   `STATE_DIR`, never acquires the mutation lock, and never modifies/deletes
+   state. Envelope writes are individually atomic, so files are internally
+   consistent; the snapshot is not a global cross-file transaction and is not a
+   substitute for reconciliation.
+
+Systemd one-shot units and timers are provided for both
+(`cryptotradingbot-healthcheck.{service,timer}` every 5 minutes,
+`cryptotradingbot-backup.{service,timer}` daily at 03:30). The operator runbook
+is `docs/OPERATIONS.md`. Both timers were installed and enabled on 2026-10-17 in
+the current deployment; installation remains an explicit operator action in the
+repository.
+
+**Safety.** No trading, risk, execution, accounting, reconciliation, or
+authorization behavior changed. `healthcheck` is read-only; `backup-state` is
+local-filesystem-only and read-only toward bot state. Neither command constructs
+an exchange adapter or reaches an order endpoint. `.env` secrets are not copied
+(it is outside `STATE_DIR`). The backup directory is git-ignored.
+
+**Also corrected in the accuracy pass.** `docs/FIRST_LIVE_BUY.md` no longer
+claims autonomous live trading does not exist; the `live-monitor` banner no
+longer implies `supportsOrderPlacement=false` disables the armed autonomous
+path; and the fee-currency docs now reflect the implemented/live-verified
+execution-level `feeProductId` resolution (order-level `GetOrderStatus` remains
+`'unknown'`, so BASE/OTHER/UNKNOWN fees still fail closed).
+
+**Read-only LIVE preflight (2026-10-17, no order placed).** `healthcheck` =
+HEALTHY; `live-test buy --check` = **BUY PREFLIGHT: READY** with the pre-trade
+BUY gate ALLOWED (global reconciliation `RECONCILIATION_REQUIRED` only from
+historical UNCORRELATED executions); `verify:ndax` = all 10 read-only checks
+passed (36/36 fees resolved: 17 quote, 19 base); `trades --open` = 0; no
+mutation lock. The first controlled BUY and any autonomous arming remain
+operator actions and were not performed.
+
+**Validation.** `npm run typecheck`, `npm run lint`, `npm test`
+(127 files / 1656 tests), `npm run build` all clean. `systemd-analyze --user
+verify` accepts the four new unit/timer files; both timers are enabled/active,
+the healthcheck one-shot exits 0 (**HEALTHY**, 5/5), and the backup one-shot
+created a snapshot in `.state-backups/` (git-ignored).

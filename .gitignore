@@ -39,6 +39,7 @@ data/
 # Persisted bot runtime state (never commit; may contain account/config data)
 .state/
 .soak/
+.state-backups/
 .live-managed-state.json
 .manual-intents.json
 *.legacy

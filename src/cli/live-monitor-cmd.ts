@@ -154,7 +154,10 @@ export const liveMonitorCommand: CommandHandler = async (_args): Promise<number>
   // eslint-disable-next-line no-console
   console.log(`  interval: ${intervalMs / 1000}s | mode: READ-ONLY (no submit/cancel)`);
   // eslint-disable-next-line no-console
-  console.log('  NDAX autonomous order placement remains DISABLED (supportsOrderPlacement=false).');
+  console.log(
+    '  This monitor never submits or cancels. NDAX supportsOrderPlacement stays false;' +
+      ' placement remains limited to the controlled-test or armed-autonomous path.',
+  );
 
   await runLiveMonitorSession({
     monitorOnce: () => monitor.monitorOnce(),

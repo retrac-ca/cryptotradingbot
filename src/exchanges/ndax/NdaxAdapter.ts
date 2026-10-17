@@ -90,11 +90,11 @@ export interface NdaxAdapterOptions {
   enableAuthenticatedReads?: boolean;
   /**
    * If true, arm the SendOrder/CancelOrder network paths. Default false. This
-   * is an INTERNAL switch for deterministic wire tests ONLY — it is not exposed
-   * through the bot configuration, and `capabilities.supportsOrderPlacement`
-   * stays `false` regardless, so the live execution engine cannot start. It
-   * exists so the exact request/response behavior can be exercised with a
-   * scripted fetch without any production path reaching a real order endpoint.
+   * is an INTERNAL switch for deterministic wire tests; it is not exposed
+   * through the bot configuration. Production placement instead requires an
+   * explicit process-local PlacementAuthorization (controlled-test or armed
+   * autonomous session). `capabilities.supportsOrderPlacement` stays `false`
+   * regardless.
    */
   enableOrderPlacement?: boolean;
   /** Minimum interval between REST requests. Defaults to the client's 1000ms. */
@@ -114,11 +114,12 @@ const CAPABILITIES: ExchangeCapabilities = {
   supportsOrderBook: true,
   supportsFees: true,
   supportsMarketInfo: true,
-  // Deliberately kept false (Gate 2 → Gate 3): even though the SendOrder/
-  // CancelOrder network paths are now implemented behind `enableOrderPlacement`,
-  // the adapter does NOT advertise live placement to the engine. LiveOrderEngine
-  // reads THIS flag; while it is false, live trading fails closed.
-  supportsOrderPlacement: false, // NOT enabled in this milestone
+  // Deliberately kept false: the adapter never advertises generic live
+  // placement. SendOrder/CancelOrder are reachable only through the internal
+  // test switch or an explicit process-local PlacementAuthorization
+  // (controlled-test or armed autonomous session); LiveOrderEngine requires the
+  // latter for production placement.
+  supportsOrderPlacement: false,
   // Public data does NOT require auth (verified live: public endpoints are
   // unsigned GETs). Only account reads need credentials.
   publicDataRequiresAuth: false,
@@ -406,9 +407,9 @@ export class NdaxAdapter implements ExchangeAdapter {
    * that the order reached the book — the execution engine reconciles via
    * getOrderStatus/getOpenOrders to confirm the working order.
    *
-   * Gated: throws OrderRejectedError unless `enableOrderPlacement` is true and
-   * authenticated reads are enabled. `capabilities.supportsOrderPlacement`
-   * stays false, so the live engine never reaches this path.
+   * Gated: throws OrderRejectedError unless `enableOrderPlacement` is true or a
+   * valid process-local PlacementAuthorization is supplied, and authenticated
+   * reads are enabled. `capabilities.supportsOrderPlacement` stays false.
    */
   async placeOrder(order: NewOrder, authorization?: PlacementAuthorization): Promise<PlaceOrderResult> {
     this.assertOrderPlacementEnabled(authorization, order);

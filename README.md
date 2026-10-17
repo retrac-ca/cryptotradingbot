@@ -17,13 +17,16 @@ This project is under active development, built incrementally in phases. See
 `docs/NEXT_STEPS.md` for the current handoff status and the remaining
 operational steps.
 
-**Currently implemented (V1, PAPER-first):**
+**Currently implemented (v1.4, PAPER-first):**
 - Project scaffolding (TypeScript, Vitest, ESLint) and a safe fixed-point money
   type (`src/money/Money.ts`) — no floating-point money
 - Configuration loading + validation from `.env` (zod), with clear errors, and
   structured logging (pino) with secret redaction
-- A CLI: `setup`, `config`, `paper`, `start`, `status`, `backtest`, `trades`,
-  `reconcile`, `live-test`, `manual`
+- A CLI covering setup/config, the paper and autonomous live engines, status,
+  backtesting, historical candle fetch, the durable order ledger,
+  reconciliation, controlled live orders, the read-only lifecycle monitor,
+  ownership onboarding, ambiguous-order resolution, the manual bridge, and the
+  read-only dashboard (see [CLI Commands](#cli-commands))
 - The NDAX exchange adapter (read-only public market data; authenticated account
   reads gated behind `ENABLE_AUTHENTICATED_READS`)
 - A polling market-data provider, a moving-average-crossover strategy, and a
@@ -55,6 +58,10 @@ operational steps.
   failure, `UNKNOWN` orders, or repeated errors (see `docs/AUTONOMOUS_LIVE.md`)
 - **Monitoring**: a read-only dashboard API plus engine heartbeat, live managed
   equity, an equity curve, and optional webhook/ntfy alerts
+- **Operations tooling**: a read-only `bot healthcheck` (state recovery,
+  mutation lock, heartbeat freshness, equity curve, dashboard liveness) and
+  `bot backup-state` (timestamped, retention-pruned snapshots of `STATE_DIR`);
+  systemd timers are provided in `deploy/systemd/` (see `docs/OPERATIONS.md`)
 
 **Live order execution is deliberately hard to enable.** The controlled one-shot
 `bot live-test buy|sell` path lets an operator make a single, risk-sized,
@@ -125,18 +132,28 @@ A fresh clone can be up and running in PAPER mode like this:
 
 | Command | Description |
 |---------|-------------|
-| `setup` | Create a `.env` file from the template (never overwrites) |
+| `setup` | Create/configure the `.env` file (never overwrites) |
 | `config` | Show the effective resolved (non-secret) configuration |
-| `paper` | Start the bot in SAFE simulated trading mode |
+| `dashboard` | Start the read-only monitoring HTTP API + UI (never trades; loopback by default) |
+| `healthcheck` | Read-only local health check (state recovery, mutation lock, heartbeat, equity curve, dashboard). Exit 2 when degraded/unhealthy |
+| `backup-state` | Snapshot `STATE_DIR` to a timestamped backup directory with retention (read-only; skips the lock/temp files) |
+| `paper` | Start the bot in SAFE simulated trading mode (always PAPER, regardless of `TRADING_MODE`) |
 | `start` | Start the bot (honors `TRADING_MODE`, paper by default). In live mode with `LIVE_AUTONOMOUS_ENABLED=true`, `--confirm-live` starts the autonomous engine (see `docs/AUTONOMOUS_LIVE.md`) |
-| `status` | Show current bot/trading status |
+| `status` | Show effective config plus the persisted paper portfolio |
 | `backtest <candles.json>` | Run a historical backtest and report performance |
+| `fetch-candles` | Fetch historical candles from the exchange (read-only public data) |
 | `trades` | Show the durable order ledger |
 | `reconcile` | Reconcile local ledger against the exchange (read-only) |
-| `live-test` | One-shot, operator-gated live SELL (`sell [--target-cad <N>] [--confirm-live]`) — the safe-first live order |
+| `live-test` | One-shot, operator-gated LIVE order: `sell` (risk-reducing) or `buy` (controlled LIMIT, managed CAD). `buy --check` is a read-only preflight; `--confirm-live` confirms |
+| `live-monitor` | Read-only lifecycle observer for unresolved LIVE orders (never submits/cancels) |
+| `live-onboard-external` | Authorize existing EXTERNAL inventory as bot-managed (local ownership only; not trading) |
+| `live-adopt-external-cash` | Adopt pre-existing EXTERNAL quote cash as bot-managed deployable capital (local ownership only; not trading) |
 | `manual` | Constrained manual-execution bridge (operator interface; records/validates/accounts evidence; never places or cancels an exchange order) |
+| `resolve-live-order` | Operator-attested resolution of an ambiguous FILLED live order (never submits/cancels) |
+| `resolve-created-order` | Operator-only ATTACH/ABANDON resolution of an unidentified live order (never submits/cancels) |
 
-Run `npm start -- help` for usage.
+Run `npm start -- help` for usage, or `npm start -- <command> --help` for
+command-specific options.
 
 ## Configuration
 
@@ -192,9 +209,14 @@ following files are created there and are git-ignored — do not commit them:
   initialization fails closed rather than re-seeding)
 - `.mutation.lock` — the state-directory mutation lock (fail-closed; removed on
   a clean release)
+- `<STATE_DIR>-backups/` — timestamped snapshots created by `bot backup-state`
+  (sibling of `STATE_DIR`, e.g. `.state-backups/`; skipped files and retention
+  are recorded in each snapshot's `manifest.json`)
 
 See `docs/CREATED_ORDER_RECOVERY.md` for the operator procedure to resolve an
-ambiguous `CREATED` live order and to remove a stale `.mutation.lock`.
+ambiguous `CREATED` live order and to remove a stale `.mutation.lock`. See
+`docs/OPERATIONS.md` for health checks, backups, restore steps, and the systemd
+timers.
 
 The configuration refuses to start if `PAPER_STATE_FILE` and
 `LIVE_MANAGED_STATE_FILE` are the same, or if any state file is outside
@@ -208,11 +230,14 @@ the `bot manual` bridge — require NDAX API credentials: `NDAX_API_KEY`,
 `NDAX_API_SECRET`, and a numeric `NDAX_USER_ID` (see `docs/NDAX_API.md`). These
 are created from your NDAX account settings.
 
-Credentials are used only for authenticated, read-only account access and are
-gated behind `ENABLE_AUTHENTICATED_READS` (default `false`). **Providing
-credentials does NOT enable autonomous live trading** — NDAX order placement
-remains disabled (`supportsOrderPlacement=false`), and no credential or
-configuration change can turn on autonomous live order placement.
+Credentials are used for authenticated account reads and are gated behind
+`ENABLE_AUTHENTICATED_READS` (default `false`). **Providing credentials alone
+does not enable autonomous live trading.** That additionally requires
+`TRADING_MODE=live`, `REAL_FUNDS_AT_RISK=true`, `KILL_SWITCH=false`,
+`ENABLE_AUTHENTICATED_READS=true`, `LIVE_AUTONOMOUS_ENABLED=true`, and the
+per-invocation `--confirm-live` flag. The adapter keeps
+`supportsOrderPlacement=false` and reaches `SendOrder` only through the explicit
+process-local capability those gates mint.
 
 > **Ownership model (Gate 5):** the bot maintains a **bot-managed** portfolio. It
 > only ever sells what it manages, and only ever buys with the deployable quote
@@ -279,22 +304,24 @@ when `TRADING_MODE=live`, `REAL_FUNDS_AT_RISK=true`, `ENABLE_AUTHENTICATED_READS
 `--confirm-live` is passed on the invocation. Config validation enforces the
 first four. Read `docs/AUTONOMOUS_LIVE.md` before arming.
 
-**Controlled-test mutation arming (readiness only).** The only way the software
-can reach `SendOrder` today is via the explicit `bot live-test sell` path, which
-creates a narrowly-scoped **controlled-test authorization** (SELL + LIMIT only,
-bounded by `LIVE_MAX_BASE_QUANTITY` / `LIVE_MAX_QUOTE_NOTIONAL`). The exact LIMIT
-order (symbol, side, quantity, limit price, notional) is prepared and displayed
-first; the operator's `EXECUTE` authorizes that **exact** order, which is then
-submitted unchanged. There is no post-confirmation repricing: the market data
-used to prepare the order must still be within the configured freshness window
-at submission, otherwise the command refuses (fail closed) instead of
-automatically computing a different order. This
-authorization is **not** autonomous live trading, is **not** a generic "live
-enabled" flag, and is required at both the engine and the adapter layer; it can
-never produce a BUY or MARKET order. `NdaxAdapter.supportsOrderPlacement` remains
-`false`. The first real order, if ever performed, is simultaneously the NDAX
-production-mutation proof; execution completeness remains a permanent limitation
-and reconciliation remains mandatory when evidence is insufficient.
+**Controlled-test mutation arming (readiness only).** The explicit one-shot
+`bot live-test sell|buy` path creates a narrowly-scoped **controlled-test
+authorization** (SELL or BUY, LIMIT only, bounded by `LIVE_MAX_BASE_QUANTITY` /
+`LIVE_MAX_QUOTE_NOTIONAL`). The exact LIMIT order (symbol, side, quantity, limit
+price, notional) is prepared and displayed first; the operator's `EXECUTE`
+authorizes that **exact** order, which is then submitted unchanged. There is no
+post-confirmation repricing: the market data used to prepare the order must
+still be within the configured freshness window at submission, otherwise the
+command refuses (fail closed) instead of automatically computing a different
+order. `live-test buy --check` is a read-only preflight that submits nothing.
+This authorization is **not** autonomous live trading, is **not** a generic
+"live enabled" flag, and is required at both the engine and the adapter layer;
+it can never produce a MARKET order. `NdaxAdapter.supportsOrderPlacement` remains
+`false`; the controlled-test authorization and the armed autonomous session are
+the only process-local capabilities that reach `SendOrder`. The first real order,
+if ever performed, is simultaneously the NDAX production-mutation proof;
+execution completeness remains a permanent limitation and reconciliation remains
+mandatory when evidence is insufficient.
 
 **Bounded LIVE lifecycle monitor (readiness only).** A read-only
 `bot live-monitor` command observes unresolved LIVE orders and advances their
@@ -324,6 +351,13 @@ but they are important to understand before relying on the live/manual realm:
   external exchange balances and never auto-adopts them. The legacy V0
   (`Reconciler`/`ReconcileService`) path was removed (see `docs/DECISIONS.md`
   §48 and `docs/RECONCILIATION_UNIFICATION.md`).
+- **Fee accounting is execution-level and fail-closed.** The order-level
+  `GetOrderStatus` read has no fee currency. An execution's fee currency is
+  resolved from `AccountTrade.feeProductId`; a PROVEN + QUOTE fee is
+  auto-accounted, while BASE/OTHER/UNKNOWN fees route to
+  `RECONCILIATION_REQUIRED` and are never converted or guessed. Universal
+  exactly-once execution accounting remains unproven (see
+  `docs/NDAX_API.md` §7c–§7d and `docs/DECISIONS.md` §34).
 
 ## Development
 
@@ -341,6 +375,7 @@ flow. Overview of the source layout:
 
 ```
 src/
+├── api/          # read-only monitoring HTTP API
 ├── cli/          # command-line interface
 ├── config/       # schema + validation
 ├── money/        # safe fixed-point money type
@@ -354,6 +389,9 @@ src/
 ├── persistence/  # state envelopes, stores, mutation lock, startup recovery
 ├── engine/       # main trading engine / orchestration
 ├── reconcile/    # order-ledger vs exchange reconciliation
+├── manual/       # constrained manual-execution bridge
+├── monitoring/   # heartbeat, equity curve, alerts, dashboard service
+├── ops/          # read-only health check + state backups
 └── backtest/     # historical backtesting
 ```
 

@@ -22,10 +22,11 @@ behind the design. The guiding principles are:
 | 8 | Paper trading | **DONE** |
 | 9 | Persistence + reconciliation | **DONE** |
 | 10 | Backtesting | **DONE** |
-| 11 | Live trading safeguards | **DONE** (engine + reconciliation tested; NDAX order placement remains **disabled**, fail-closed, until verified against a live account) |
+| 11 | Live trading safeguards | **DONE** (engine + reconciliation tested; `supportsOrderPlacement` stays `false`, with placement reachable only through the controlled-test or armed-autonomous capability) |
 | 12 | CLI / UX | **DONE** |
 | 13 | Docs + packaging | **DONE** |
 | 14 | Autonomous LIVE engine + monitoring | **DONE** (bounded, explicitly armed; see `docs/AUTONOMOUS_LIVE.md`) |
+| 15 | Operations hardening (health check, backups) | **DONE** (read-only `healthcheck` + `backup-state`, systemd timers; see `docs/OPERATIONS.md`) |
 
 Phases are implemented and reviewed incrementally, not all at once.
 
@@ -68,9 +69,9 @@ Pino-based structured (JSON) logging with sane development pretty-printing and
 
 ### `src/cli/` — User interface
 Minimal command dispatcher. Commands: `setup`, `config`, `paper`, `start`,
-`status`, `backtest`, `trades`, `reconcile`, `live-test`, and `manual`. Each is a
-small module. The CLI is crafted so non-technical users can get running without
-editing source.
+`status`, `backtest`, `trades`, `reconcile`, `live-test`, `manual`,
+`dashboard`, `healthcheck`, and `backup-state`. Each is a small module. The CLI
+is crafted so non-technical users can get running without editing source.
 
 - **`bot manual`** — the **CONSTRAINED MANUAL EXECUTION BRIDGE** operator
   interface (Gate 9.6). It is NOT a trading terminal or order-placement
@@ -162,6 +163,14 @@ editing source.
   (`src/persistence/equityHistory.ts`), surfaced at `/api/engine` and
   `/api/equity`. Optional alerting (`src/monitoring/notifier.ts`; webhook/ntfy) is
   fire-and-forget and never throws into the engine.
+- **`src/ops/`** — operational health and durability, both read-only with respect
+  to trading state. `healthcheck.ts` composes `recoverState`, the mutation-lock
+  check, the engine heartbeat, the equity curve, and a local dashboard liveness
+  probe into `bot healthcheck` (exit 2 when degraded/unhealthy). `stateBackup.ts`
+  implements `bot backup-state`: timestamped snapshots of `STATE_DIR` with a
+  manifest and retention, skipping `.mutation.lock`/`*.tmp`, never acquiring the
+  lock. systemd timers live in `deploy/systemd/`; the runbook is
+  `docs/OPERATIONS.md`.
 - **Multi-asset (Gate 5):** `src/engine/universe.ts` builds the eligible market
   universe from the curated `UNIVERSE_MARKETS` filtered by metadata eligibility
   (quote currency, valid ticks, min order, fees, market orders — never the
@@ -211,10 +220,11 @@ editing source.
   (`GetOrderStatus`/`GetOpenOrders`) before any action.
 - Reconciliation treats the exchange as authoritative and fails closed on any
   read failure or discrepancy.
-- NDAX real order placement is **disabled** (`supportsOrderPlacement=false`)
-  and stays that way until its order semantics and private-header signing are
-  verified against a live account. The live execution engine still enforces all
-  gates and is fully tested via the exchange adapter interface.
+- NDAX advertises `supportsOrderPlacement=false`; real placement is reachable
+  only through an explicit, process-local capability (a controlled-test
+  authorization or an armed autonomous session), never a generic config switch.
+  The live execution engine enforces all gates and is fully tested via the
+  exchange adapter interface.
 
 ### Manual-execution bridge safety boundary (Gate 9.4)
 
@@ -238,11 +248,13 @@ workflow — it is NOT autonomous trading. Its safety boundaries:
 - **Operator-entered evidence is a HINT, never authoritative.** Authority comes
   only from an exchange read. `evidenceSource` records the origin but never
   upgrades it.
-- **Fee accounting is strict and fail-closed.** Only an authoritative,
-  quote-denominated, provably-complete fee is accounted. NDAX order-level fee
-  currency is `'unknown'` (not resolvable from `GetOrderStatus`), so a real NDAX
-  order can never be auto-fee-accounted — it routes to `RECONCILIATION_REQUIRED`
-  (never `SETTLED`/accounted, never a fake `AMBIGUOUS`).
+- **Fee accounting is strict and fail-closed.** The order-level `GetOrderStatus`
+  read carries no fee currency (NDAX reports `'unknown'`), so authority comes
+  only from execution-level `AccountTrade.feeProductId` resolved through
+  `resolveFeeCurrency` (`GetProducts` + `GetInstruments`). A PROVEN + QUOTE fee
+  is accountable; a BASE, OTHER, UNKNOWN, malformed, or incomplete fee is never
+  converted or guessed and routes to `RECONCILIATION_REQUIRED` (never
+  `SETTLED`/accounted, never a fake `AMBIGUOUS`).
 - **`executionId` is display/evidence/dedupe only** — never authoritative and
   never exactly-once accounting (uniqueness unproven; per-order enumeration not
   correctness-guaranteed).
